@@ -19,6 +19,7 @@ interface PermissionHandlerOptions {
   relay: boolean;
   verbose: boolean;
   cwd: string;
+  taskId?: string;
 }
 
 export type PermissionHandler = CanUseTool & {
@@ -48,6 +49,7 @@ export function createPermissionHandler(
     const event: PilotEvent = {
       type: toolName === "AskUserQuestion" ? "question" : "permission",
       session_id: sessionId,
+      ...(opts.taskId && { task_id: opts.taskId }),
       tool_name: toolName,
       tool_input: input,
       tool_use_id: sdkOptions.toolUseID,

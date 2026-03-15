@@ -16,6 +16,7 @@ npx tsc --noEmit               # Type-check without building
 ```
 
 Usage: `claude-pilot [options] <prompt>`
+- `--task-id <id>` — Task identifier for external agent tracking
 - `--no-relay` — Disable agent forwarding, answer all prompts locally
 - `--cwd <dir>` — Working directory for Claude Code
 - `--verbose` — Show debug output
@@ -44,8 +45,9 @@ src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig
 
 ## Configuration
 
-Place `.claude-pilot.json` in the project root:
+Place `claude-pilot.json` in the target project's `.claude/` directory:
 ```json
+// .claude/claude-pilot.json
 {
   "command": "mika",
   "args": ["--agent", "mika-dev", "ask"],

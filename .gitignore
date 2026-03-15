@@ -1,7 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
-.claude-pilot.json
+.claude/claude-pilot.json
 .claude/*.local.json
 .claude/*.local.md
 .claude/worktrees

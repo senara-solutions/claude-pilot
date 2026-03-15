@@ -15,6 +15,7 @@ export type PilotConfig = z.infer<typeof PilotConfigSchema>;
 export interface PilotEvent {
   type: "permission" | "question";
   session_id?: string;
+  task_id?: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_use_id: string;
@@ -37,3 +38,16 @@ export const PilotResponseSchema = z.discriminatedUnion("action", [
 ]);
 
 export type PilotResponse = z.infer<typeof PilotResponseSchema>;
+
+// --- Result JSON written to stdout on completion ---
+
+export interface ResultJson {
+  status: "success" | "error";
+  subtype: string;
+  task_id?: string;
+  session_id?: string;
+  turns: number;
+  cost_usd: number;
+  duration_ms: number;
+  errors?: string[];
+}
