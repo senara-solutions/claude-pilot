@@ -1,5 +1,5 @@
 import { query, AbortError } from "@anthropic-ai/claude-agent-sdk";
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
 import type { PermissionHandler } from "./permissions.js";
 import type { ResultJson } from "./types.js";
 import {
@@ -55,6 +55,11 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
       }
 
       if (message.type === "result") {
+        const errors =
+          message.subtype !== "success" && "errors" in message
+            ? (message as { errors: string[] }).errors
+            : undefined;
+
         const resultJson: ResultJson = {
           status: message.subtype === "success" ? "success" : "error",
           subtype: message.subtype,
@@ -63,10 +68,8 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
           turns: message.num_turns,
           cost_usd: message.total_cost_usd,
           duration_ms: message.duration_ms,
+          ...(errors && { errors }),
         };
-        if (message.subtype !== "success" && "errors" in message) {
-          resultJson.errors = (message as { errors: string[] }).errors;
-        }
         process.stdout.write(JSON.stringify(resultJson) + "\n");
 
         if (message.subtype === "success") {
@@ -76,11 +79,7 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
             message.duration_ms,
           );
         } else {
-          const errors =
-            "errors" in message
-              ? (message as { errors: string[] }).errors
-              : [];
-          logError(message.subtype, errors);
+          logError(message.subtype, errors ?? []);
           process.exitCode = 1;
         }
       }

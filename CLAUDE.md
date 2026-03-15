@@ -29,7 +29,7 @@ src/agent.ts        → SDK query() wrapper, message stream iteration, log rende
 src/permissions.ts  → canUseTool handler: relay, retry, interactive fallback
 src/transport.ts    → execFile command transport with Zod validation
 src/ui.ts           → Stderr log renderer (ANSI colors)
-src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig
+src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, ResultJson
 ```
 
 **Flow**: CLI → `query()` with `canUseTool` callback → on tool permission needed → format `PilotEvent` → invoke external command via `execFile` (stdin JSON) → validate response with Zod → map to SDK `PermissionResult` → return to SDK.

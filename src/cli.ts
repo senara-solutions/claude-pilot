@@ -41,9 +41,15 @@ function parseArgs(argv: string[]): {
       case "--no-relay":
         relay = false;
         break;
-      case "--task-id":
-        taskId = args[++i];
+      case "--task-id": {
+        const value = args[++i];
+        if (!value || value.startsWith("-")) {
+          process.stderr.write("Error: --task-id requires a value\n");
+          usage();
+        }
+        taskId = value;
         break;
+      }
       case "--cwd":
         cwd = args[++i] ?? cwd;
         break;
@@ -99,7 +105,7 @@ function loadConfig(cwd: string): PilotConfig | undefined {
   const result = PilotConfigSchema.safeParse(parsed);
   if (!result.success) {
     process.stderr.write(
-      `Error: Invalid .claude-pilot.json: ${result.error.issues.map((i) => i.message).join(", ")}\n`,
+      `Error: Invalid .claude/claude-pilot.json: ${result.error.issues.map((i) => i.message).join(", ")}\n`,
     );
     process.exit(1);
   }
