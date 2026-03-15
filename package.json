@@ -1,0 +1,28 @@
+{
+  "name": "claude-pilot",
+  "version": "0.1.0",
+  "description": "SDK-based Claude Code wrapper with external agent integration",
+  "type": "module",
+  "bin": {
+    "claude-pilot": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsup",
+    "start": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
