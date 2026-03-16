@@ -58,9 +58,10 @@ Requires Node.js >= 22 and Claude Code installed.
 
 ## Configuration
 
-Create `.claude-pilot.json` in your project root:
+Create `claude-pilot.json` in the target project's `.claude/` directory:
 
 ```json
+// .claude/claude-pilot.json
 {
   "command": "mika",
   "args": ["--agent", "mika-dev", "ask"],
@@ -81,10 +82,11 @@ If no config file is found, claude-pilot runs in no-relay mode (all prompts go t
 ```
 claude-pilot [options] <prompt>
 
-  --no-relay    Disable agent forwarding, answer all prompts locally
-  --cwd <dir>   Working directory for Claude Code (default: current)
-  --verbose     Show debug output
-  --help        Show help
+  --task-id <id>  Task identifier for external agent tracking
+  --no-relay      Disable agent forwarding, answer all prompts locally
+  --cwd <dir>     Working directory for Claude Code (default: current)
+  --verbose       Show debug output
+  --help          Show help
 ```
 
 ## Response contract
@@ -119,6 +121,7 @@ The agent receives this on stdin:
 {
   "type": "permission",
   "session_id": "abc123",
+  "task_id": "task-456",
   "tool_name": "Bash",
   "tool_input": {"command": "rm -rf /tmp/build"},
   "tool_use_id": "toolu_xyz",

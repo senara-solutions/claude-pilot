@@ -12,10 +12,11 @@ function usage(): never {
     `Usage: claude-pilot [options] <prompt>
 
 Options:
-  --no-relay    Disable agent forwarding (answer all prompts locally)
-  --cwd <dir>   Working directory for Claude Code (default: current)
-  --verbose     Show debug output
-  --help        Show this help
+  --task-id <id>  Task identifier for external agent tracking
+  --no-relay      Disable agent forwarding (answer all prompts locally)
+  --cwd <dir>     Working directory for Claude Code (default: current)
+  --verbose       Show debug output
+  --help          Show this help
 `,
   );
   process.exit(1);
@@ -26,11 +27,13 @@ function parseArgs(argv: string[]): {
   relay: boolean;
   cwd: string;
   verbose: boolean;
+  taskId?: string;
 } {
   const args = argv.slice(2);
   let relay = true;
   let cwd = process.cwd();
   let verbose = false;
+  let taskId: string | undefined;
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -38,6 +41,15 @@ function parseArgs(argv: string[]): {
       case "--no-relay":
         relay = false;
         break;
+      case "--task-id": {
+        const value = args[++i];
+        if (!value || value.startsWith("-")) {
+          process.stderr.write("Error: --task-id requires a value\n");
+          usage();
+        }
+        taskId = value;
+        break;
+      }
       case "--cwd":
         cwd = args[++i] ?? cwd;
         break;
@@ -67,11 +79,12 @@ function parseArgs(argv: string[]): {
     relay,
     cwd: resolve(cwd),
     verbose,
+    taskId: taskId || undefined, // treat empty string as absent
   };
 }
 
 function loadConfig(cwd: string): PilotConfig | undefined {
-  const configPath = resolve(cwd, ".claude-pilot.json");
+  const configPath = resolve(cwd, ".claude", "claude-pilot.json");
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf-8");
@@ -92,7 +105,7 @@ function loadConfig(cwd: string): PilotConfig | undefined {
   const result = PilotConfigSchema.safeParse(parsed);
   if (!result.success) {
     process.stderr.write(
-      `Error: Invalid .claude-pilot.json: ${result.error.issues.map((i) => i.message).join(", ")}\n`,
+      `Error: Invalid .claude/claude-pilot.json: ${result.error.issues.map((i) => i.message).join(", ")}\n`,
     );
     process.exit(1);
   }
@@ -106,8 +119,8 @@ async function main(): Promise<void> {
 
   if (opts.relay && !config) {
     process.stderr.write(
-      "Warning: No .claude-pilot.json found — running in no-relay mode.\n" +
-        "Create a .claude-pilot.json with {\"command\": \"...\", \"args\": [...]} to enable agent forwarding.\n\n",
+      "Warning: No .claude/claude-pilot.json found — running in no-relay mode.\n" +
+        "Create .claude/claude-pilot.json with {\"command\": \"...\", \"args\": [...]} to enable agent forwarding.\n\n",
     );
     opts.relay = false;
   }
@@ -126,12 +139,14 @@ async function main(): Promise<void> {
     relay: opts.relay,
     verbose: opts.verbose,
     cwd: opts.cwd,
+    taskId: opts.taskId,
   });
 
   await runAgent({
     prompt: opts.prompt,
     cwd: opts.cwd,
     verbose: opts.verbose,
+    taskId: opts.taskId,
     permissionHandler,
     abortController,
   });

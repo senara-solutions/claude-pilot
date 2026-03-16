@@ -11,8 +11,9 @@ function log(msg: string): void {
   process.stderr.write(msg + "\n");
 }
 
-export function logInit(sessionId: string, model: string): void {
-  log(`${DIM}[init]${RESET} Session ${sessionId.slice(0, 8)}, model ${model}`);
+export function logInit(sessionId: string, model: string, taskId?: string): void {
+  const taskStr = taskId ? `, task ${taskId}` : "";
+  log(`${DIM}[init]${RESET} Session ${sessionId.slice(0, 8)}, model ${model}${taskStr}`);
 }
 
 export function logTool(
