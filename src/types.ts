@@ -6,6 +6,7 @@ export const PilotConfigSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).optional(),
   timeout: z.number().int().min(1000).max(600_000).optional(),
+  model: z.string().min(1).optional(),
 });
 
 export type PilotConfig = z.infer<typeof PilotConfigSchema>;
@@ -14,15 +15,11 @@ export type PilotConfig = z.infer<typeof PilotConfigSchema>;
 
 export interface PilotEvent {
   type: "permission" | "question";
-  session_id?: string;
-  task_id?: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_use_id: string;
   decision_reason?: string;
   blocked_path?: string;
-  cwd: string;
-  timestamp: string;
   error?: string; // present on retry after malformed response
 }
 

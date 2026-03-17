@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import type { PilotConfig, PilotEvent, PilotResponse } from "./types.js";
 import { PilotResponseSchema } from "./types.js";
+import { writeFileLog } from "./logger.js";
 import { logVerbose } from "./ui.js";
 
-const SCRUB_PATTERNS = [/KEY$/i, /SECRET/i, /TOKEN$/i, /PASSWORD/i, /CREDENTIAL/i];
+const SCRUB_PATTERNS = [/KEY/i, /SECRET/i, /TOKEN/i, /PASSWORD/i, /CREDENTIAL/i, /^DATABASE_URL$/i, /DSN$/i, /AUTH/i, /PRIVATE/i];
 
 function scrubEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
@@ -18,17 +19,22 @@ export async function invokeCommand(
   event: PilotEvent,
   signal: AbortSignal,
   verbose: boolean,
+  sessionId?: string,
 ): Promise<PilotResponse> {
   const timeout = config.timeout ?? 120_000;
 
+  const args = [...(config.args ?? []), "-"];
+  if (config.model) args.push("--model", config.model);
+  if (sessionId) args.push("--session-id", sessionId);
+
   if (verbose) {
-    logVerbose(`invoking: ${config.command} ${(config.args ?? []).join(" ")}`);
+    logVerbose(`invoking: ${config.command} ${args.join(" ")}`);
   }
 
   return new Promise<PilotResponse>((resolve, reject) => {
     const child = execFile(
       config.command,
-      config.args ?? [],
+      args,
       {
         timeout,
         env: scrubEnv(process.env),
@@ -78,6 +84,13 @@ export async function invokeCommand(
         reject(new TransportError("Command produced no output"));
       },
     );
+
+    // Log relay metadata to file for debugging (content redacted to avoid secret leakage)
+    if (verbose) {
+      writeFileLog(
+        `[relay:payload] type=${event.type} tool=${event.tool_name} id=${event.tool_use_id}\n`,
+      );
+    }
 
     // Write event payload to stdin
     if (child.stdin) {

@@ -1,3 +1,5 @@
+import { writeLog, writeFileLog } from "./logger.js";
+
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -8,7 +10,7 @@ const CYAN = "\x1b[36m";
 const MAGENTA = "\x1b[35m";
 
 function log(msg: string): void {
-  process.stderr.write(msg + "\n");
+  writeLog(msg + "\n");
 }
 
 export function logInit(sessionId: string, model: string, taskId?: string): void {
@@ -36,7 +38,7 @@ export function logQuestion(
 }
 
 export function logText(text: string): void {
-  process.stderr.write(`${DIM}${text}${RESET}`);
+  writeLog(`${DIM}${text}${RESET}`);
 }
 
 export function logDone(
@@ -81,4 +83,8 @@ export function logEscalate(toolName: string, detail: string): void {
 
 export function logQuestionEscalate(question: string): void {
   log(`${CYAN}[QUESTION]${RESET} ${question}`);
+}
+
+export function logPrompt(prompt: string): void {
+  writeFileLog(`[prompt] ${prompt}\n`);
 }
