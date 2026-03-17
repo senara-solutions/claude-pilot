@@ -6,6 +6,7 @@ export const PilotConfigSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).optional(),
   timeout: z.number().int().min(1000).max(600_000).optional(),
+  model: z.string().min(1).optional(),
 });
 
 export type PilotConfig = z.infer<typeof PilotConfigSchema>;

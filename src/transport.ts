@@ -24,6 +24,7 @@ export async function invokeCommand(
   const timeout = config.timeout ?? 120_000;
 
   const args = [...(config.args ?? []), "-"];
+  if (config.model) args.push("--model", config.model);
   if (sessionId) args.push("--session-id", sessionId);
 
   if (verbose) {
