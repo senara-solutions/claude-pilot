@@ -18,7 +18,6 @@ interface PermissionHandlerOptions {
   config?: PilotConfig;
   relay: boolean;
   verbose: boolean;
-  taskId?: string;
 }
 
 export type PermissionHandler = CanUseTool & {
@@ -63,7 +62,6 @@ export function createPermissionHandler(
         event,
         sdkOptions.signal,
         opts.verbose,
-        opts.taskId,
         sessionId,
       );
       return mapResponse(toolName, input, response);
@@ -83,7 +81,6 @@ export function createPermissionHandler(
             retryEvent,
             sdkOptions.signal,
             opts.verbose,
-            opts.taskId,
             sessionId,
           );
           return mapResponse(toolName, input, response);

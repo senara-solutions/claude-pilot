@@ -161,7 +161,6 @@ async function main(): Promise<void> {
     ...(config && { config }),
     relay: opts.relay,
     verbose: opts.verbose,
-    taskId: opts.taskId,
   });
 
   await runAgent({

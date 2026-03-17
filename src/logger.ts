@@ -4,8 +4,8 @@ import { dirname } from "node:path";
 let fileStream: WriteStream | undefined;
 
 export function initFileLog(filePath: string): void {
-  mkdirSync(dirname(filePath), { recursive: true });
-  fileStream = createWriteStream(filePath, { flags: "a" });
+  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+  fileStream = createWriteStream(filePath, { flags: "a", mode: 0o600 });
 }
 
 export function writeLog(msg: string): void {
