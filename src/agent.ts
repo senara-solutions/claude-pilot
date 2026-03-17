@@ -57,9 +57,14 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
       }
 
       if (message.type === "result") {
-        const errors =
+        const rawErrors =
           message.subtype !== "success" && "errors" in message
-            ? (message as { errors: string[] }).errors
+            ? (message as Record<string, unknown>).errors
+            : undefined;
+        const errors =
+          Array.isArray(rawErrors) &&
+          rawErrors.every((e): e is string => typeof e === "string")
+            ? rawErrors
             : undefined;
 
         const resultJson: ResultJson = {

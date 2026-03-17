@@ -133,7 +133,8 @@ async function main(): Promise<void> {
 
   // Initialize file logging when --log-dir is present
   if (opts.logDir) {
-    const logName = opts.taskId ? `${opts.taskId}.log` : "session.log";
+    const sanitized = opts.taskId?.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const logName = sanitized ? `${sanitized}.log` : "session.log";
     const logPath = join(opts.logDir, logName);
     initFileLog(logPath);
   }
@@ -157,7 +158,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   const permissionHandler = createPermissionHandler({
-    config: config ?? { command: "" },
+    ...(config && { config }),
     relay: opts.relay,
     verbose: opts.verbose,
     taskId: opts.taskId,
@@ -176,6 +177,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(`Fatal: ${err.message}\n`);
+  process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 });

@@ -15,7 +15,7 @@ import {
 } from "./ui.js";
 
 interface PermissionHandlerOptions {
-  config: PilotConfig;
+  config?: PilotConfig;
   relay: boolean;
   verbose: boolean;
   taskId?: string;
@@ -39,8 +39,8 @@ export function createPermissionHandler(
       return { behavior: "allow" as const, updatedInput: input };
     }
 
-    // Relay disabled: go straight to interactive
-    if (!opts.relay) {
+    // Relay disabled or no config: go straight to interactive
+    if (!opts.relay || !opts.config) {
       return interactiveFallback(toolName, input);
     }
 
@@ -192,12 +192,10 @@ async function interactivePermission(
 async function interactiveQuestion(
   input: Record<string, unknown>,
 ): Promise<PermissionResult> {
-  const questions = input.questions as Array<{
-    question: string;
-    header?: string;
-    options?: Array<{ label: string; description?: string }>;
-    multiSelect?: boolean;
-  }>;
+  const questions = input.questions;
+  if (!Array.isArray(questions)) {
+    return { behavior: "deny", message: "Malformed AskUserQuestion: missing questions array" };
+  }
 
   const answers: Record<string, string> = {};
 
@@ -208,24 +206,24 @@ async function interactiveQuestion(
 
   try {
     for (const q of questions) {
-      logQuestionEscalate(q.question);
+      const qObj = q as { question: string; options?: Array<{ label: string }> };
+      logQuestionEscalate(qObj.question);
 
-      if (q.options && q.options.length > 0) {
-        for (let i = 0; i < q.options.length; i++) {
-          process.stderr.write(`  ${i + 1}. ${q.options[i].label}\n`);
+      if (qObj.options && qObj.options.length > 0) {
+        for (let i = 0; i < qObj.options.length; i++) {
+          process.stderr.write(`  ${i + 1}. ${qObj.options[i].label}\n`);
         }
         const answer = await rl.question("\n  Your answer: ");
         // Try to parse as number (option index)
         const num = parseInt(answer.trim(), 10);
-        if (num >= 1 && num <= q.options.length) {
-          answers[q.question] = q.options[num - 1].label;
+        if (num >= 1 && num <= qObj.options.length) {
+          answers[qObj.question] = qObj.options[num - 1].label;
         } else {
-          // Treat as freeform text
-          answers[q.question] = answer.trim();
+          answers[qObj.question] = answer.trim();
         }
       } else {
         const answer = await rl.question("\n  Your answer: ");
-        answers[q.question] = answer.trim();
+        answers[qObj.question] = answer.trim();
       }
     }
   } finally {

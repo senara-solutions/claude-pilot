@@ -3,7 +3,7 @@ import type { PilotConfig, PilotEvent, PilotResponse } from "./types.js";
 import { PilotResponseSchema } from "./types.js";
 import { logVerbose } from "./ui.js";
 
-const SCRUB_PATTERNS = [/KEY$/i, /SECRET/i, /TOKEN$/i, /PASSWORD/i, /CREDENTIAL/i];
+const SCRUB_PATTERNS = [/KEY/i, /SECRET/i, /TOKEN/i, /PASSWORD/i, /CREDENTIAL/i, /^DATABASE_URL$/i, /DSN$/i, /AUTH/i, /PRIVATE/i];
 
 function scrubEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
