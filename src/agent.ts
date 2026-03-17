@@ -4,6 +4,7 @@ import type { PermissionHandler } from "./permissions.js";
 import type { ResultJson } from "./types.js";
 import {
   logInit,
+  logPrompt,
   logText,
   logDone,
   logError,
@@ -39,6 +40,7 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
         sessionId = message.session_id;
         opts.permissionHandler.setSessionId(sessionId);
         logInit(sessionId, message.model, opts.taskId);
+        logPrompt(opts.prompt);
         continue;
       }
 

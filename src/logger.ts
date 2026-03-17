@@ -15,6 +15,12 @@ export function writeLog(msg: string): void {
   }
 }
 
+export function writeFileLog(msg: string): void {
+  if (fileStream) {
+    fileStream.write(msg.replace(/\x1b\[[0-9;]*m/g, ""));
+  }
+}
+
 export function closeFileLog(): void {
   fileStream?.end();
   fileStream = undefined;

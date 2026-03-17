@@ -18,7 +18,6 @@ interface PermissionHandlerOptions {
   config: PilotConfig;
   relay: boolean;
   verbose: boolean;
-  cwd: string;
   taskId?: string;
 }
 
@@ -48,15 +47,11 @@ export function createPermissionHandler(
     // Build event payload
     const event: PilotEvent = {
       type: toolName === "AskUserQuestion" ? "question" : "permission",
-      session_id: sessionId,
-      ...(opts.taskId && { task_id: opts.taskId }),
       tool_name: toolName,
       tool_input: input,
       tool_use_id: sdkOptions.toolUseID,
       decision_reason: sdkOptions.decisionReason,
       blocked_path: sdkOptions.blockedPath,
-      cwd: opts.cwd,
-      timestamp: new Date().toISOString(),
     };
 
     logForwarded(toolName);
@@ -68,6 +63,8 @@ export function createPermissionHandler(
         event,
         sdkOptions.signal,
         opts.verbose,
+        opts.taskId,
+        sessionId,
       );
       return mapResponse(toolName, input, response);
     } catch (err) {
@@ -77,7 +74,6 @@ export function createPermissionHandler(
 
         const retryEvent: PilotEvent = {
           ...event,
-          timestamp: new Date().toISOString(),
           error: `Previous response was malformed: ${err.message}. Expected JSON: {"action": "allow"} or {"action": "deny"} or {"action": "answer", "answers": {"question": "answer"}}`,
         };
 
@@ -87,6 +83,8 @@ export function createPermissionHandler(
             retryEvent,
             sdkOptions.signal,
             opts.verbose,
+            opts.taskId,
+            sessionId,
           );
           return mapResponse(toolName, input, response);
         } catch (retryErr) {

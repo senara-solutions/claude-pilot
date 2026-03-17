@@ -18,17 +18,23 @@ export async function invokeCommand(
   event: PilotEvent,
   signal: AbortSignal,
   verbose: boolean,
+  taskId?: string,
+  sessionId?: string,
 ): Promise<PilotResponse> {
   const timeout = config.timeout ?? 120_000;
 
+  const args = [...(config.args ?? [])];
+  if (taskId) args.push("--task-id", taskId);
+  if (sessionId) args.push("--session-id", sessionId);
+
   if (verbose) {
-    logVerbose(`invoking: ${config.command} ${(config.args ?? []).join(" ")}`);
+    logVerbose(`invoking: ${config.command} ${args.join(" ")}`);
   }
 
   return new Promise<PilotResponse>((resolve, reject) => {
     const child = execFile(
       config.command,
-      config.args ?? [],
+      args,
       {
         timeout,
         env: scrubEnv(process.env),

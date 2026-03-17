@@ -160,7 +160,6 @@ async function main(): Promise<void> {
     config: config ?? { command: "" },
     relay: opts.relay,
     verbose: opts.verbose,
-    cwd: opts.cwd,
     taskId: opts.taskId,
   });
 

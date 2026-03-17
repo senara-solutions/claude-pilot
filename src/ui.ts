@@ -1,4 +1,4 @@
-import { writeLog } from "./logger.js";
+import { writeLog, writeFileLog } from "./logger.js";
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
@@ -83,4 +83,8 @@ export function logEscalate(toolName: string, detail: string): void {
 
 export function logQuestionEscalate(question: string): void {
   log(`${CYAN}[QUESTION]${RESET} ${question}`);
+}
+
+export function logPrompt(prompt: string): void {
+  writeFileLog(`[prompt] ${prompt}\n`);
 }

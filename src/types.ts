@@ -14,15 +14,11 @@ export type PilotConfig = z.infer<typeof PilotConfigSchema>;
 
 export interface PilotEvent {
   type: "permission" | "question";
-  session_id?: string;
-  task_id?: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_use_id: string;
   decision_reason?: string;
   blocked_path?: string;
-  cwd: string;
-  timestamp: string;
   error?: string; // present on retry after malformed response
 }
 
