@@ -82,11 +82,14 @@ If no config file is found, claude-pilot runs in no-relay mode (all prompts go t
 ```
 claude-pilot [options] <prompt>
 
-  --task-id <id>  Task identifier for external agent tracking
-  --no-relay      Disable agent forwarding, answer all prompts locally
-  --cwd <dir>     Working directory for Claude Code (default: current)
-  --verbose       Show debug output
-  --help          Show help
+  --task-id <id>       Task identifier for external agent tracking
+  --no-relay           Disable agent forwarding, answer all prompts locally
+  --relay-config <path> Explicit path to config JSON (overrides CWD discovery;
+                       hard error if file not found or invalid)
+  --cwd <dir>          Working directory for Claude Code (default: current)
+  --log-dir [path]     Enable file logging (default: /var/log/claude-pilot)
+  --verbose            Show debug output
+  --help               Show help
 ```
 
 ## Response contract

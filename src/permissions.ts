@@ -3,7 +3,9 @@ import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sd
 import type { PilotConfig, PilotEvent, PilotResponse } from "./types.js";
 import { invokeCommand, TransportError } from "./transport.js";
 import {
-  logForwarded,
+  logRelaySend,
+  logRelayRecv,
+  logToolRequest,
   logTool,
   logQuestion,
   logDenied,
@@ -38,6 +40,9 @@ export function createPermissionHandler(
       return { behavior: "allow" as const, updatedInput: input };
     }
 
+    // Log every user-facing tool request before decision logic
+    logToolRequest(toolName, summarizeInput(toolName, input));
+
     // Relay disabled or no config: go straight to interactive
     if (!opts.relay || !opts.config) {
       return interactiveFallback(toolName, input);
@@ -53,9 +58,10 @@ export function createPermissionHandler(
       blocked_path: sdkOptions.blockedPath,
     };
 
-    logForwarded(toolName);
+    logRelaySend(toolName);
 
     // Attempt 1
+    let start = Date.now();
     try {
       const response = await invokeCommand(
         opts.config,
@@ -64,9 +70,11 @@ export function createPermissionHandler(
         opts.verbose,
         sessionId,
       );
+      logRelayRecv(toolName, response.action, Date.now() - start);
       return mapResponse(toolName, input, response);
     } catch (err) {
       if (err instanceof TransportError) {
+        logRelayRecv(toolName, "error", Date.now() - start);
         // Retry once with error feedback
         logRetry(`${err.message} — retrying with error feedback`);
 
@@ -75,6 +83,7 @@ export function createPermissionHandler(
           error: `Previous response was malformed: ${err.message}. Expected JSON: {"action": "allow"} or {"action": "deny"} or {"action": "answer", "answers": {"question": "answer"}}`,
         };
 
+        start = Date.now();
         try {
           const response = await invokeCommand(
             opts.config,
@@ -83,12 +92,14 @@ export function createPermissionHandler(
             opts.verbose,
             sessionId,
           );
+          logRelayRecv(toolName, response.action, Date.now() - start);
           return mapResponse(toolName, input, response);
         } catch (retryErr) {
           // Propagate abort errors — don't fall back to interactive on shutdown
           if (retryErr instanceof Error && retryErr.name === "AbortError") {
             throw retryErr;
           }
+          logRelayRecv(toolName, "error", Date.now() - start);
           // Second failure: fall back to user
           const reason =
             retryErr instanceof Error ? retryErr.message : String(retryErr);
