@@ -7,18 +7,20 @@ import { PilotConfigSchema } from "./types.js";
 import { createPermissionHandler } from "./permissions.js";
 import { runAgent } from "./agent.js";
 import { initFileLog, closeFileLog } from "./logger.js";
+import { logConfig } from "./ui.js";
 
 function usage(): never {
   process.stderr.write(
     `Usage: claude-pilot [options] <prompt>
 
 Options:
-  --task-id <id>  Task identifier for external agent tracking
-  --no-relay      Disable agent forwarding (answer all prompts locally)
-  --cwd <dir>     Working directory for Claude Code (default: current)
-  --log-dir [path] Enable file logging (default: /var/log/claude-pilot)
-  --verbose       Show debug output
-  --help          Show this help
+  --task-id <id>       Task identifier for external agent tracking
+  --no-relay           Disable agent forwarding (answer all prompts locally)
+  --relay-config <path> Explicit path to config JSON (overrides CWD discovery)
+  --cwd <dir>          Working directory for Claude Code (default: current)
+  --log-dir [path]     Enable file logging (default: /var/log/claude-pilot)
+  --verbose            Show debug output
+  --help               Show this help
 `,
   );
   process.exit(1);
@@ -31,6 +33,7 @@ function parseArgs(argv: string[]): {
   verbose: boolean;
   taskId?: string;
   logDir?: string;
+  relayConfig?: string;
 } {
   const args = argv.slice(2);
   let relay = true;
@@ -38,6 +41,7 @@ function parseArgs(argv: string[]): {
   let verbose = false;
   let taskId: string | undefined;
   let logDir: string | undefined;
+  let relayConfig: string | undefined;
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -52,6 +56,15 @@ function parseArgs(argv: string[]): {
           usage();
         }
         taskId = value;
+        break;
+      }
+      case "--relay-config": {
+        const rcValue = args[++i];
+        if (!rcValue || rcValue.startsWith("-")) {
+          process.stderr.write("Error: --relay-config requires a path\n");
+          usage();
+        }
+        relayConfig = resolve(rcValue);
         break;
       }
       case "--cwd":
@@ -94,11 +107,12 @@ function parseArgs(argv: string[]): {
     verbose,
     taskId: taskId || undefined, // treat empty string as absent
     logDir,
+    relayConfig,
   };
 }
 
-function loadConfig(cwd: string): PilotConfig | undefined {
-  const configPath = resolve(cwd, ".claude", "claude-pilot.json");
+function loadConfig(cwd: string, explicitPath?: string): PilotConfig | undefined {
+  const configPath = explicitPath ?? resolve(cwd, ".claude", "claude-pilot.json");
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf-8");
@@ -129,7 +143,8 @@ function loadConfig(cwd: string): PilotConfig | undefined {
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
-  const config = loadConfig(opts.cwd);
+  const config = loadConfig(opts.cwd, opts.relayConfig);
+  const configPath = opts.relayConfig ?? resolve(opts.cwd, ".claude", "claude-pilot.json");
 
   // Initialize file logging when --log-dir is present
   if (opts.logDir) {
@@ -139,12 +154,25 @@ async function main(): Promise<void> {
     initFileLog(logPath);
   }
 
+  // Log config discovery result (fires unconditionally for diagnostics)
+  logConfig(opts.cwd, configPath, !!config, opts.relay && !!config);
+
   if (opts.relay && !config) {
+    if (opts.relayConfig) {
+      // Explicit path: hard error — user asked for this config specifically
+      process.stderr.write(`Error: Config file not found: ${opts.relayConfig}\n`);
+      process.exit(1);
+    }
+    // CWD discovery: warning + disable
     process.stderr.write(
       "Warning: No .claude/claude-pilot.json found — running in no-relay mode.\n" +
         "Create .claude/claude-pilot.json with {\"command\": \"...\", \"args\": [...]} to enable agent forwarding.\n\n",
     );
     opts.relay = false;
+  }
+
+  if (!opts.relay && opts.relayConfig) {
+    process.stderr.write("Warning: --relay-config is ignored when --no-relay is active\n");
   }
 
   // Wire up graceful shutdown
