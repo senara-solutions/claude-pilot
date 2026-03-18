@@ -249,22 +249,30 @@ async function interactiveQuestion(
   };
 }
 
+function scrubSecrets(text: string): string {
+  return text
+    .replace(/(Bearer\s+)\S+/gi, "$1[REDACTED]")
+    .replace(/(sk-ant-\S{0,6})\S*/g, "$1...[REDACTED]")
+    .replace(/(ghp_\S{0,4})\S*/g, "$1...[REDACTED]")
+    .replace(/(xoxb-\S{0,4})\S*/g, "$1...[REDACTED]")
+    .replace(/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|API_KEY)=\S+/gi, "$1=[REDACTED]");
+}
+
 function summarizeInput(
   toolName: string,
   input: Record<string, unknown>,
 ): string {
   switch (toolName) {
     case "Bash":
-      return String(input.command ?? "").slice(0, 200);
+      return scrubSecrets(String(input.command ?? "").slice(0, 200));
     case "Write":
     case "Edit":
     case "Read":
       return String(input.file_path ?? "");
     case "Glob":
-      return String(input.pattern ?? "");
     case "Grep":
       return String(input.pattern ?? "");
     default:
-      return JSON.stringify(input).slice(0, 150);
+      return scrubSecrets(JSON.stringify(input).slice(0, 150));
   }
 }
