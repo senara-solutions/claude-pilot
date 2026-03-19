@@ -1,7 +1,7 @@
 ---
 title: "fix: Add relay diagnostics and tool request logging"
 type: fix
-status: active
+status: completed
 date: 2026-03-18
 origin: docs/brainstorms/2026-03-18-fix-relay-and-monitoring-brainstorm.md
 ---
