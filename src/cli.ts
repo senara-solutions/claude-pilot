@@ -19,6 +19,7 @@ Options:
   --relay-config <path> Explicit path to config JSON (overrides CWD discovery)
   --cwd <dir>          Working directory for Claude Code (default: current)
   --log-dir [path]     Enable file logging (default: /var/log/claude-pilot)
+  --command <cmd>      Slash command to prepend to the prompt (e.g., /mika)
   --verbose            Show debug output
   --help               Show this help
 `,
@@ -34,6 +35,7 @@ function parseArgs(argv: string[]): {
   taskId?: string;
   logDir?: string;
   relayConfig?: string;
+  command?: string;
 } {
   const args = argv.slice(2);
   let relay = true;
@@ -42,6 +44,7 @@ function parseArgs(argv: string[]): {
   let taskId: string | undefined;
   let logDir: string | undefined;
   let relayConfig: string | undefined;
+  let command: string | undefined;
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -79,6 +82,19 @@ function parseArgs(argv: string[]): {
         }
         break;
       }
+      case "--command": {
+        const cmdValue = args[++i];
+        if (!cmdValue || cmdValue.startsWith("-")) {
+          process.stderr.write("Error: --command requires a value\n");
+          usage();
+        }
+        if (!cmdValue.startsWith("/")) {
+          process.stderr.write("Error: --command must start with / (e.g., /mika)\n");
+          usage();
+        }
+        command = cmdValue;
+        break;
+      }
       case "--verbose":
         verbose = true;
         break;
@@ -108,6 +124,7 @@ function parseArgs(argv: string[]): {
     taskId: taskId || undefined, // treat empty string as absent
     logDir,
     relayConfig,
+    command,
   };
 }
 
@@ -191,8 +208,10 @@ async function main(): Promise<void> {
     verbose: opts.verbose,
   });
 
+  const prompt = opts.command ? `${opts.command} ${opts.prompt}` : opts.prompt;
+
   await runAgent({
-    prompt: opts.prompt,
+    prompt,
     cwd: opts.cwd,
     verbose: opts.verbose,
     taskId: opts.taskId,
