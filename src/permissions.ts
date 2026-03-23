@@ -32,15 +32,7 @@ export function createPermissionHandler(
   let sessionId: string | undefined;
 
   const handler: CanUseTool = async (toolName, input, sdkOptions) => {
-    // Sub-agent tool calls: auto-allow
-    if (sdkOptions.agentID) {
-      if (opts.verbose) {
-        logVerbose(`auto-allowing sub-agent ${sdkOptions.agentID}: ${toolName}`);
-      }
-      return { behavior: "allow" as const, updatedInput: input };
-    }
-
-    // Log every user-facing tool request before decision logic
+    // Log every tool request before decision logic
     logToolRequest(toolName, summarizeInput(toolName, input));
 
     // Relay disabled or no config: go straight to interactive
@@ -54,6 +46,7 @@ export function createPermissionHandler(
       tool_name: toolName,
       tool_input: input,
       tool_use_id: sdkOptions.toolUseID,
+      agent_id: sdkOptions.agentID,
       decision_reason: sdkOptions.decisionReason,
       blocked_path: sdkOptions.blockedPath,
     };

@@ -18,6 +18,7 @@ export interface PilotEvent {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_use_id: string;
+  agent_id?: string; // set when the call originates from a sub-agent
   decision_reason?: string;
   blocked_path?: string;
   error?: string; // present on retry after malformed response
