@@ -102,6 +102,10 @@ function parseArgs(argv: string[]): {
       case "-h":
         usage();
         break;
+      case "--":
+        positional.push(...args.slice(i + 1));
+        i = args.length;
+        break;
       default:
         if (args[i].startsWith("-")) {
           process.stderr.write(`Unknown option: ${args[i]}\n`);
