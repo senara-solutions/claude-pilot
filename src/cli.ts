@@ -88,6 +88,10 @@ function parseArgs(argv: string[]): {
           process.stderr.write("Error: --command requires a value\n");
           usage();
         }
+        if (!cmdValue.startsWith("/")) {
+          process.stderr.write("Error: --command must start with / (e.g., /mika)\n");
+          usage();
+        }
         command = cmdValue;
         break;
       }
