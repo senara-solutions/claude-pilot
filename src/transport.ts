@@ -46,7 +46,12 @@ export async function invokeCommand(
         // (institutional learning: capture first, interpret second)
         if (stdout.trim()) {
           try {
-            const parsed = JSON.parse(stdout.trim());
+            const parsed = extractJson(stdout);
+            if (verbose && stdout.trim() !== JSON.stringify(parsed)) {
+              logVerbose(
+                `extracted JSON from noisy stdout (${stdout.length} bytes)`,
+              );
+            }
             const result = PilotResponseSchema.safeParse(parsed);
             if (result.success) {
               resolve(result.data);
@@ -101,6 +106,67 @@ export async function invokeCommand(
       child.stdin.end();
     }
   });
+}
+
+/**
+ * Extract the first valid JSON object from a string that may contain
+ * surrounding text (preamble, markdown fences, trailing commentary).
+ * Uses bracket-matching to handle nested objects correctly.
+ */
+function extractJson(raw: string): unknown {
+  // Fast path: entire string is valid JSON
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Continue to extraction
+  }
+
+  const start = raw.indexOf("{");
+  if (start === -1) {
+    throw new Error("no JSON object found in output");
+  }
+
+  // Bracket-match to find the first complete object
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(raw.slice(start, i + 1));
+        } catch {
+          // Malformed segment — stop scanning
+          break;
+        }
+      }
+    }
+  }
+
+  // Last resort: first '{' to last '}'
+  const end = raw.lastIndexOf("}");
+  if (end > start) {
+    return JSON.parse(raw.slice(start, end + 1));
+  }
+
+  throw new Error("no JSON object found in output");
 }
 
 export class TransportError extends Error {
