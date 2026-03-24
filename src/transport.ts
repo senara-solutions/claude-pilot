@@ -46,8 +46,8 @@ export async function invokeCommand(
         // (institutional learning: capture first, interpret second)
         if (stdout.trim()) {
           try {
-            const parsed = extractJson(stdout);
-            if (verbose && stdout.trim() !== JSON.stringify(parsed)) {
+            const { value: parsed, extracted } = extractJson(stdout);
+            if (verbose && extracted) {
               logVerbose(
                 `extracted JSON from noisy stdout (${stdout.length} bytes)`,
               );
@@ -63,10 +63,11 @@ export async function invokeCommand(
               ),
             );
             return;
-          } catch {
+          } catch (err) {
             reject(
               new TransportError(
                 `Invalid JSON from command: ${stdout.trim().slice(0, 200)}`,
+                { cause: err },
               ),
             );
             return;
@@ -113,11 +114,11 @@ export async function invokeCommand(
  * surrounding text (preamble, markdown fences, trailing commentary).
  * Uses bracket-matching to handle nested objects correctly.
  */
-function extractJson(raw: string): unknown {
+function extractJson(raw: string): { value: unknown; extracted: boolean } {
   // Fast path: entire string is valid JSON
   const trimmed = raw.trim();
   try {
-    return JSON.parse(trimmed);
+    return { value: JSON.parse(trimmed), extracted: false };
   } catch {
     // Continue to extraction
   }
@@ -151,7 +152,7 @@ function extractJson(raw: string): unknown {
       depth--;
       if (depth === 0) {
         try {
-          return JSON.parse(raw.slice(start, i + 1));
+          return { value: JSON.parse(raw.slice(start, i + 1)), extracted: true };
         } catch {
           // Malformed segment — stop scanning
           break;
@@ -160,18 +161,12 @@ function extractJson(raw: string): unknown {
     }
   }
 
-  // Last resort: first '{' to last '}'
-  const end = raw.lastIndexOf("}");
-  if (end > start) {
-    return JSON.parse(raw.slice(start, end + 1));
-  }
-
   throw new Error("no JSON object found in output");
 }
 
 export class TransportError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "TransportError";
   }
 }
