@@ -4,12 +4,12 @@
   "description": "SDK-based Claude Code wrapper with external agent integration",
   "type": "module",
   "bin": {
-    "claude-pilot": "./dist/cli.js"
+    "claude-pilot": "./bin/claude-pilot"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup",
-    "start": "node dist/cli.js"
+    "start": "tsx src/cli.ts"
   },
   "engines": {
     "node": ">=22"
