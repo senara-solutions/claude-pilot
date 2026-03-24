@@ -38,7 +38,6 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
     for await (const message of q) {
       if (message.type === "system" && message.subtype === "init") {
         sessionId = message.session_id;
-        opts.permissionHandler.setSessionId(sessionId);
         logInit(sessionId, message.model, opts.taskId);
         logPrompt(opts.prompt);
         continue;
