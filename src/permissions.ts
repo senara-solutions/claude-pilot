@@ -22,15 +22,11 @@ interface PermissionHandlerOptions {
   verbose: boolean;
 }
 
-export type PermissionHandler = CanUseTool & {
-  setSessionId(id: string): void;
-};
+export type PermissionHandler = CanUseTool;
 
 export function createPermissionHandler(
   opts: PermissionHandlerOptions,
 ): PermissionHandler {
-  let sessionId: string | undefined;
-
   const handler: CanUseTool = async (toolName, input, sdkOptions) => {
     // Log every tool request before decision logic
     logToolRequest(toolName, summarizeInput(toolName, input));
@@ -61,7 +57,6 @@ export function createPermissionHandler(
         event,
         sdkOptions.signal,
         opts.verbose,
-        sessionId,
       );
       logRelayRecv(toolName, response.action, Date.now() - start);
       return mapResponse(toolName, input, response);
@@ -83,7 +78,6 @@ export function createPermissionHandler(
             retryEvent,
             sdkOptions.signal,
             opts.verbose,
-            sessionId,
           );
           logRelayRecv(toolName, response.action, Date.now() - start);
           return mapResponse(toolName, input, response);
@@ -105,11 +99,7 @@ export function createPermissionHandler(
     }
   };
 
-  return Object.assign(handler, {
-    setSessionId(id: string): void {
-      sessionId = id;
-    },
-  });
+  return handler;
 }
 
 function mapResponse(
