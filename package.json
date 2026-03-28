@@ -12,7 +12,7 @@
     "start": "tsx src/cli.ts"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "private": true,
   "dependencies": {
