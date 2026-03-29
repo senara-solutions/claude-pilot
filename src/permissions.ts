@@ -2,6 +2,7 @@ import * as readline from "node:readline/promises";
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { PilotConfig, PilotEvent, PilotResponse } from "./types.js";
 import { invokeCommand, TransportError } from "./transport.js";
+import { isTier1AutoApprove } from "./tier1.js";
 import {
   logRelaySend,
   logRelayRecv,
@@ -20,6 +21,7 @@ interface PermissionHandlerOptions {
   config?: PilotConfig;
   relay: boolean;
   verbose: boolean;
+  cwd: string;
 }
 
 export type PermissionHandler = CanUseTool;
@@ -30,6 +32,12 @@ export function createPermissionHandler(
   const handler: CanUseTool = async (toolName, input, sdkOptions) => {
     // Log every tool request before decision logic
     logToolRequest(toolName, summarizeInput(toolName, input));
+
+    // Tier 1 auto-approval: skip relay for safe operations
+    if (isTier1AutoApprove(toolName, input, opts.cwd)) {
+      logTool(toolName, summarizeInput(toolName, input), "AUTO");
+      return { behavior: "allow", updatedInput: input };
+    }
 
     // Relay disabled or no config: go straight to interactive
     if (!opts.relay || !opts.config) {
