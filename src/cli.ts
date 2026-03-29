@@ -2,10 +2,11 @@
 
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { PilotConfig } from "./types.js";
+import type { PilotConfig, GuardrailConfig } from "./types.js";
 import { PilotConfigSchema } from "./types.js";
 import { createPermissionHandler } from "./permissions.js";
 import { runAgent } from "./agent.js";
+import { SessionGuardrails, resolveGuardrailDefaults } from "./guardrails.js";
 import { initFileLog, closeFileLog } from "./logger.js";
 import { logConfig } from "./ui.js";
 
@@ -22,12 +23,20 @@ Options:
   --command <cmd>      Slash command to prepend to the prompt (e.g., /mika)
   --verbose            Show debug output
   --help               Show this help
+
+Guardrail options:
+  --max-turns <n>      Maximum agentic turns (default: 200)
+  --max-budget <usd>   Maximum cost in USD (default: disabled)
+  --stall-threshold <n> Consecutive no-tool turns before termination (default: 5)
+  --empty-threshold <n> Consecutive trivial responses before termination (default: 5)
+  --idle-timeout <ms>  Idle timeout in milliseconds (default: 300000)
+  --no-guardrails      Disable application-level guardrails (stall, empty, idle)
 `,
   );
   process.exit(1);
 }
 
-function parseArgs(argv: string[]): {
+interface ParsedArgs {
   prompt: string;
   relay: boolean;
   cwd: string;
@@ -36,7 +45,11 @@ function parseArgs(argv: string[]): {
   logDir?: string;
   relayConfig?: string;
   command?: string;
-} {
+  guardrailOverrides: Partial<GuardrailConfig>;
+  noGuardrails: boolean;
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
   let relay = true;
   let cwd = process.cwd();
@@ -45,6 +58,8 @@ function parseArgs(argv: string[]): {
   let logDir: string | undefined;
   let relayConfig: string | undefined;
   let command: string | undefined;
+  let noGuardrails = false;
+  const guardrailOverrides: Partial<GuardrailConfig> = {};
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -95,6 +110,54 @@ function parseArgs(argv: string[]): {
         command = cmdValue;
         break;
       }
+      case "--max-turns": {
+        const v = parseInt(args[++i], 10);
+        if (isNaN(v) || v < 1) {
+          process.stderr.write("Error: --max-turns requires a positive integer\n");
+          usage();
+        }
+        guardrailOverrides.maxTurns = v;
+        break;
+      }
+      case "--max-budget": {
+        const v = parseFloat(args[++i]);
+        if (isNaN(v) || v < 0.01) {
+          process.stderr.write("Error: --max-budget requires a positive number\n");
+          usage();
+        }
+        guardrailOverrides.maxBudgetUsd = v;
+        break;
+      }
+      case "--stall-threshold": {
+        const v = parseInt(args[++i], 10);
+        if (isNaN(v) || v < 1) {
+          process.stderr.write("Error: --stall-threshold requires a positive integer\n");
+          usage();
+        }
+        guardrailOverrides.stallThreshold = v;
+        break;
+      }
+      case "--empty-threshold": {
+        const v = parseInt(args[++i], 10);
+        if (isNaN(v) || v < 1) {
+          process.stderr.write("Error: --empty-threshold requires a positive integer\n");
+          usage();
+        }
+        guardrailOverrides.emptyResponseThreshold = v;
+        break;
+      }
+      case "--idle-timeout": {
+        const v = parseInt(args[++i], 10);
+        if (isNaN(v) || v < 1000) {
+          process.stderr.write("Error: --idle-timeout requires a value >= 1000 (ms)\n");
+          usage();
+        }
+        guardrailOverrides.idleTimeoutMs = v;
+        break;
+      }
+      case "--no-guardrails":
+        noGuardrails = true;
+        break;
       case "--verbose":
         verbose = true;
         break;
@@ -129,6 +192,8 @@ function parseArgs(argv: string[]): {
     logDir,
     relayConfig,
     command,
+    guardrailOverrides,
+    noGuardrails,
   };
 }
 
@@ -160,6 +225,30 @@ function loadConfig(cwd: string, explicitPath?: string): PilotConfig | undefined
   }
 
   return result.data;
+}
+
+/**
+ * Merge guardrail config: config file < CLI overrides.
+ * --no-guardrails disables application-level guardrails (stall, empty, idle)
+ * but preserves SDK-native maxTurns.
+ */
+function mergeGuardrailConfig(
+  fileConfig?: GuardrailConfig,
+  cliOverrides?: Partial<GuardrailConfig>,
+  noGuardrails?: boolean,
+): GuardrailConfig {
+  const merged: GuardrailConfig = {
+    ...fileConfig,
+    ...cliOverrides,
+  };
+
+  if (noGuardrails) {
+    merged.stallThreshold = 0;
+    merged.emptyResponseThreshold = 0;
+    merged.idleTimeoutMs = 0;
+  }
+
+  return merged;
 }
 
 async function main(): Promise<void> {
@@ -196,6 +285,13 @@ async function main(): Promise<void> {
     process.stderr.write("Warning: --relay-config is ignored when --no-relay is active\n");
   }
 
+  // Merge guardrail config: file < CLI overrides
+  const guardrailConfig = mergeGuardrailConfig(
+    config?.guardrails,
+    opts.guardrailOverrides,
+    opts.noGuardrails,
+  );
+
   // Wire up graceful shutdown
   const abortController = new AbortController();
   const shutdown = () => {
@@ -206,11 +302,16 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
+  // Create shared guardrails instance — used by both agent loop and permission handler
+  const resolvedGuardrails = resolveGuardrailDefaults(guardrailConfig);
+  const guardrails = new SessionGuardrails(resolvedGuardrails, abortController);
+
   const permissionHandler = createPermissionHandler({
     ...(config && { config }),
     relay: opts.relay,
     verbose: opts.verbose,
     cwd: opts.cwd,
+    guardrails,
   });
 
   const prompt = opts.command ? `${opts.command} ${opts.prompt}` : opts.prompt;
@@ -222,6 +323,8 @@ async function main(): Promise<void> {
     taskId: opts.taskId,
     permissionHandler,
     abortController,
+    guardrails,
+    guardrailConfig,
   });
 
   closeFileLog();

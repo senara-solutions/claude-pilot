@@ -1,4 +1,5 @@
 import { writeLog, writeFileLog } from "./logger.js";
+import type { ResolvedGuardrailConfig } from "./guardrails.js";
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
@@ -8,6 +9,7 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const CYAN = "\x1b[36m";
 const MAGENTA = "\x1b[35m";
+const ORANGE = "\x1b[38;5;208m";
 
 function log(msg: string): void {
   writeLog(msg + "\n");
@@ -102,4 +104,25 @@ export function logQuestionEscalate(question: string): void {
 
 export function logPrompt(prompt: string): void {
   writeFileLog(`[prompt] ${prompt}\n`);
+}
+
+export function logGuardrail(type: string, detail: string): void {
+  log(
+    `\n${ORANGE}[guardrail]${RESET} ${BOLD}${type}${RESET}: ${detail}`,
+  );
+}
+
+export function logGuardrailConfig(config: ResolvedGuardrailConfig): void {
+  const parts = [
+    `maxTurns=${config.maxTurns}`,
+    config.stallThreshold > 0 ? `stallThreshold=${config.stallThreshold}` : null,
+    config.emptyResponseThreshold > 0
+      ? `emptyResponseThreshold=${config.emptyResponseThreshold}`
+      : null,
+    config.idleTimeoutMs > 0
+      ? `idleTimeout=${config.idleTimeoutMs / 1000}s`
+      : null,
+    config.maxBudgetUsd > 0 ? `maxBudget=$${config.maxBudgetUsd}` : null,
+  ].filter(Boolean);
+  log(`${DIM}[guardrails]${RESET} ${parts.join(" ")}`);
 }

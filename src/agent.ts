@@ -1,14 +1,19 @@
 import { query, AbortError } from "@anthropic-ai/claude-agent-sdk";
 
 import type { PermissionHandler } from "./permissions.js";
-import type { ResultJson } from "./types.js";
+import type { GuardrailConfig, ResultJson } from "./types.js";
+import { isGuardrailAbortReason } from "./types.js";
+import type { SessionGuardrails } from "./guardrails.js";
 import {
   logInit,
   logPrompt,
   logText,
   logDone,
   logError,
+  logGuardrail,
+  logGuardrailConfig,
 } from "./ui.js";
+import { resolveGuardrailDefaults } from "./guardrails.js";
 
 export interface AgentOptions {
   prompt: string;
@@ -17,10 +22,18 @@ export interface AgentOptions {
   taskId?: string;
   permissionHandler: PermissionHandler;
   abortController: AbortController;
+  guardrails: SessionGuardrails;
+  guardrailConfig?: GuardrailConfig;
 }
 
 export async function runAgent(opts: AgentOptions): Promise<void> {
+  const startTime = Date.now();
   let sessionId: string | undefined;
+  const guardrails = opts.guardrails;
+
+  // Resolve config for SDK-native options (maxTurns, maxBudgetUsd)
+  const resolvedConfig = resolveGuardrailDefaults(opts.guardrailConfig);
+  logGuardrailConfig(resolvedConfig);
 
   const q = query({
     prompt: opts.prompt,
@@ -31,6 +44,13 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
       abortController: opts.abortController,
       settingSources: ["user", "project", "local"],
       canUseTool: opts.permissionHandler,
+      // SDK-native guardrails
+      ...(resolvedConfig.maxTurns > 0 && {
+        maxTurns: resolvedConfig.maxTurns,
+      }),
+      ...(resolvedConfig.maxBudgetUsd > 0 && {
+        maxBudgetUsd: resolvedConfig.maxBudgetUsd,
+      }),
     },
   });
 
@@ -43,6 +63,12 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
         continue;
       }
 
+      // Turn boundary: complete assistant response with content blocks
+      if (message.type === "assistant") {
+        guardrails.onAssistantMessage(message);
+        continue;
+      }
+
       if (message.type === "stream_event") {
         const event = message.event;
         if (
@@ -51,6 +77,7 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
           event.delta.type === "text_delta"
         ) {
           logText(event.delta.text);
+          guardrails.onStreamActivity();
         }
         continue;
       }
@@ -92,9 +119,30 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
     }
   } catch (err) {
     if (err instanceof AbortError) {
-      process.stderr.write("\n");
+      const reason = opts.abortController.signal.reason;
+      if (isGuardrailAbortReason(reason)) {
+        // Guardrail-initiated abort: emit structured ResultJson
+        const resultJson: ResultJson = {
+          status: "terminated",
+          subtype: reason.guardrail,
+          ...(opts.taskId && { task_id: opts.taskId }),
+          ...(sessionId && { session_id: sessionId }),
+          turns: guardrails.turns,
+          cost_usd: 0, // not available on abort
+          duration_ms: Date.now() - startTime,
+          termination_reason: reason.detail,
+        };
+        process.stdout.write(JSON.stringify(resultJson) + "\n");
+        logGuardrail(reason.guardrail, reason.detail);
+        process.exitCode = 1;
+      } else {
+        // User-initiated abort (SIGINT/SIGTERM)
+        process.stderr.write("\n");
+      }
       return;
     }
     throw err;
+  } finally {
+    guardrails.dispose();
   }
 }
