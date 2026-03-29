@@ -1,6 +1,7 @@
 import * as readline from "node:readline/promises";
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { PilotConfig, PilotEvent, PilotResponse } from "./types.js";
+import type { SessionGuardrails } from "./guardrails.js";
 import { invokeCommand, TransportError } from "./transport.js";
 import { isTier1AutoApprove } from "./tier1.js";
 import {
@@ -22,6 +23,7 @@ interface PermissionHandlerOptions {
   relay: boolean;
   verbose: boolean;
   cwd: string;
+  guardrails?: SessionGuardrails;
 }
 
 export type PermissionHandler = CanUseTool;
@@ -57,6 +59,9 @@ export function createPermissionHandler(
 
     logRelaySend(toolName);
 
+    // Pause idle timer during relay — relay agent may take 60-120s (human escalation)
+    opts.guardrails?.pauseIdleTimer();
+
     // Attempt 1
     let start = Date.now();
     try {
@@ -67,6 +72,7 @@ export function createPermissionHandler(
         opts.verbose,
       );
       logRelayRecv(toolName, response.action, Date.now() - start);
+      opts.guardrails?.resumeIdleTimer();
       return mapResponse(toolName, input, response);
     } catch (err) {
       if (err instanceof TransportError) {
@@ -88,8 +94,10 @@ export function createPermissionHandler(
             opts.verbose,
           );
           logRelayRecv(toolName, response.action, Date.now() - start);
+          opts.guardrails?.resumeIdleTimer();
           return mapResponse(toolName, input, response);
         } catch (retryErr) {
+          opts.guardrails?.resumeIdleTimer();
           // Propagate abort errors — don't fall back to interactive on shutdown
           if (retryErr instanceof Error && retryErr.name === "AbortError") {
             throw retryErr;
@@ -102,6 +110,7 @@ export function createPermissionHandler(
           return interactiveFallback(toolName, input);
         }
       }
+      opts.guardrails?.resumeIdleTimer();
       // AbortError or unexpected: rethrow
       throw err;
     }

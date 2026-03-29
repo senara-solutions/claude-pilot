@@ -20,17 +20,24 @@ Usage: `claude-pilot [options] <prompt>`
 - `--no-relay` — Disable agent forwarding, answer all prompts locally
 - `--cwd <dir>` — Working directory for Claude Code
 - `--verbose` — Show debug output
+- `--max-turns <n>` — Maximum agentic turns (default: 200)
+- `--max-budget <usd>` — Maximum cost in USD (default: disabled)
+- `--stall-threshold <n>` — Consecutive no-tool turns before termination (default: 5)
+- `--empty-threshold <n>` — Consecutive trivial responses before termination (default: 5)
+- `--idle-timeout <ms>` — Idle timeout in milliseconds (default: 300000)
+- `--no-guardrails` — Disable application-level guardrails (stall, empty, idle)
 
 ## Architecture
 
 ```
-src/cli.ts          → Entry point: arg parsing, config loading, signal handling
-src/agent.ts        → SDK query() wrapper, message stream iteration, log rendering
-src/permissions.ts  → canUseTool handler: tier1 filter, relay, retry, interactive fallback
+src/cli.ts          → Entry point: arg parsing, config loading, signal handling, guardrail CLI flags
+src/agent.ts        → SDK query() wrapper, message stream iteration, log rendering, guardrail integration
+src/permissions.ts  → canUseTool handler: tier1 filter, relay, retry, interactive fallback, idle timer pause/resume
 src/tier1.ts        → Tier 1 auto-approval filter: deny-list, safe command patterns, path safety
 src/transport.ts    → execFile command transport with Zod validation
-src/ui.ts           → Stderr log renderer (ANSI colors)
-src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, ResultJson
+src/guardrails.ts   → Session termination guardrails: stall detection, empty-response, idle timeout
+src/ui.ts           → Stderr log renderer (ANSI colors), guardrail log functions
+src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, GuardrailConfig, ResultJson
 ```
 
 **Flow**: CLI → `query()` with `canUseTool` callback → on tool permission needed → format `PilotEvent` → invoke external command via `execFile` (stdin JSON) → validate response with Zod → map to SDK `PermissionResult` → return to SDK.
@@ -43,6 +50,7 @@ src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, Res
 - Non-interactive mode (no TTY) auto-denies on failure
 - `execFile` (not `exec`) prevents shell injection
 - Sensitive env vars (`ANTHROPIC_API_KEY`, etc.) are scrubbed before spawning commands
+- **Session guardrails** detect degenerate loops (stall, empty responses, idle) and terminate via `AbortController` with structured `ResultJson` output. SDK-native `maxTurns`/`maxBudgetUsd` are passed through to `query()`. Idle timer pauses during `canUseTool` to avoid false positives from slow relay agents.
 
 ## Configuration
 
@@ -52,9 +60,18 @@ Place `claude-pilot.json` in the target project's `.claude/` directory:
 {
   "command": "mika",
   "args": ["--agent", "mika-dev", "ask"],
-  "timeout": 120000
+  "timeout": 120000,
+  "guardrails": {
+    "maxTurns": 200,
+    "stallThreshold": 5,
+    "emptyResponseThreshold": 5,
+    "idleTimeoutMs": 300000,
+    "minTurnsBeforeDetection": 10
+  }
 }
 ```
+
+Guardrail fields are optional — defaults apply when omitted. CLI flags override config file values. Set a threshold to `0` to disable that specific guardrail.
 
 ## Key SDK Types
 
