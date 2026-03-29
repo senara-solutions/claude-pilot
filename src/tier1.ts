@@ -118,7 +118,7 @@ function isSafeSubCommand(sub: string): boolean {
     isSafeGitCommand(sub) ||
     isSafeBuildCommand(sub) ||
     isSafeShellCommand(sub) ||
-    isSafePrCommand(sub)
+    isSafeGhCommand(sub)
   );
 }
 
@@ -155,6 +155,7 @@ export function isSafeGitCommand(sub: string): boolean {
 
 const SAFE_CARGO_SUBCOMMANDS = new Set([
   "check", "test", "clippy", "fmt", "build",
+  "clean", "doc", "bench", "tree", "metadata",
 ]);
 
 const SAFE_NPM_RUN_SCRIPTS = new Set([
@@ -171,11 +172,14 @@ export function isSafeBuildCommand(sub: string): boolean {
   const npmRunMatch = sub.match(/^\s*npm\s+run\s+(\S+)/);
   if (npmRunMatch && SAFE_NPM_RUN_SCRIPTS.has(npmRunMatch[1])) return true;
 
+  // npm test / npm start (built-in aliases without "run" prefix)
+  if (/^\s*npm\s+(test|start)\b/.test(sub)) return true;
+
   // npm install / npm ci
   if (/^\s*npm\s+(install|ci)\b/.test(sub)) return true;
 
-  // npx tsc / npx vitest
-  if (/^\s*npx\s+(tsc|vitest)\b/.test(sub)) return true;
+  // npx tsc / npx vitest / npx prettier / npx eslint
+  if (/^\s*npx\s+(tsc|vitest|prettier|eslint)\b/.test(sub)) return true;
 
   return false;
 }
@@ -213,7 +217,7 @@ export function isSafeShellCommand(sub: string): boolean {
   return true;
 }
 
-// ── Safe PR/issue commands ───────────────────────────────────────────────────
+// ── Safe GitHub CLI commands ─────────────────────────────────────────────────
 
 const SAFE_GH_PR_SUBCOMMANDS = new Set([
   "create", "view", "list", "checkout", "diff", "checks",
@@ -223,7 +227,27 @@ const SAFE_GH_ISSUE_SUBCOMMANDS = new Set([
   "view", "list",
 ]);
 
-export function isSafePrCommand(sub: string): boolean {
+const SAFE_GH_RUN_SUBCOMMANDS = new Set([
+  "view", "list",
+]);
+
+const SAFE_GH_REPO_SUBCOMMANDS = new Set([
+  "view",
+]);
+
+const SAFE_GH_RELEASE_SUBCOMMANDS = new Set([
+  "view", "list",
+]);
+
+const SAFE_GH_WORKFLOW_SUBCOMMANDS = new Set([
+  "view", "list",
+]);
+
+/**
+ * Check a `gh` CLI command for safety. Uses Set-based subcommand lookups
+ * for each gh subdomain. Renamed from isSafePrCommand to reflect expanded scope.
+ */
+export function isSafeGhCommand(sub: string): boolean {
   // gh pr <subcommand>
   const prMatch = sub.match(/^\s*gh\s+pr\s+(\S+)/);
   if (prMatch && SAFE_GH_PR_SUBCOMMANDS.has(prMatch[1])) return true;
@@ -232,8 +256,21 @@ export function isSafePrCommand(sub: string): boolean {
   const issueMatch = sub.match(/^\s*gh\s+issue\s+(\S+)/);
   if (issueMatch && SAFE_GH_ISSUE_SUBCOMMANDS.has(issueMatch[1])) return true;
 
-  // gh run view/list
-  if (/^\s*gh\s+run\s+(view|list)\b/.test(sub)) return true;
+  // gh run <subcommand>
+  const runMatch = sub.match(/^\s*gh\s+run\s+(\S+)/);
+  if (runMatch && SAFE_GH_RUN_SUBCOMMANDS.has(runMatch[1])) return true;
+
+  // gh repo <subcommand>
+  const repoMatch = sub.match(/^\s*gh\s+repo\s+(\S+)/);
+  if (repoMatch && SAFE_GH_REPO_SUBCOMMANDS.has(repoMatch[1])) return true;
+
+  // gh release <subcommand>
+  const releaseMatch = sub.match(/^\s*gh\s+release\s+(\S+)/);
+  if (releaseMatch && SAFE_GH_RELEASE_SUBCOMMANDS.has(releaseMatch[1])) return true;
+
+  // gh workflow <subcommand>
+  const workflowMatch = sub.match(/^\s*gh\s+workflow\s+(\S+)/);
+  if (workflowMatch && SAFE_GH_WORKFLOW_SUBCOMMANDS.has(workflowMatch[1])) return true;
 
   // gh api — only auto-approve read-only (no method override, no field input)
   if (/^\s*gh\s+api\b/.test(sub)) {
