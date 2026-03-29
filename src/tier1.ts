@@ -75,6 +75,7 @@ const TIER3_PATTERNS: RegExp[] = [
   /`[^`]*`/,                               // backtick command substitution
   /<\(/,                                   // process substitution <(...)
   />\(/,                                   // process substitution >(...)
+  /(?:^|[^<])>{1,2}(?!\()/,               // output redirect > or >> (not process substitution)
 ];
 
 export function isTier3Dangerous(command: string): boolean {
@@ -188,7 +189,7 @@ export function isSafeBuildCommand(sub: string): boolean {
  */
 const SAFE_SHELL_COMMANDS = new Set([
   "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
-  "awk", "mkdir", "echo", "printf", "dirname", "basename",
+  "awk", "echo", "printf", "dirname", "basename",
   "realpath", "readlink", "stat", "file", "which", "type",
   "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
   "comm", "test", "[",
@@ -219,7 +220,7 @@ const SAFE_GH_PR_SUBCOMMANDS = new Set([
 ]);
 
 const SAFE_GH_ISSUE_SUBCOMMANDS = new Set([
-  "view", "list", "create",
+  "view", "list",
 ]);
 
 export function isSafePrCommand(sub: string): boolean {

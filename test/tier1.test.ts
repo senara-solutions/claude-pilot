@@ -65,6 +65,9 @@ describe("Tier 3 deny-list", () => {
     ["echo hello | xargs rm", "xargs"],
     ["find . -exec rm {} \\;", "find -exec"],
     ["find . -delete", "find -delete"],
+    ["echo secret > /tmp/exfil", "output redirect >"],
+    ["cat file >> /tmp/exfil", "output redirect >>"],
+    ["awk '{print}' file > /outside", "redirect after safe command"],
     ["echo $(rm -rf /)", "command substitution $(...)"],
     ["echo `rm -rf /`", "backtick substitution"],
     ["diff <(cat /etc/shadow) <(echo x)", "process substitution <("],
@@ -159,7 +162,6 @@ describe("Safe shell commands", () => {
     "grep -r pattern src/",
     "sed 's/foo/bar/' file.txt",
     "awk '{print $1}' file.txt",
-    "mkdir -p src/new",
     "echo hello",
     "printf '%s\\n' hello",
     "dirname /path/to/file",
@@ -184,6 +186,7 @@ describe("Safe shell commands", () => {
     ["mv important.ts /dev/null", "mv can destroy files"],
     ["touch /tmp/signal", "touch can create files outside project"],
     ["env python3 -c 'import os'", "env can execute arbitrary commands"],
+    ["mkdir -p /tmp/exfil", "mkdir can create dirs outside project"],
   ])("does NOT auto-approve: %s (%s)", (command) => {
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
@@ -213,7 +216,7 @@ describe("Safe PR/issue commands", () => {
     "gh pr checks 42",
     "gh issue view 14",
     "gh issue list",
-    "gh issue create --title 'new'",
+    // gh issue create removed — side-effect visible to others (Tier 2)
     "gh run view 123",
     "gh run list",
     "gh api repos/owner/repo/pulls",
@@ -227,6 +230,7 @@ describe("Safe PR/issue commands", () => {
     ["gh api repos/owner/repo --method POST", "gh api with POST method"],
     ["gh api repos/owner/repo -f state=closed", "gh api with field input (implies mutation)"],
     ["gh api repos/owner/repo --field body=test", "gh api with --field"],
+    ["gh issue create --title 'new'", "gh issue create is visible to others (Tier 2)"],
   ])("does NOT auto-approve: %s (%s)", (command) => {
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
