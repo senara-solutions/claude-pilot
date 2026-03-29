@@ -27,10 +27,11 @@ Options:
 Guardrail options:
   --max-turns <n>      Maximum agentic turns (default: 200)
   --max-budget <usd>   Maximum cost in USD (default: disabled)
-  --stall-threshold <n> Consecutive no-tool turns before termination (default: 5)
-  --empty-threshold <n> Consecutive trivial responses before termination (default: 5)
-  --idle-timeout <ms>  Idle timeout in milliseconds (default: 300000)
-  --no-guardrails      Disable application-level guardrails (stall, empty, idle)
+  --stall-threshold <n> Consecutive no-tool turns before termination (0=off, default: 5)
+  --empty-threshold <n> Consecutive trivial responses before termination (0=off, default: 5)
+  --idle-timeout <ms>  Idle timeout in ms (0=off, max 3600000, default: 300000)
+  --min-detection-turns <n> Turns before stall/empty detection activates (default: 10)
+  --no-guardrails      Disable stall/empty/idle detection (maxTurns still applies)
 `,
   );
   process.exit(1);
@@ -130,8 +131,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
       case "--stall-threshold": {
         const v = parseInt(args[++i], 10);
-        if (isNaN(v) || v < 1) {
-          process.stderr.write("Error: --stall-threshold requires a positive integer\n");
+        if (isNaN(v) || v < 0) {
+          process.stderr.write("Error: --stall-threshold requires a non-negative integer (0 = disabled)\n");
           usage();
         }
         guardrailOverrides.stallThreshold = v;
@@ -139,8 +140,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
       case "--empty-threshold": {
         const v = parseInt(args[++i], 10);
-        if (isNaN(v) || v < 1) {
-          process.stderr.write("Error: --empty-threshold requires a positive integer\n");
+        if (isNaN(v) || v < 0) {
+          process.stderr.write("Error: --empty-threshold requires a non-negative integer (0 = disabled)\n");
           usage();
         }
         guardrailOverrides.emptyResponseThreshold = v;
@@ -148,11 +149,20 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
       case "--idle-timeout": {
         const v = parseInt(args[++i], 10);
-        if (isNaN(v) || v < 1000) {
-          process.stderr.write("Error: --idle-timeout requires a value >= 1000 (ms)\n");
+        if (isNaN(v) || (v !== 0 && v < 1000) || v > 3_600_000) {
+          process.stderr.write("Error: --idle-timeout must be 0 (disabled) or 1000-3600000 (ms)\n");
           usage();
         }
         guardrailOverrides.idleTimeoutMs = v;
+        break;
+      }
+      case "--min-detection-turns": {
+        const v = parseInt(args[++i], 10);
+        if (isNaN(v) || v < 0) {
+          process.stderr.write("Error: --min-detection-turns requires a non-negative integer\n");
+          usage();
+        }
+        guardrailOverrides.minTurnsBeforeDetection = v;
         break;
       }
       case "--no-guardrails":
@@ -324,7 +334,6 @@ async function main(): Promise<void> {
     permissionHandler,
     abortController,
     guardrails,
-    guardrailConfig,
   });
 
   closeFileLog();

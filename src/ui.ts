@@ -1,5 +1,5 @@
 import { writeLog, writeFileLog } from "./logger.js";
-import type { ResolvedGuardrailConfig } from "./guardrails.js";
+import type { GuardrailConfig } from "./types.js";
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
@@ -112,7 +112,7 @@ export function logGuardrail(type: string, detail: string): void {
   );
 }
 
-export function logGuardrailConfig(config: ResolvedGuardrailConfig): void {
+export function logGuardrailConfig(config: Required<GuardrailConfig>): void {
   const parts = [
     `maxTurns=${config.maxTurns}`,
     config.stallThreshold > 0 ? `stallThreshold=${config.stallThreshold}` : null,

@@ -1,7 +1,7 @@
 import { query, AbortError } from "@anthropic-ai/claude-agent-sdk";
 
 import type { PermissionHandler } from "./permissions.js";
-import type { GuardrailConfig, ResultJson } from "./types.js";
+import type { ResultJson } from "./types.js";
 import { isGuardrailAbortReason } from "./types.js";
 import type { SessionGuardrails } from "./guardrails.js";
 import {
@@ -13,7 +13,6 @@ import {
   logGuardrail,
   logGuardrailConfig,
 } from "./ui.js";
-import { resolveGuardrailDefaults } from "./guardrails.js";
 
 export interface AgentOptions {
   prompt: string;
@@ -23,17 +22,21 @@ export interface AgentOptions {
   permissionHandler: PermissionHandler;
   abortController: AbortController;
   guardrails: SessionGuardrails;
-  guardrailConfig?: GuardrailConfig;
 }
+
+/** SDK result subtypes that indicate a guardrail-like termination. */
+const SDK_TERMINATION_SUBTYPES = new Set([
+  "error_max_turns",
+  "error_max_budget_usd",
+]);
 
 export async function runAgent(opts: AgentOptions): Promise<void> {
   const startTime = Date.now();
   let sessionId: string | undefined;
   const guardrails = opts.guardrails;
+  const config = guardrails.config;
 
-  // Resolve config for SDK-native options (maxTurns, maxBudgetUsd)
-  const resolvedConfig = resolveGuardrailDefaults(opts.guardrailConfig);
-  logGuardrailConfig(resolvedConfig);
+  logGuardrailConfig(config);
 
   const q = query({
     prompt: opts.prompt,
@@ -45,12 +48,8 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
       settingSources: ["user", "project", "local"],
       canUseTool: opts.permissionHandler,
       // SDK-native guardrails
-      ...(resolvedConfig.maxTurns > 0 && {
-        maxTurns: resolvedConfig.maxTurns,
-      }),
-      ...(resolvedConfig.maxBudgetUsd > 0 && {
-        maxBudgetUsd: resolvedConfig.maxBudgetUsd,
-      }),
+      ...(config.maxTurns > 0 && { maxTurns: config.maxTurns }),
+      ...(config.maxBudgetUsd > 0 && { maxBudgetUsd: config.maxBudgetUsd }),
     },
   });
 
@@ -77,7 +76,6 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
           event.delta.type === "text_delta"
         ) {
           logText(event.delta.text);
-          guardrails.onStreamActivity();
         }
         continue;
       }
@@ -93,8 +91,15 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
             ? rawErrors
             : undefined;
 
+        // Normalize SDK-native guardrail results to "terminated" status
+        const isSdkTermination = SDK_TERMINATION_SUBTYPES.has(message.subtype);
+
         const resultJson: ResultJson = {
-          status: message.subtype === "success" ? "success" : "error",
+          status: message.subtype === "success"
+            ? "success"
+            : isSdkTermination
+              ? "terminated"
+              : "error",
           subtype: message.subtype,
           ...(opts.taskId && { task_id: opts.taskId }),
           ...(sessionId && { session_id: sessionId }),
@@ -102,6 +107,9 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
           cost_usd: message.total_cost_usd,
           duration_ms: message.duration_ms,
           ...(errors && { errors }),
+          ...(isSdkTermination && {
+            termination_reason: `SDK limit reached: ${message.subtype}`,
+          }),
         };
         process.stdout.write(JSON.stringify(resultJson) + "\n");
 
@@ -111,6 +119,9 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
             message.total_cost_usd,
             message.duration_ms,
           );
+        } else if (isSdkTermination) {
+          logGuardrail(message.subtype, `SDK limit reached after ${message.num_turns} turns`);
+          process.exitCode = 1;
         } else {
           logError(message.subtype, errors ?? []);
           process.exitCode = 1;

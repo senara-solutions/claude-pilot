@@ -5,9 +5,9 @@ import { z } from "zod";
 export const GuardrailConfigSchema = z.object({
   maxTurns: z.number().int().min(1).optional(),
   maxBudgetUsd: z.number().min(0.01).optional(),
-  stallThreshold: z.number().int().min(1).optional(),
-  emptyResponseThreshold: z.number().int().min(1).optional(),
-  idleTimeoutMs: z.number().int().min(1000).optional(),
+  stallThreshold: z.number().int().min(0).optional(), // 0 = disabled
+  emptyResponseThreshold: z.number().int().min(0).optional(), // 0 = disabled
+  idleTimeoutMs: z.number().int().min(0).max(3_600_000).optional(), // 0 = disabled, max 1 hour
   minTurnsBeforeDetection: z.number().int().min(0).optional(),
 });
 
@@ -87,6 +87,8 @@ export function isGuardrailAbortReason(
   return (
     typeof value === "object" &&
     value !== null &&
-    (value as Record<string, unknown>).type === "guardrail"
+    (value as Record<string, unknown>).type === "guardrail" &&
+    typeof (value as Record<string, unknown>).guardrail === "string" &&
+    typeof (value as Record<string, unknown>).detail === "string"
   );
 }
