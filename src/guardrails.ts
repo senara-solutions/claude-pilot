@@ -7,11 +7,13 @@ export function resolveGuardrailDefaults(
   config?: GuardrailConfig,
 ): Required<GuardrailConfig> {
   return {
-    ...GUARDRAIL_DEFAULTS,
-    ...Object.fromEntries(
-      Object.entries(config ?? {}).filter(([, v]) => v !== undefined),
-    ),
-  } as Required<GuardrailConfig>;
+    maxTurns: config?.maxTurns ?? GUARDRAIL_DEFAULTS.maxTurns,
+    maxBudgetUsd: config?.maxBudgetUsd ?? GUARDRAIL_DEFAULTS.maxBudgetUsd,
+    stallThreshold: config?.stallThreshold ?? GUARDRAIL_DEFAULTS.stallThreshold,
+    emptyResponseThreshold: config?.emptyResponseThreshold ?? GUARDRAIL_DEFAULTS.emptyResponseThreshold,
+    idleTimeoutMs: config?.idleTimeoutMs ?? GUARDRAIL_DEFAULTS.idleTimeoutMs,
+    minTurnsBeforeDetection: config?.minTurnsBeforeDetection ?? GUARDRAIL_DEFAULTS.minTurnsBeforeDetection,
+  };
 }
 
 interface GuardrailState {
@@ -55,7 +57,11 @@ export class SessionGuardrails {
   onAssistantMessage(message: SDKAssistantMessage): void {
     this.state.turnCount++;
 
-    // Reset idle timer on every turn boundary (the agent is active)
+    // Reset idle timer on every turn boundary unconditionally. The plan specified
+    // resetting only on meaningful progress (tool use / non-trivial text), but
+    // unconditional reset is better: rapid empty responses keep the timer alive,
+    // while stall/empty detection handles that degenerate case. Idle timeout is
+    // reserved for "nothing at all" — no messages from the SDK whatsoever.
     this.resetIdleTimer();
 
     // Skip detection during warm-up period

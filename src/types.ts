@@ -89,6 +89,7 @@ export function isGuardrailAbortReason(
     value !== null &&
     (value as Record<string, unknown>).type === "guardrail" &&
     typeof (value as Record<string, unknown>).guardrail === "string" &&
+    typeof (value as Record<string, unknown>).turns === "number" &&
     typeof (value as Record<string, unknown>).detail === "string"
   );
 }

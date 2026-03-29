@@ -139,7 +139,11 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
           ...(opts.taskId && { task_id: opts.taskId }),
           ...(sessionId && { session_id: sessionId }),
           turns: guardrails.turns,
-          cost_usd: 0, // not available on abort
+          // Cost is unavailable when aborting mid-session — the SDK does not
+          // expose partial cost on AbortError. Consumers (mika-dev) should
+          // treat cost_usd: 0 on terminated sessions as "not reported", not
+          // as "free". See ResultJson.status === "terminated" as the signal.
+          cost_usd: 0,
           duration_ms: Date.now() - startTime,
           termination_reason: reason.detail,
         };
