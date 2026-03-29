@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdirSync, rmdirSync, symlinkSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -50,6 +50,7 @@ describe("Tier 3 deny-list", () => {
     ["git push origin main", "git push to main"],
     ["git push origin master", "git push to master"],
     ["git reset --hard HEAD~1", "git reset --hard"],
+    ["git branch -D feat/old", "git branch -D"],
     ["DROP TABLE users", "DROP TABLE"],
     ["drop table users", "drop table (case insensitive)"],
     ["DELETE FROM users WHERE id = 1", "DELETE FROM"],
@@ -66,6 +67,7 @@ describe("Tier 3 deny-list", () => {
     ["find . -delete", "find -delete"],
     ["echo $(rm -rf /)", "command substitution $(...)"],
     ["echo `rm -rf /`", "backtick substitution"],
+    ["diff <(cat /etc/shadow) <(echo x)", "process substitution <("],
   ])("blocks: %s (%s)", (command) => {
     expect(isTier3Dangerous(command)).toBe(true);
     expect(isSafeBashCommand(command)).toBe(false);
@@ -112,6 +114,9 @@ describe("Safe git commands", () => {
     "git push origin main",
     "git push origin master",
     "git reset --hard",
+    "git branch -D feat/old",
+    "git config core.hooksPath /evil",
+    "git config alias.st '!rm -rf /'",
   ])("does NOT auto-approve: %s", (command) => {
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
@@ -169,13 +174,18 @@ describe("Safe shell commands", () => {
     "which node",
     "stat file.txt",
     "file image.png",
-    "env",
-    "touch new-file.ts",
-    "cp src/a.ts src/b.ts",
-    "mv old.ts new.ts",
   ])("auto-approves: %s", (command) => {
     expect(isSafeShellCommand(command)).toBe(true);
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(true);
+  });
+
+  it.each([
+    ["cp src/a.ts /tmp/exfil", "cp can write outside project"],
+    ["mv important.ts /dev/null", "mv can destroy files"],
+    ["touch /tmp/signal", "touch can create files outside project"],
+    ["env python3 -c 'import os'", "env can execute arbitrary commands"],
+  ])("does NOT auto-approve: %s (%s)", (command) => {
+    expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
 
   it("does NOT auto-approve sed -i", () => {
@@ -210,6 +220,15 @@ describe("Safe PR/issue commands", () => {
   ])("auto-approves: %s", (command) => {
     expect(isSafePrCommand(command)).toBe(true);
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(true);
+  });
+
+  it.each([
+    ["gh api repos/owner/repo -X DELETE", "gh api with DELETE method"],
+    ["gh api repos/owner/repo --method POST", "gh api with POST method"],
+    ["gh api repos/owner/repo -f state=closed", "gh api with field input (implies mutation)"],
+    ["gh api repos/owner/repo --field body=test", "gh api with --field"],
+  ])("does NOT auto-approve: %s (%s)", (command) => {
+    expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
 });
 
@@ -286,6 +305,18 @@ describe("Bash edge cases", () => {
 
   it("relays command substitution embedded in safe command", () => {
     expect(isTier1AutoApprove("Bash", { command: "echo $(cat secret)" }, CWD)).toBe(false);
+  });
+
+  it("relays process substitution", () => {
+    expect(isTier1AutoApprove("Bash", { command: "diff <(cat a) <(cat b)" }, CWD)).toBe(false);
+  });
+
+  it("relays git config (can install hooks/aliases)", () => {
+    expect(isTier1AutoApprove("Bash", { command: "git config core.hooksPath /evil" }, CWD)).toBe(false);
+  });
+
+  it("relays git branch -D (force-delete)", () => {
+    expect(isTier1AutoApprove("Bash", { command: "git branch -D feat/old" }, CWD)).toBe(false);
   });
 });
 
@@ -368,7 +399,7 @@ describe("Write/Edit symlink safety", () => {
 
   afterAll(() => {
     try {
-      rmdirSync(tmpBase, { recursive: true });
+      rmSync(tmpBase, { recursive: true, force: true });
     } catch {
       // cleanup best-effort
     }

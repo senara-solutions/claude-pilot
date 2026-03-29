@@ -10,6 +10,10 @@ import { resolve, relative, dirname, basename, isAbsolute, join } from "node:pat
  *
  * Security principle: deny-list first, conservative default.
  * When in doubt, return false (relay decides).
+ *
+ * Note: Bash shell commands do NOT get path-containment checks
+ * (unlike Write/Edit). Static analysis of shell redirect/copy targets
+ * is impractical. Only commands with no write side effects are safe-listed.
  */
 export function isTier1AutoApprove(
   toolName: string,
@@ -56,6 +60,7 @@ const TIER3_PATTERNS: RegExp[] = [
   /git\s+push\s+.*-\w*f\b/,               // git push -f (short flag)
   /git\s+push\s+\S+\s+(main|master)\b/,   // git push origin main/master
   /git\s+reset\s+--hard\b/,               // git reset --hard
+  /git\s+branch\s+.*-\w*D\b/,             // git branch -D (force-delete)
   /\bDROP\s+TABLE\b/i,                    // DROP TABLE (case-insensitive)
   /\bDELETE\s+FROM\b/i,                   // DELETE FROM (case-insensitive)
   /\bcargo\s+publish\b/,                   // cargo publish
@@ -68,6 +73,8 @@ const TIER3_PATTERNS: RegExp[] = [
   /\bfind\s.*-(exec|delete)\b/,           // find -exec or -delete
   /\$\(/,                                  // command substitution $(...)
   /`[^`]*`/,                               // backtick command substitution
+  /<\(/,                                   // process substitution <(...)
+  />\(/,                                   // process substitution >(...)
 ];
 
 export function isTier3Dangerous(command: string): boolean {
@@ -120,7 +127,7 @@ const SAFE_GIT_SUBCOMMANDS = new Set([
   "status", "log", "diff", "branch", "show", "commit",
   "push", "checkout", "worktree", "rev-parse", "remote",
   "fetch", "pull", "add", "stash", "tag", "merge",
-  "rebase", "cherry-pick", "config", "symbolic-ref",
+  "rebase", "cherry-pick", "symbolic-ref",
   "ls-files", "describe", "shortlog", "blame",
 ]);
 
@@ -136,6 +143,9 @@ export function isSafeGitCommand(sub: string): boolean {
 
   // Block push to main/master
   if (gitSub === "push" && /\b(main|master)\b/.test(sub)) return false;
+
+  // Block branch -D (force-delete, caught by deny-list too)
+  if (gitSub === "branch" && /-\w*D\b/.test(sub)) return false;
 
   return true;
 }
@@ -171,12 +181,17 @@ export function isSafeBuildCommand(sub: string): boolean {
 
 // ── Safe shell commands ──────────────────────────────────────────────────────
 
+/**
+ * Read-only or benign shell commands. Commands that can write to arbitrary
+ * locations (cp, mv, tee, python3) are intentionally excluded — they bypass
+ * the isWithinProject() check that protects Write/Edit.
+ */
 const SAFE_SHELL_COMMANDS = new Set([
   "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
   "awk", "mkdir", "echo", "printf", "dirname", "basename",
   "realpath", "readlink", "stat", "file", "which", "type",
-  "env", "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
-  "comm", "test", "[", "touch", "cp", "mv",
+  "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
+  "comm", "test", "[",
 ]);
 
 export function isSafeShellCommand(sub: string): boolean {
@@ -219,8 +234,11 @@ export function isSafePrCommand(sub: string): boolean {
   // gh run view/list
   if (/^\s*gh\s+run\s+(view|list)\b/.test(sub)) return true;
 
-  // gh api (read-only GET requests)
-  if (/^\s*gh\s+api\b/.test(sub)) return true;
+  // gh api — only auto-approve read-only (no method override, no field input)
+  if (/^\s*gh\s+api\b/.test(sub)) {
+    if (/-(X|method)\b/.test(sub) || /-(f|F|field|raw-field)\b/.test(sub)) return false;
+    return true;
+  }
 
   return false;
 }
@@ -232,20 +250,12 @@ export function isSafePrCommand(sub: string): boolean {
  * Uses fs.realpathSync() to resolve symlinks and prevent traversal.
  */
 export function isWithinProject(filePath: string, cwd: string): boolean {
+  if (!filePath) return false;
+
   try {
     const resolvedCwd = realpathSync(cwd);
-    let resolvedPath: string;
-
-    if (!filePath) return false; // empty path → relay
-
-    if (isAbsolute(filePath)) {
-      // Try to resolve the full path; if it doesn't exist, resolve parent
-      resolvedPath = tryResolveRealPath(filePath, resolvedCwd);
-    } else {
-      // Relative path: resolve against cwd
-      const absPath = resolve(resolvedCwd, filePath);
-      resolvedPath = tryResolveRealPath(absPath, resolvedCwd);
-    }
+    const absPath = resolve(resolvedCwd, filePath);
+    const resolvedPath = tryResolveRealPath(absPath);
 
     if (!resolvedPath) return false; // cannot resolve → relay
 
@@ -261,7 +271,7 @@ export function isWithinProject(filePath: string, cwd: string): boolean {
  * Try to resolve the real path. If the file doesn't exist (Write creating new file),
  * resolve the parent directory and append the basename.
  */
-function tryResolveRealPath(absPath: string, _resolvedCwd: string): string {
+function tryResolveRealPath(absPath: string): string {
   try {
     return realpathSync(absPath);
   } catch {
