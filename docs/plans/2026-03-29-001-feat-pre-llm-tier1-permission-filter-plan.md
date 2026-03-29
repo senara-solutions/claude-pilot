@@ -1,7 +1,7 @@
 ---
 title: "feat: pre-LLM Tier 1 permission filter to skip relay for safe operations"
 type: feat
-status: active
+status: completed
 date: 2026-03-29
 issue: "#14"
 ---
