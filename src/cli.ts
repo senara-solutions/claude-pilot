@@ -210,6 +210,7 @@ async function main(): Promise<void> {
     ...(config && { config }),
     relay: opts.relay,
     verbose: opts.verbose,
+    cwd: opts.cwd,
   });
 
   const prompt = opts.command ? `${opts.command} ${opts.prompt}` : opts.prompt;

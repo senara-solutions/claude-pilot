@@ -26,7 +26,8 @@ Usage: `claude-pilot [options] <prompt>`
 ```
 src/cli.ts          → Entry point: arg parsing, config loading, signal handling
 src/agent.ts        → SDK query() wrapper, message stream iteration, log rendering
-src/permissions.ts  → canUseTool handler: relay, retry, interactive fallback
+src/permissions.ts  → canUseTool handler: tier1 filter, relay, retry, interactive fallback
+src/tier1.ts        → Tier 1 auto-approval filter: deny-list, safe command patterns, path safety
 src/transport.ts    → execFile command transport with Zod validation
 src/ui.ts           → Stderr log renderer (ANSI colors)
 src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, ResultJson
