@@ -152,6 +152,11 @@ export function isSafeGitCommand(sub: string): boolean {
 }
 
 // ── Safe build/test commands ─────────────────────────────────────────────────
+//
+// Build/test/format commands are safe because the project itself is trusted.
+// They execute project-defined code (package.json scripts, Cargo build scripts).
+// If the threat model ever changes to include untrusted repos, ALL commands in
+// this section must be moved to Tier 2 (relay).
 
 const SAFE_CARGO_SUBCOMMANDS = new Set([
   "check", "test", "clippy", "fmt", "build",
@@ -179,6 +184,8 @@ export function isSafeBuildCommand(sub: string): boolean {
   if (/^\s*npm\s+(install|ci)\b/.test(sub)) return true;
 
   // npx tsc / npx vitest / npx prettier / npx eslint
+  // prettier --write and eslint --fix modify project files in-place,
+  // intentionally allowed (same trust level as cargo fmt)
   if (/^\s*npx\s+(tsc|vitest|prettier|eslint)\b/.test(sub)) return true;
 
   return false;
@@ -219,62 +226,31 @@ export function isSafeShellCommand(sub: string): boolean {
 
 // ── Safe GitHub CLI commands ─────────────────────────────────────────────────
 
-const SAFE_GH_PR_SUBCOMMANDS = new Set([
-  "create", "view", "list", "checkout", "diff", "checks",
-]);
-
-const SAFE_GH_ISSUE_SUBCOMMANDS = new Set([
-  "view", "list",
-]);
-
-const SAFE_GH_RUN_SUBCOMMANDS = new Set([
-  "view", "list",
-]);
-
-const SAFE_GH_REPO_SUBCOMMANDS = new Set([
-  "view",
-]);
-
-const SAFE_GH_RELEASE_SUBCOMMANDS = new Set([
-  "view", "list",
-]);
-
-const SAFE_GH_WORKFLOW_SUBCOMMANDS = new Set([
-  "view", "list",
-]);
-
 /**
- * Check a `gh` CLI command for safety. Uses Set-based subcommand lookups
- * for each gh subdomain. Renamed from isSafePrCommand to reflect expanded scope.
+ * Map of gh subdomains to their safe (auto-approvable) subcommands.
+ * Adding a new gh subdomain is a one-liner: add an entry to this map.
+ * gh api is handled separately (flag-based gating, not subcommand lookup).
  */
+const SAFE_GH_SUBCOMMANDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["pr",       new Set(["create", "view", "list", "checkout", "diff", "checks"])],
+  ["issue",    new Set(["view", "list"])],
+  ["run",      new Set(["view", "list"])],
+  ["repo",     new Set(["view"])],
+  ["release",  new Set(["view", "list"])],
+  ["workflow", new Set(["view", "list"])],
+]);
+
 export function isSafeGhCommand(sub: string): boolean {
-  // gh pr <subcommand>
-  const prMatch = sub.match(/^\s*gh\s+pr\s+(\S+)/);
-  if (prMatch && SAFE_GH_PR_SUBCOMMANDS.has(prMatch[1])) return true;
+  // gh <domain> <subcommand> — lookup in SAFE_GH_SUBCOMMANDS map
+  const match = sub.match(/^\s*gh\s+(\S+)\s+(\S+)/);
+  if (match) {
+    const allowed = SAFE_GH_SUBCOMMANDS.get(match[1]);
+    if (allowed) return allowed.has(match[2]);
+  }
 
-  // gh issue <subcommand>
-  const issueMatch = sub.match(/^\s*gh\s+issue\s+(\S+)/);
-  if (issueMatch && SAFE_GH_ISSUE_SUBCOMMANDS.has(issueMatch[1])) return true;
-
-  // gh run <subcommand>
-  const runMatch = sub.match(/^\s*gh\s+run\s+(\S+)/);
-  if (runMatch && SAFE_GH_RUN_SUBCOMMANDS.has(runMatch[1])) return true;
-
-  // gh repo <subcommand>
-  const repoMatch = sub.match(/^\s*gh\s+repo\s+(\S+)/);
-  if (repoMatch && SAFE_GH_REPO_SUBCOMMANDS.has(repoMatch[1])) return true;
-
-  // gh release <subcommand>
-  const releaseMatch = sub.match(/^\s*gh\s+release\s+(\S+)/);
-  if (releaseMatch && SAFE_GH_RELEASE_SUBCOMMANDS.has(releaseMatch[1])) return true;
-
-  // gh workflow <subcommand>
-  const workflowMatch = sub.match(/^\s*gh\s+workflow\s+(\S+)/);
-  if (workflowMatch && SAFE_GH_WORKFLOW_SUBCOMMANDS.has(workflowMatch[1])) return true;
-
-  // gh api — only auto-approve read-only (no method override, no field input)
+  // gh api — only auto-approve read-only (no method override, no field/body input)
   if (/^\s*gh\s+api\b/.test(sub)) {
-    if (/-(X|method)\b/.test(sub) || /-(f|F|field|raw-field)\b/.test(sub)) return false;
+    if (/-(X|method)\b/.test(sub) || /-(f|F|field|raw-field)\b/.test(sub) || /--input\b/.test(sub)) return false;
     return true;
   }
 

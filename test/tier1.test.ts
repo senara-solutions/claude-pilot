@@ -252,6 +252,7 @@ describe("Safe GitHub CLI commands", () => {
     ["gh api repos/owner/repo -f state=closed", "gh api with field input (implies mutation)"],
     ["gh api repos/owner/repo --field body=test", "gh api with --field"],
     ["gh issue create --title 'new'", "gh issue create is visible to others (Tier 2)"],
+    ["gh api repos/owner/repo/issues --input body.json", "gh api with --input (implies mutation)"],
     ["gh repo create my-repo", "gh repo create is a mutation"],
     ["gh repo delete my-repo", "gh repo delete is destructive"],
     ["gh release create v2.0.0", "gh release create is a mutation"],
