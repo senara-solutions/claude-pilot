@@ -9,7 +9,7 @@ import {
   isSafeGitCommand,
   isSafeBuildCommand,
   isSafeShellCommand,
-  isSafePrCommand,
+  isSafeGhCommand,
   isWithinProject,
 } from "../src/tier1.js";
 
@@ -64,6 +64,7 @@ describe("Tier 3 deny-list", () => {
     ['eval "echo hello"', "eval"],
     ["echo hello | xargs rm", "xargs"],
     ["find . -exec rm {} \\;", "find -exec"],
+    ["find . -execdir grep foo {} +", "find -execdir"],
     ["find . -delete", "find -delete"],
     ["echo secret > /tmp/exfil", "output redirect >"],
     ["cat file >> /tmp/exfil", "output redirect >>"],
@@ -134,6 +135,21 @@ describe("Safe build/test commands", () => {
     "cargo clippy",
     "cargo fmt",
     "cargo check",
+    "cargo clean",
+    "cargo doc",
+    "cargo bench",
+    "cargo tree",
+    "cargo metadata",
+    "cargo metadata --format-version 1",
+    "cargo doc --no-deps",
+    "cargo clean --release",
+    "cargo bench -- --ignored",
+    "npm test",
+    "npm start",
+    "npx prettier --write src/",
+    "npx prettier --check .",
+    "npx eslint src/",
+    "npx eslint --fix .",
     "npm run build",
     "npm run test",
     "npm run dev",
@@ -202,11 +218,15 @@ describe("Safe shell commands", () => {
   it("does NOT auto-approve find -delete", () => {
     expect(isTier1AutoApprove("Bash", { command: "find . -name '*.tmp' -delete" }, CWD)).toBe(false);
   });
+
+  it("does NOT auto-approve find -execdir", () => {
+    expect(isTier1AutoApprove("Bash", { command: "find . -execdir grep foo {} +" }, CWD)).toBe(false);
+  });
 });
 
-// ── Bash: safe PR/issue commands ────────────────────────────────────────────
+// ── Bash: safe GitHub CLI commands ──────────────────────────────────────────
 
-describe("Safe PR/issue commands", () => {
+describe("Safe GitHub CLI commands", () => {
   it.each([
     "gh pr create --title 'fix' --body 'desc'",
     "gh pr view 42",
@@ -219,9 +239,15 @@ describe("Safe PR/issue commands", () => {
     // gh issue create removed — side-effect visible to others (Tier 2)
     "gh run view 123",
     "gh run list",
+    "gh repo view",
+    "gh repo view senara-solutions/claude-pilot",
+    "gh release view v1.0.0",
+    "gh release list",
+    "gh workflow view build.yml",
+    "gh workflow list",
     "gh api repos/owner/repo/pulls",
   ])("auto-approves: %s", (command) => {
-    expect(isSafePrCommand(command)).toBe(true);
+    expect(isSafeGhCommand(command)).toBe(true);
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(true);
   });
 
@@ -231,6 +257,13 @@ describe("Safe PR/issue commands", () => {
     ["gh api repos/owner/repo -f state=closed", "gh api with field input (implies mutation)"],
     ["gh api repos/owner/repo --field body=test", "gh api with --field"],
     ["gh issue create --title 'new'", "gh issue create is visible to others (Tier 2)"],
+    ["gh api repos/owner/repo/issues --input body.json", "gh api with --input (implies mutation)"],
+    ["gh repo create my-repo", "gh repo create is a mutation"],
+    ["gh repo delete my-repo", "gh repo delete is destructive"],
+    ["gh release create v2.0.0", "gh release create is a mutation"],
+    ["gh release delete v1.0.0", "gh release delete is destructive"],
+    ["gh workflow run build.yml", "gh workflow run triggers dispatch"],
+    ["gh run rerun 123", "gh run rerun triggers execution"],
   ])("does NOT auto-approve: %s (%s)", (command) => {
     expect(isTier1AutoApprove("Bash", { command }, CWD)).toBe(false);
   });
@@ -266,6 +299,18 @@ describe("Compound commands", () => {
   it("auto-approves multi-part safe chain", () => {
     expect(
       isTier1AutoApprove("Bash", { command: "git status && cargo test && npm run build" }, CWD),
+    ).toBe(true);
+  });
+
+  it("auto-approves new safe commands in compound chain", () => {
+    expect(
+      isTier1AutoApprove("Bash", { command: "cargo clean && cargo build && npm test" }, CWD),
+    ).toBe(true);
+  });
+
+  it("auto-approves gh commands in compound chain", () => {
+    expect(
+      isTier1AutoApprove("Bash", { command: "gh release list && gh workflow list" }, CWD),
     ).toBe(true);
   });
 });
@@ -321,6 +366,16 @@ describe("Bash edge cases", () => {
 
   it("relays git branch -D (force-delete)", () => {
     expect(isTier1AutoApprove("Bash", { command: "git branch -D feat/old" }, CWD)).toBe(false);
+  });
+
+  it("relays new safe command with redirect (deny-list catches redirect)", () => {
+    expect(isTier1AutoApprove("Bash", { command: "cargo tree > output.txt" }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Bash", { command: "cargo metadata >> log.txt" }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Bash", { command: "gh release list > releases.txt" }, CWD)).toBe(false);
+  });
+
+  it("relays new safe command with command substitution", () => {
+    expect(isTier1AutoApprove("Bash", { command: "echo $(cargo tree)" }, CWD)).toBe(false);
   });
 });
 
