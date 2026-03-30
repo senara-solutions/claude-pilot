@@ -57,12 +57,20 @@ Added comments clarifying that build/test commands (`cargo`, `npm`, `npx`) are s
 - **Excluded `mkdir`:** Can create dirs outside project; would need complex argument parsing for path containment. Write tool creates parent directories implicitly.
 - **Allowed `npx prettier --write` / `npx eslint --fix`:** Consistent with already-approved `cargo fmt` — formatters modify project files in-place at the same trust level.
 
+### 5. Review-phase hardening
+
+Post-review fixes applied:
+- **ReadonlySet consistency:** All module-level Sets (`SAFE_GIT_SUBCOMMANDS`, `SAFE_CARGO_SUBCOMMANDS`, `SAFE_NPM_RUN_SCRIPTS`, `SAFE_SHELL_COMMANDS`) and `TIER3_PATTERNS` now use `ReadonlySet<string>` / `readonly RegExp[]` type annotations, matching the `SAFE_GH_SUBCOMMANDS` convention.
+- **`find -execdir` guard:** Added `-execdir` to both the deny-list regex and the secondary guard clause in `isSafeShellCommand`. The deny-list already caught it via substring match on `exec`, but the secondary guard was an exact match that missed it.
+- **`gh api` piped stdin documentation:** Added a comment documenting the known edge case where `gh api` can receive mutation bodies via piped stdin (e.g., `echo '...' | gh api ...`). Practical risk is low; the compound splitter evaluates pipe segments independently.
+
 ## Prevention
 
 - **Three-question test for future safe-list additions:** (1) Can this write outside the project? (2) Can flags change behavior from read to write? (3) Can shell redirects cause side effects? (Already caught by deny-list, but verify.)
 - **Deny-list-first invariant:** All new patterns checked AFTER `isTier3Dangerous()` scans raw command string. Never bypass this ordering.
 - **Use `ReadonlyMap`/`ReadonlySet` types** for safe-list constants to prevent accidental mutation.
 - **Test each new pattern with deny-list interaction tests** (redirect, command substitution) to verify the deny-list catches abuse.
+- **Mirror deny-list and secondary guards:** When adding dangerous flags to the deny-list (which scans raw strings), also add them to the per-command secondary guards (which check sub-commands). The two layers should stay in sync.
 
 ## Impact
 
