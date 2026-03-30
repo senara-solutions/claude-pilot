@@ -64,6 +64,7 @@ describe("Tier 3 deny-list", () => {
     ['eval "echo hello"', "eval"],
     ["echo hello | xargs rm", "xargs"],
     ["find . -exec rm {} \\;", "find -exec"],
+    ["find . -execdir grep foo {} +", "find -execdir"],
     ["find . -delete", "find -delete"],
     ["echo secret > /tmp/exfil", "output redirect >"],
     ["cat file >> /tmp/exfil", "output redirect >>"],
@@ -216,6 +217,10 @@ describe("Safe shell commands", () => {
 
   it("does NOT auto-approve find -delete", () => {
     expect(isTier1AutoApprove("Bash", { command: "find . -name '*.tmp' -delete" }, CWD)).toBe(false);
+  });
+
+  it("does NOT auto-approve find -execdir", () => {
+    expect(isTier1AutoApprove("Bash", { command: "find . -execdir grep foo {} +" }, CWD)).toBe(false);
   });
 });
 

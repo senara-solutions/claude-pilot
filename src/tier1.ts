@@ -54,7 +54,7 @@ export function isTier1AutoApprove(
  * before any splitting. If any pattern matches, the command is NOT
  * auto-approved (falls through to relay).
  */
-const TIER3_PATTERNS: RegExp[] = [
+const TIER3_PATTERNS: readonly RegExp[] = [
   /rm\s+(-\w*r\w*f|-\w*f\w*r)\b/,        // rm -rf, rm -fr, rm -rfi, etc.
   /git\s+push\s+.*--force\b/,              // git push --force
   /git\s+push\s+.*-\w*f\b/,               // git push -f (short flag)
@@ -70,7 +70,7 @@ const TIER3_PATTERNS: RegExp[] = [
   /\bsh\s+-c\b/,                           // sh -c
   /\beval\s/,                              // eval command
   /\bxargs\b/,                             // xargs (command amplifier)
-  /\bfind\s.*-(exec|delete)\b/,           // find -exec or -delete
+  /\bfind\s.*-(exec|execdir|delete)\b/,   // find -exec, -execdir, or -delete
   /\$\(/,                                  // command substitution $(...)
   /`[^`]*`/,                               // backtick command substitution
   /<\(/,                                   // process substitution <(...)
@@ -124,7 +124,7 @@ function isSafeSubCommand(sub: string): boolean {
 
 // ── Safe git commands ────────────────────────────────────────────────────────
 
-const SAFE_GIT_SUBCOMMANDS = new Set([
+const SAFE_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "status", "log", "diff", "branch", "show", "commit",
   "push", "checkout", "worktree", "rev-parse", "remote",
   "fetch", "pull", "add", "stash", "tag", "merge",
@@ -158,12 +158,12 @@ export function isSafeGitCommand(sub: string): boolean {
 // If the threat model ever changes to include untrusted repos, ALL commands in
 // this section must be moved to Tier 2 (relay).
 
-const SAFE_CARGO_SUBCOMMANDS = new Set([
+const SAFE_CARGO_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "check", "test", "clippy", "fmt", "build",
   "clean", "doc", "bench", "tree", "metadata",
 ]);
 
-const SAFE_NPM_RUN_SCRIPTS = new Set([
+const SAFE_NPM_RUN_SCRIPTS: ReadonlySet<string> = new Set([
   "build", "dev", "test", "lint", "fmt", "start",
   "typecheck", "type-check", "check",
 ]);
@@ -198,7 +198,7 @@ export function isSafeBuildCommand(sub: string): boolean {
  * locations (cp, mv, tee, python3) are intentionally excluded — they bypass
  * the isWithinProject() check that protects Write/Edit.
  */
-const SAFE_SHELL_COMMANDS = new Set([
+const SAFE_SHELL_COMMANDS: ReadonlySet<string> = new Set([
   "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
   "awk", "echo", "printf", "dirname", "basename",
   "realpath", "readlink", "stat", "file", "which", "type",
@@ -217,9 +217,9 @@ export function isSafeShellCommand(sub: string): boolean {
   // but double-check here for safety
   if (cmd === "sed" && /\s-\w*i\b/.test(sub)) return false;
 
-  // find with -exec or -delete is blocked by deny-list,
+  // find with -exec, -execdir, or -delete is blocked by deny-list,
   // but double-check here
-  if (cmd === "find" && /-(exec|delete)\b/.test(sub)) return false;
+  if (cmd === "find" && /-(exec|execdir|delete)\b/.test(sub)) return false;
 
   return true;
 }
@@ -249,6 +249,9 @@ export function isSafeGhCommand(sub: string): boolean {
   }
 
   // gh api — only auto-approve read-only (no method override, no field/body input)
+  // Known limitation: piped stdin (e.g. `echo '{"body":"..."}' | gh api ...`) can pass
+  // mutations through because the compound splitter evaluates each pipe segment independently.
+  // Practical risk is low — Claude Code rarely pipes to gh api.
   if (/^\s*gh\s+api\b/.test(sub)) {
     if (/-(X|method)\b/.test(sub) || /-(f|F|field|raw-field)\b/.test(sub) || /--input\b/.test(sub)) return false;
     return true;
