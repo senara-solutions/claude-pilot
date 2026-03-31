@@ -7,3 +7,5 @@ dist/
 .claude/worktrees
 .claude/scheduled_tasks.lock
 lefthook-local.yml
+.env*
+!.env.example
