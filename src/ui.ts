@@ -112,6 +112,15 @@ export function logGuardrail(type: string, detail: string): void {
   );
 }
 
+export function logEnv(envPath: string, result: { error?: Error; parsed?: Record<string, string> }): void {
+  if (result.error) {
+    log(`${DIM}[env]${RESET} path=${envPath} [NOT FOUND]`);
+  } else {
+    const count = result.parsed ? Object.keys(result.parsed).length : 0;
+    log(`${DIM}[env]${RESET} path=${envPath} [LOADED] vars=${count}`);
+  }
+}
+
 export function logGuardrailConfig(config: Required<GuardrailConfig>): void {
   const parts = [
     `maxTurns=${config.maxTurns}`,

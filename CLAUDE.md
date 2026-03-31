@@ -52,6 +52,14 @@ src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, Gua
 - Sensitive env vars (`ANTHROPIC_API_KEY`, etc.) are scrubbed before spawning commands
 - **Session guardrails** detect degenerate loops (stall, empty responses, idle) and terminate via `AbortController` with structured `ResultJson` output. SDK-native `maxTurns`/`maxBudgetUsd` are passed through to `query()`. Idle timer pauses during `canUseTool` to avoid false positives from slow relay agents.
 
+## Environment Variables
+
+Place a `.env` file in the claude-pilot root directory (alongside `package.json`) to set process-level env vars. Values do NOT override existing `process.env` entries. See `.env.example` for available variables.
+
+Example: create `.env` with `GH_TOKEN=<bot-pat>` so PRs appear from the bot account while agents use the host's `gh auth` for `gh pr checks`.
+
+The `.env` file is gitignored and not copied to worktrees. Autonomous sessions inherit env vars from the parent process instead.
+
 ## Configuration
 
 Place `claude-pilot.json` in the target project's `.claude/` directory:
