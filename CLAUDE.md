@@ -60,6 +60,8 @@ Example: create `.env` with `GH_TOKEN=<bot-pat>` so PRs appear from the bot acco
 
 The `.env` file is gitignored and not copied to worktrees. Autonomous sessions inherit env vars from the parent process instead.
 
+**Note:** Variables matching sensitive patterns (`TOKEN`, `KEY`, `SECRET`, `AUTH`, etc.) are scrubbed from the relay child process via `scrubEnv()` in `transport.ts`, but remain visible to the Claude Code SDK subprocess. This is by design — Claude Code needs tokens like `GH_TOKEN` to operate, while the relay agent should not see them.
+
 ## Configuration
 
 Place `claude-pilot.json` in the target project's `.claude/` directory:

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import dotenv from "dotenv";
 import type { PilotConfig, GuardrailConfig } from "./types.js";
 import { PilotConfigSchema } from "./types.js";
@@ -264,10 +263,9 @@ function mergeGuardrailConfig(
 }
 
 async function main(): Promise<void> {
-  // Load .env from package root (does not override existing env vars)
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  const envPath = resolve(__dirname, "..", ".env");
+  // Load .env from package root (does not override existing env vars).
+  // import.meta.dirname resolves to src/ (dev) or dist/ (build) — one level below package root.
+  const envPath = resolve(import.meta.dirname, "..", ".env");
   const envResult = dotenv.config({ path: envPath, override: false });
 
   const opts = parseArgs(process.argv);

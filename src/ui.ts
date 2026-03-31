@@ -112,7 +112,7 @@ export function logGuardrail(type: string, detail: string): void {
   );
 }
 
-export function logEnv(envPath: string, result: { error?: Error; parsed?: Record<string, string> }): void {
+export function logEnv(envPath: string, result: import("dotenv").DotenvConfigOutput): void {
   if (result.error) {
     log(`${DIM}[env]${RESET} path=${envPath} [NOT FOUND]`);
   } else {
