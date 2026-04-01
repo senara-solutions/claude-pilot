@@ -24,6 +24,7 @@ interface PermissionHandlerOptions {
   verbose: boolean;
   cwd: string;
   guardrails?: SessionGuardrails;
+  taskId?: string;
 }
 
 export type PermissionHandler = CanUseTool;
@@ -70,6 +71,7 @@ export function createPermissionHandler(
         event,
         sdkOptions.signal,
         opts.verbose,
+        opts.taskId,
       );
       logRelayRecv(toolName, response.action, Date.now() - start);
       opts.guardrails?.resumeIdleTimer();
@@ -92,6 +94,7 @@ export function createPermissionHandler(
             retryEvent,
             sdkOptions.signal,
             opts.verbose,
+            opts.taskId,
           );
           logRelayRecv(toolName, response.action, Date.now() - start);
           opts.guardrails?.resumeIdleTimer();
