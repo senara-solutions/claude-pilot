@@ -39,7 +39,12 @@ const args = [...(config.args ?? []), "-"];
 
 **4. Add relay payload metadata logging** — verbose mode now logs `type`, `tool_name`, and `tool_use_id` to the file log for debugging without leaking secrets.
 
+## Update (2026-04-01)
+
+mika#358 / mika#367 separated `--task-id` (correlation-only metadata) from `--task-complete` (task completion trigger). With this fix, `--task-id` can now be safely forwarded on every relay call without causing task status transitions. The `--task-id` flag was re-added to the relay chain in claude-pilot#24, following the same pattern as `--model` (session-scoped metadata in CLI args, per-event data in stdin JSON).
+
 ## Prevention
 
 - When integrating with external CLI tools via stdin, always verify the tool's convention for reading stdin (usually `"-"` or `--stdin` flag). Don't assume piping to stdin is sufficient.
 - Avoid forwarding identifiers that cause side effects (like task status transitions) on every permission callback — pass them once at session level, not per-event.
+- Session-scoped metadata (`--model`, `--task-id`) is acceptable as CLI args since it is constant across all relay calls. Per-event data belongs in the stdin JSON payload.
