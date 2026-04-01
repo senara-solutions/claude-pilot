@@ -24,7 +24,11 @@ process.on("uncaughtException", (err) => {
       stack: err.stack,
     }) + "\n",
   );
+  // Set exitCode to allow pending I/O (e.g. ResultJson on stdout) to flush,
+  // but schedule a forced exit — after an uncaught exception the process is
+  // in an undefined state and may hang if the event loop doesn't drain.
   process.exitCode = 1;
+  setTimeout(() => process.exit(1), 500).unref();
 });
 
 process.on("unhandledRejection", (reason) => {
