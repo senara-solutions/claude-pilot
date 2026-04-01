@@ -3,13 +3,44 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import dotenv from "dotenv";
-import type { PilotConfig, GuardrailConfig } from "./types.js";
+import type { PilotConfig, GuardrailConfig, ResultJson } from "./types.js";
 import { PilotConfigSchema } from "./types.js";
 import { createPermissionHandler } from "./permissions.js";
 import { runAgent } from "./agent.js";
 import { SessionGuardrails, resolveGuardrailDefaults } from "./guardrails.js";
 import { initFileLog, closeFileLog } from "./logger.js";
 import { logConfig, logEnv } from "./ui.js";
+
+// --- Global error handlers ---
+// Catch late-firing errors from SDK teardown / dangling promises.
+// Registered before any async work so they cover every phase.
+// Log structured JSON to stderr (stdout is reserved for ResultJson)
+// and set exitCode = 1 so callers distinguish "known crash" from "unknown fatal" (exit code 5).
+process.on("uncaughtException", (err) => {
+  process.stderr.write(
+    JSON.stringify({
+      error: "uncaughtException",
+      message: err.message,
+      stack: err.stack,
+    }) + "\n",
+  );
+  // Set exitCode to allow pending I/O (e.g. ResultJson on stdout) to flush,
+  // but schedule a forced exit — after an uncaught exception the process is
+  // in an undefined state and may hang if the event loop doesn't drain.
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 500).unref();
+});
+
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(
+    JSON.stringify({
+      error: "unhandledRejection",
+      message: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    }) + "\n",
+  );
+  process.exitCode = 1;
+});
 
 function usage(): never {
   process.stderr.write(
@@ -353,6 +384,18 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+  const message = err instanceof Error ? err.message : String(err);
+  // Emit structured ResultJson so callers always have parseable output,
+  // even when the error occurs before/after the agent session.
+  const resultJson: ResultJson = {
+    status: "error",
+    subtype: "fatal",
+    turns: 0,
+    cost_usd: 0,
+    duration_ms: 0,
+    errors: [message],
+  };
+  process.stdout.write(JSON.stringify(resultJson) + "\n");
+  process.stderr.write(`Fatal: ${message}\n`);
   process.exit(1);
 });
