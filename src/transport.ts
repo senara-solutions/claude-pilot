@@ -19,11 +19,13 @@ export async function invokeCommand(
   event: PilotEvent,
   signal: AbortSignal,
   verbose: boolean,
+  taskId?: string,
 ): Promise<PilotResponse> {
   const timeout = config.timeout ?? 120_000;
 
   const args = [...(config.args ?? []), "-"];
   if (config.model) args.push("--model", config.model);
+  if (taskId) args.push("--task-id", taskId);
 
   if (verbose) {
     logVerbose(`invoking: ${config.command} ${args.join(" ")}`);

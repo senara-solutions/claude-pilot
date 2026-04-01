@@ -334,6 +334,7 @@ async function main(): Promise<void> {
     verbose: opts.verbose,
     cwd: opts.cwd,
     guardrails,
+    taskId: opts.taskId,
   });
 
   const prompt = opts.command ? `${opts.command} ${opts.prompt}` : opts.prompt;
