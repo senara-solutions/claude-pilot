@@ -6,6 +6,7 @@ let fileStream: WriteStream | undefined;
 export function initFileLog(filePath: string): void {
   mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
   fileStream = createWriteStream(filePath, { flags: "a", mode: 0o600 });
+  fileStream.on("error", () => {}); // Swallow — log file is best-effort
 }
 
 export function writeLog(msg: string): void {
