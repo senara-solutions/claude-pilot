@@ -1,7 +1,7 @@
 ---
 title: "fix: V8 fatal error (exit code 5) on process teardown"
 type: fix
-status: active
+status: completed
 date: 2026-04-02
 issue: 29
 ---
