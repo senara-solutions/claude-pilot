@@ -381,6 +381,12 @@ async function main(): Promise<void> {
   });
 
   closeFileLog();
+
+  // Force exit with the intended code. After runAgent() returns and ResultJson
+  // is on stdout, there is nothing left to do. Letting Node.js drain the event
+  // loop risks a V8 fatal error (exit code 5) from SDK transport cleanup.
+  // See: https://github.com/senara-solutions/claude-pilot/issues/29
+  process.exit(process.exitCode ?? 0);
 }
 
 main().catch((err) => {

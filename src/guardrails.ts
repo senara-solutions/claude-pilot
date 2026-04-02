@@ -154,7 +154,7 @@ export class SessionGuardrails {
         "idle_timeout",
         `No meaningful progress for ${Math.round(this.resolvedConfig.idleTimeoutMs / 1000)}s`,
       );
-    }, this.resolvedConfig.idleTimeoutMs);
+    }, this.resolvedConfig.idleTimeoutMs).unref();
   }
 
   private abort(
