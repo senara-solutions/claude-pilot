@@ -92,9 +92,16 @@ main().catch((err) => {
 
 ### Defense-in-depth: Logger and guardrail hardening
 
-**Logger:** No-op error handler on the file write stream prevents log I/O errors from escalating to `uncaughtException` and changing the exit code:
+**Logger:** Error handler on the file write stream prevents log I/O errors from escalating to `uncaughtException` and changing the exit code. Emits a one-time diagnostic to stderr and disables further log writes:
 ```typescript
-fileStream.on("error", () => {}); // Swallow — log file is best-effort
+let logErrorReported = false;
+fileStream.on("error", (err) => {
+  if (!logErrorReported) {
+    logErrorReported = true;
+    process.stderr.write(`Warning: log file write error: ${err.message}\n`);
+  }
+  fileStream = undefined;
+});
 ```
 
 **Guardrails:** Idle timer uses `.unref()` so it cannot keep the event loop alive if `dispose()` is somehow skipped:
