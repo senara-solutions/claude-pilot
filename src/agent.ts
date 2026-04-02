@@ -158,6 +158,8 @@ export async function runAgent(opts: AgentOptions): Promise<void> {
     }
     throw err;
   } finally {
+    // Deregister SDK exit handler to prevent V8 crash on process.exit() (#29)
+    try { q.close(); } catch { /* already cleaned up */ }
     guardrails.dispose();
   }
 }
