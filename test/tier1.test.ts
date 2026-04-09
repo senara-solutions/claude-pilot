@@ -502,6 +502,85 @@ describe("isWithinProject", () => {
   });
 });
 
+// ── Skill tool: pipeline slash commands ─────────────────────────────────────
+
+describe("Skill tool — pipeline slash commands", () => {
+  // All allowlisted skills (short form)
+  it.each([
+    "mika",
+    "ce:plan",
+    "ce:work",
+    "ce:review",
+    "ce:compound",
+    "ce:brainstorm",
+    "ralph-loop",
+    "ralph-loop:ralph-loop",
+    "ralph-loop:cancel-ralph",
+    "ralph-loop:help",
+    "mika-doc-audit",
+  ])("auto-approves short-form skill: %s", (skill) => {
+    expect(isTier1AutoApprove("Skill", { skill }, CWD)).toBe(true);
+  });
+
+  // All allowlisted skills (fully-qualified form)
+  it.each([
+    "compound-engineering:ce-plan",
+    "compound-engineering:ce-work",
+    "compound-engineering:ce-review",
+    "compound-engineering:ce-compound",
+    "compound-engineering:ce-brainstorm",
+    "compound-engineering:resolve_todo_parallel",
+  ])("auto-approves fully-qualified skill: %s", (skill) => {
+    expect(isTier1AutoApprove("Skill", { skill }, CWD)).toBe(true);
+  });
+
+  // Args are ignored for matching — only input.skill matters
+  it("auto-approves regardless of args", () => {
+    expect(isTier1AutoApprove("Skill", { skill: "ce:plan", args: "--deep" }, CWD)).toBe(true);
+    expect(isTier1AutoApprove("Skill", { skill: "mika", args: "#214" }, CWD)).toBe(true);
+    expect(isTier1AutoApprove("Skill", { skill: "ralph-loop", args: "finish all slash commands" }, CWD)).toBe(true);
+  });
+
+  // Non-allowlisted skills are relayed
+  it.each([
+    "unknown-skill",
+    "some-plugin:dangerous-action",
+    "WebSearch",
+    "agent-browser",
+  ])("relays non-allowlisted skill: %s", (skill) => {
+    expect(isTier1AutoApprove("Skill", { skill }, CWD)).toBe(false);
+  });
+
+  // Defensive: missing or malformed input.skill
+  it("relays when input.skill is missing", () => {
+    expect(isTier1AutoApprove("Skill", {}, CWD)).toBe(false);
+  });
+
+  it("relays when input.skill is not a string", () => {
+    expect(isTier1AutoApprove("Skill", { skill: 42 }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Skill", { skill: null }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Skill", { skill: undefined }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Skill", { skill: true }, CWD)).toBe(false);
+  });
+
+  it("relays when input.skill is empty string", () => {
+    expect(isTier1AutoApprove("Skill", { skill: "" }, CWD)).toBe(false);
+  });
+
+  // Whitespace trimming
+  it("trims whitespace from skill name before matching", () => {
+    expect(isTier1AutoApprove("Skill", { skill: "  ce:plan  " }, CWD)).toBe(true);
+    expect(isTier1AutoApprove("Skill", { skill: "\tralph-loop\n" }, CWD)).toBe(true);
+  });
+
+  // Case sensitivity — skill names are case-sensitive
+  it("is case-sensitive (does not match wrong case)", () => {
+    expect(isTier1AutoApprove("Skill", { skill: "CE:PLAN" }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Skill", { skill: "Mika" }, CWD)).toBe(false);
+    expect(isTier1AutoApprove("Skill", { skill: "RALPH-LOOP" }, CWD)).toBe(false);
+  });
+});
+
 // ── isTier1AutoApprove integration ──────────────────────────────────────────
 
 describe("isTier1AutoApprove integration", () => {

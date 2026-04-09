@@ -51,6 +51,7 @@ src/types.ts        → PilotEvent, PilotResponse (Zod schema), PilotConfig, Gua
 - `execFile` (not `exec`) prevents shell injection
 - Sensitive env vars (`ANTHROPIC_API_KEY`, etc.) are scrubbed before spawning commands
 - **Session guardrails** detect degenerate loops (stall, empty responses, idle) and terminate via `AbortController` with structured `ResultJson` output. SDK-native `maxTurns`/`maxBudgetUsd` are passed through to `query()`. Idle timer pauses during `canUseTool` to avoid false positives from slow relay agents.
+- **Pipeline slash commands bypass mika-dev approval.** The `Skill` tool invocations for `/mika`, `/ce:*`, `/ralph-loop:*`, `/compound-engineering:resolve_todo_parallel`, and `/mika-doc-audit` are auto-approved at TIER 1. These are the agent's own orchestration steps — routing them through the relay exposes them to LLM-driven approval that can rationalize fabricated denials. The allowlist is in `TIER1_SAFE_SKILLS` in `src/tier1.ts`.
 
 ## Environment Variables
 

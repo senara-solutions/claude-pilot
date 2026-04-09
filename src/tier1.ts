@@ -41,11 +41,57 @@ export function isTier1AutoApprove(
       return isWithinProject(filePath, cwd);
     }
 
+    // Auto-approve pipeline slash commands.
+    // Only the skill name is checked — args are intentionally ignored because
+    // skills are prompt-only orchestration; any tool calls they make go through
+    // their own canUseTool check independently.
+    case "Skill": {
+      const skill = typeof input.skill === "string" ? input.skill.trim() : "";
+      return TIER1_SAFE_SKILLS.has(skill);
+    }
+
     // Never auto-approve
     default:
       return false;
   }
 }
+
+// ── Pipeline slash commands (Skill tool) ────────────────────────────────────
+
+/**
+ * Pipeline-internal slash commands that bypass relay approval.
+ * These are the agent's own orchestration — never ask mika-dev.
+ *
+ * Includes both short forms (ce:plan) and fully-qualified forms
+ * (compound-engineering:ce-plan) because the SDK can send either.
+ *
+ * To add a new pipeline skill: add the exact `input.skill` string here.
+ */
+const TIER1_SAFE_SKILLS: ReadonlySet<string> = new Set([
+  // /mika pipeline entrypoint
+  "mika",
+  // CE workflow commands (short form)
+  "ce:plan",
+  "ce:work",
+  "ce:review",
+  "ce:compound",
+  "ce:brainstorm",
+  // CE workflow commands (fully-qualified form)
+  "compound-engineering:ce-plan",
+  "compound-engineering:ce-work",
+  "compound-engineering:ce-review",
+  "compound-engineering:ce-compound",
+  "compound-engineering:ce-brainstorm",
+  // CE utility commands
+  "compound-engineering:resolve_todo_parallel",
+  // Ralph loop (all sub-commands)
+  "ralph-loop",
+  "ralph-loop:ralph-loop",
+  "ralph-loop:cancel-ralph",
+  "ralph-loop:help",
+  // Doc audit
+  "mika-doc-audit",
+]);
 
 // ── Deny-list ────────────────────────────────────────────────────────────────
 
