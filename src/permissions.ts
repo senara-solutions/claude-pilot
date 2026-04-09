@@ -277,7 +277,7 @@ function summarizeInput(
       return String(input.pattern ?? "");
     case "Skill": {
       const skill = String(input.skill ?? "unknown");
-      const args = input.args ? ` ${String(input.args).slice(0, 100)}` : "";
+      const args = input.args ? ` ${scrubSecrets(String(input.args).slice(0, 100))}` : "";
       return `${skill}${args}`;
     }
     default:

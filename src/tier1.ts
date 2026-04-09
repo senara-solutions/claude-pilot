@@ -41,7 +41,10 @@ export function isTier1AutoApprove(
       return isWithinProject(filePath, cwd);
     }
 
-    // Auto-approve pipeline slash commands
+    // Auto-approve pipeline slash commands.
+    // Only the skill name is checked — args are intentionally ignored because
+    // skills are prompt-only orchestration; any tool calls they make go through
+    // their own canUseTool check independently.
     case "Skill": {
       const skill = typeof input.skill === "string" ? input.skill.trim() : "";
       return TIER1_SAFE_SKILLS.has(skill);
