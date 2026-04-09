@@ -84,11 +84,6 @@ const TIER1_SAFE_SKILLS: ReadonlySet<string> = new Set([
   "compound-engineering:ce-brainstorm",
   // CE utility commands
   "compound-engineering:resolve_todo_parallel",
-  // Ralph loop (all sub-commands)
-  "ralph-loop",
-  "ralph-loop:ralph-loop",
-  "ralph-loop:cancel-ralph",
-  "ralph-loop:help",
   // Doc audit
   "mika-doc-audit",
 ]);
