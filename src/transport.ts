@@ -98,12 +98,20 @@ export async function invokeCommand(
       );
     }
 
-    // Write event payload to stdin
+    // Write event payload to stdin, prefixed with a structural marker that the
+    // external relay agent uses to distinguish PilotEvent messages from regular
+    // user messages and webhook notifications. Without this marker, LLM-backed
+    // relay agents (e.g. mika-dev's self-dev skill) may apply the JSON-only
+    // PilotResponse format to any structured-looking user message and fail to
+    // process it as prose — observed on 2026-04-11 with qwen3-coder emitting
+    // `{"action":"allow"}` to sprint dispatch prompts and to `[GitHub] PR
+    // review (commented)` webhooks. The relay agent's system prompt keys on
+    // this exact literal prefix to gate the JSON-only response contract.
     if (child.stdin) {
       child.stdin.on("error", () => {
         // Ignore broken pipe — child may have exited before we finished writing
       });
-      child.stdin.write(JSON.stringify(event));
+      child.stdin.write(`[claude-pilot] ${JSON.stringify(event)}`);
       child.stdin.end();
     }
   });
