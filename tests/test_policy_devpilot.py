@@ -210,6 +210,84 @@ def test_guard_vetoes_allowlisted_mixed_with_evil_substitution() -> None:
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
 
 
+def test_guard_allows_git_merge_base_substitution_base_drift_idiom() -> None:
+    """18-incident class 2026-07-27 — dispatch-lib base-drift detection uses
+    `$(git merge-base main HEAD)` to compute the merge base then diff. Both
+    variants (main and origin/main) must round-trip through chain-safe."""
+    # Assert both merge-base tokens are enumerated. The broader integration test
+    # above (`test_guard_allows_each_allowlisted_substitution_token`) iterates
+    # every entry inside a `gh pr view --head <TOKEN>` outer, so token addition
+    # is exercised end-to-end there. This test pins the founding-incident tokens
+    # explicitly so a future refactor cannot silently drop them without a
+    # named-test failure pointing at the 18-incident class.
+    for token in (
+        "$(git merge-base main HEAD)",
+        "$(git merge-base origin/main HEAD)",
+    ):
+        assert token in _SUBSTITUTION_ALLOWLIST, token
+
+
+def test_policy_bash_derive_scripts_allow_shape() -> None:
+    """18-incident class 2026-07-27 — dispatch-lib helpers `./scripts/derive-*`
+    were falling through to default-deny. `bash-derive-scripts` policy rule
+    admits the sanctioned invocations; chain-safety still applies to any tail."""
+    for cmd in (
+        "./scripts/derive-branch-name issue-1852",
+        "./scripts/derive-worktree-path fix/1852/foo",
+        "./scripts/derive-phase-from-body ISSUE_BODY.md",
+        "./scripts/derive-branch-name issue-1852 2>/dev/null",
+    ):
+        pd = evaluate(_POLICY, "Bash", {"command": cmd})
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-derive-scripts", f"{cmd}: {pd.rule_id}"
+        # Chain-safe check on the standalone command (single segment = the same
+        # command) must also honor it (via policy re-eval on the segment).
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_policy_bash_derive_scripts_rejects_metachar_args() -> None:
+    """Charset restriction on args: `$`, backtick, quotes, pipe, semicolon,
+    ampersand, redirects, spaces (except separator) MUST NOT match the rule.
+    The pattern's `[\\w./=:-]+` class enforces this at the regex layer — any
+    metachar in an arg falls through to default-deny.
+    """
+    for cmd in (
+        "./scripts/derive-branch-name $(rm -rf ~)",   # substitution
+        "./scripts/derive-branch-name `id`",           # backtick
+        "./scripts/derive-branch-name 'arg with spaces'",  # quoted arg
+        "./scripts/derive-branch-name arg;rm -rf ~",   # chained via ;
+        "./scripts/derive-branch-name arg|cat",        # piped
+        "./scripts/derive-branch-name arg>file",       # redirect
+        "./scripts/derive-branch-name arg&background", # bare & backgrounding
+    ):
+        pd = evaluate(_POLICY, "Bash", {"command": cmd})
+        # Either the rule doesn't match (falls to default deny) OR
+        # chain-safe subsequently vetoes (compound with a bad tail segment).
+        # Both paths result in the invocation being denied — the safety
+        # invariant is "no metachar in a derive-script arg is auto-approved".
+        if pd.decision == "allow" and pd.rule_id == "bash-derive-scripts":
+            # If the policy rule matched somehow, chain-safe MUST veto.
+            assert (
+                _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+            ), f"metachar arg allowed and chain-safe: {cmd}"
+        # else: rule did not match → default deny → safe.
+
+
+def test_policy_bash_derive_scripts_rejects_unknown_script() -> None:
+    """Closed-world script set: only `derive-{branch-name,worktree-path,phase-from-body}`.
+    Any other script (even under ./scripts/) falls through to default-deny.
+    Widening the set requires a separate evidence-gated ticket (cpp#34)."""
+    for cmd in (
+        "./scripts/derive-foo x",           # unknown derive-*
+        "./scripts/other-script x",         # different script family
+        "./scripts/mika-orchestrator-poll", # sibling script not on the closed set
+    ):
+        pd = evaluate(_POLICY, "Bash", {"command": cmd})
+        assert not (
+            pd.decision == "allow" and pd.rule_id == "bash-derive-scripts"
+        ), f"unknown script matched bash-derive-scripts: {cmd}"
+
+
 def test_guard_exempts_sole_command_heredoc() -> None:
     cmd = "cat > /tmp/helper.sh <<'EOF'\nrm -rf /tmp/build\nEOF"
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
