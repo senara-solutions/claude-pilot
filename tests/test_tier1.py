@@ -263,6 +263,41 @@ def test_git_unknown_subcommand_denied() -> None:
     assert is_safe_git_command("git obliterate") is False
 
 
+# ── git merge-base (18-incident class 2026-07-27) ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git merge-base main HEAD",
+        "git merge-base origin/main HEAD",
+        "git merge-base main feature/foo",
+        "git merge-base --octopus branch-a branch-b branch-c",
+    ],
+)
+def test_git_merge_base_allowed(command: str) -> None:
+    """merge-base is read-only stdout SHA lookup — same class as rev-parse."""
+    assert is_safe_git_command(command) is True, command
+
+
+def test_git_merge_base_compound_with_diff_allowed() -> None:
+    """`base=$(git merge-base ...)` companion pattern: compound `git merge-base &&
+    git diff --name-only` also passes via chain-safe (each segment tier1-safe).
+    This covers the 18-incident 'git merge-base + git diff --name-only' shape
+    from mika#1849 dev-pilot code-review halt."""
+    assert (
+        is_safe_bash_command("git merge-base main HEAD && git diff --name-only")
+        is True
+    )
+
+
+def test_git_merge_base_force_flag_still_denied() -> None:
+    """Defense-in-depth: the shared `_FORCE_FLAG_RE` check still fires. There is
+    no legitimate `--force` on merge-base, but the check is uniform across all
+    git subcommands so the coverage is worth asserting."""
+    assert is_safe_git_command("git merge-base --force main HEAD") is False
+
+
 # ── make-specific (cpp#45 / mika#1639; architect 783d4a04) ───────────────────
 #
 # Closed-world `make` allowlist: only `make verify-bundled-skills` auto-approves.

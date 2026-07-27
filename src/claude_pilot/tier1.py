@@ -447,6 +447,14 @@ SAFE_GIT_SUBCOMMANDS: frozenset[str] = frozenset({
     "fetch", "pull", "add", "stash", "tag", "merge",
     "rebase", "cherry-pick", "symbolic-ref",
     "ls-files", "describe", "shortlog", "blame",
+    # `merge-base` is read-only: prints the best common ancestor commit SHA on
+    # stdout, has no filesystem or ref-mutation side effects. Same safety class
+    # as `rev-parse` / `describe` / `shortlog` already in this set.
+    # Groom-phase pilots need it to detect base-drift before diff (`git merge-base
+    # main HEAD` then `git diff --name-only $BASE HEAD`). Added after 18-incident
+    # policy:deny class observed 2026-07-26 → 2026-07-27 blocked dev-groom /
+    # dev-pilot on mika#1852/#1849/#1401/#1403 (compound-bash tier1/tier2 gap).
+    "merge-base",
 })
 
 _GIT_CMD_RE = re.compile(r"^\s*git\s+(\S+)")

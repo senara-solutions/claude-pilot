@@ -182,6 +182,17 @@ _SUBSTITUTION_ALLOWLIST = (
     "$(git rev-parse --abbrev-ref HEAD)",
     "$(git rev-parse HEAD)",
     "$(git rev-parse --short HEAD)",
+    # `merge-base` prints the best common ancestor SHA on stdout — same class as
+    # the rev-parse tokens above (short identifier output, no side effects, no
+    # nested `$(`, backtick, redirect, or pipe). The main / origin/main variants
+    # are the base-drift detection idiom used by dispatch-lib and dev-groom
+    # (`BASE=$(git merge-base main HEAD); git diff --name-only $BASE HEAD`).
+    # 18-incident policy:deny class 2026-07-26 → 2026-07-27 (mika#1852/#1849
+    # groom/pilot halted on this shape). Coupled pair with the `merge-base`
+    # addition to `SAFE_GIT_SUBCOMMANDS` in tier1.py — both must land together
+    # to unblock the compound and its standalone form.
+    "$(git merge-base main HEAD)",
+    "$(git merge-base origin/main HEAD)",
 )
 
 # Inert placeholder a redacted substitution collapses to. Identifier-shaped with

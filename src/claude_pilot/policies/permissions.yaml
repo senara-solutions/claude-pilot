@@ -125,9 +125,42 @@ rules:
 
   - id: bash-git-readonly
     tool: Bash
-    pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree)"
+    pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree|merge-base)"
     decision: allow
-    reason: "git read-only operations"
+    reason: "git read-only operations (merge-base is common-ancestor SHA lookup, no side effects — added 2026-07-27 with 18-incident compound-bash class)"
+
+  # ---- Dispatch-lib deterministic helper scripts ----
+  # `./scripts/derive-{branch-name,worktree-path,phase-from-body}` are the
+  # deterministic shell helpers used by `_shared/dispatch-lib.sh` (mika-platform)
+  # to compute worktree paths, branch refs, and phase-from-body from a groom
+  # brief. Each is:
+  #   - PURE COMPUTATION: reads its args, prints one identifier to stdout.
+  #   - NO FILESYSTEM WRITES: no `>`, no `mkdir`, no `cp/mv/rm`, no `sed -i`.
+  #   - NO NETWORK: no `curl`, `wget`, `gh`, `git push`.
+  #   - NO SUBPROCESS: no `sh -c`, `bash -c`, `eval`, `source`.
+  #
+  # The rule allow-shape is anchored + argument-charset restricted so a
+  # malicious pilot cannot smuggle metachars into an arg to escape the script's
+  # own sanitization:
+  #   - `^\./scripts/derive-(…)` closed-world script set (3 named scripts only)
+  #   - `(\s+[\w./=:-]+)*` args restricted to word-chars + dot/slash/=/colon/hyphen
+  #     — excludes `$`, backtick, quotes, pipe, semicolon, ampersand, redirects,
+  #     spaces (except separator). No substitution risk at THIS layer.
+  #   - `\s*$` trailing anchor — nothing rides after the last arg.
+  #
+  # Chain-safety (`_bash_allow_is_chain_safe`) still applies compound-wide, so
+  # `./scripts/derive-branch-name x && rm -rf ~` still vetoes on the tail segment.
+  #
+  # Founding evidence: 18-incident policy:deny class 2026-07-26 → 2026-07-27
+  # (compound-bash tier1/tier2 gap). Multiple incidents cited
+  # `./scripts/derive-branch-name … 2>/dev/null || echo …` as the deny trigger.
+  # Widening the closed-set (adding a 4th script) requires evidence + a separate
+  # ticket per cpp#34 discipline (mika-arch session 783d4a04).
+  - id: bash-derive-scripts
+    tool: Bash
+    pattern: '^\./scripts/derive-(branch-name|worktree-path|phase-from-body)(\s+[\w./=:-]+)*\s*(2>/dev/null)?\s*$'
+    decision: allow
+    reason: "./scripts/derive-{branch-name,worktree-path,phase-from-body} — dispatch-lib deterministic helpers, pure stdout print, arg charset restricted to [\\w./=:-] (no metachars/substitution)"
 
   - id: bash-git-stage-commit
     tool: Bash
