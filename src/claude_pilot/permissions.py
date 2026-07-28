@@ -193,6 +193,44 @@ _SUBSTITUTION_ALLOWLIST = (
     # to unblock the compound and its standalone form.
     "$(git merge-base main HEAD)",
     "$(git merge-base origin/main HEAD)",
+    # cpp#95: reverse argument order — `git merge-base` is commutative, so the
+    # HEAD-first variants are the same read-only-plumbing-emits-short-SHA safety
+    # class as the main-first variants above. mika-dev pilots write both orders
+    # organically: `BASE=$(git merge-base HEAD main) || BASE="main"`. Adding both
+    # orderings drops one of the three sampled cpp#95 prod-failure classes
+    # (mika-db tasks id `27ea7dc4-5dfb-40cf-bc44-85970cd28e72`, mika#1824).
+    #
+    # NOT added (deferred to follow-up): the `2>/dev/null` variants
+    # (`$(git merge-base HEAD main 2>/dev/null)`). The `2>` inside the
+    # substitution violates the "no nested redirect" invariant of this doctrine.
+    # Even though `/dev/null` is inert, admitting redirects into the allow-list
+    # requires a separate architectural pass to prove the invariant expansion.
+    "$(git merge-base HEAD main)",
+    "$(git merge-base HEAD origin/main)",
+    # cpp#95: `$(date +%F)` and `$(date +%Y-%m-%d)`. `date` is a POSIX read-only
+    # utility with no filesystem or ref-mutation side effects. `+%F` and
+    # `+%Y-%m-%d` are literal format specifiers producing a fixed-length
+    # YYYY-MM-DD string on stdout — the same short-identifier-output class as
+    # the git-plumbing tokens above (no nested `$(`, backtick, redirect, or
+    # pipe in the token). Used by mika-dev pilots for date-templated filenames
+    # (`docs/plans/$(date +%F)-...`, `grep "$(date +%F)" ...`). Drops the second
+    # sampled cpp#95 prod-failure class (mika-db tasks id
+    # `5c3c4622-6d9f-43be-9c1d-07a9b72e4478`, mika#1823) and the third
+    # (`b22e4b7a-3e01-410f-a18b-92c9a0fdf9ff`, mika#1712).
+    "$(date +%F)",
+    "$(date +%Y-%m-%d)",
+    # cpp#95: `$(pwd)`. `pwd` is a POSIX shell builtin (also `/usr/bin/pwd` as
+    # a distinct binary — this literal invokes whichever bash resolves) that
+    # prints the current working directory on stdout — a bounded short path
+    # string, no side effects. Same class as the tokens above (no nested `$(`,
+    # backtick, redirect, or pipe in the token). Used by mika-dev pilots for
+    # relative-to-absolute path composition (`cd "$(pwd)/subdir"`,
+    # `cat "$(pwd)/manifest.json"`). Preemptive addition alongside the two
+    # `date` and two `merge-base HEAD-first` tokens — same evidence class
+    # (compound-bash tier1 gap 2026-07-26 → 2026-07-28 rupture-D storm, 12
+    # rescue-drafts single-day peak). See cpp#95 body for full pattern
+    # analysis.
+    "$(pwd)",
 )
 
 # Inert placeholder a redacted substitution collapses to. Identifier-shaped with
