@@ -191,6 +191,26 @@ def load_policy(path: Path | None = None) -> Policy:
 # ── Evaluator ───────────────────────────────────────────────────────────────
 
 
+# DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
+#
+# Applies per senara-solutions/mika @
+# crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+#
+#   "This agent structurally cannot do X" applies to pre-classifier engine
+#   gates only, NEVER to LLM classifier decisions.
+#
+# THIS IS THE TIER-2 CLASSIFIER ENTRY POINT — rules-file-driven policy
+# evaluation via first-match regex (YAML-authored rules loaded from
+# `policies/permissions.yaml`). Decisions here are POLICY (deny/allow/escalate
+# per rule regex), NOT structural gates. Agents downstream (mika-dev, mika-qa)
+# MUST NOT frame tier-2 denials as "structurally cannot" — those framings are
+# reserved for the pre-classifier structural gates in mika-agent
+# (`validate_dispatch_readiness`, `is_unauthorized_webhook_dispatch`).
+#
+# Companion tier anchors live in claude_pilot/tier1.py (tier1 + tier3);
+# see cpp#83 for the full-tier-set anchoring rationale + mika#1193 for the
+# retirement reference that moved these classifier tiers from mika-agent
+# into claude-pilot-py.
 def evaluate(policy: Policy, tool_name: str, tool_input: dict[str, Any]) -> PolicyDecision:
     """Evaluate a tool invocation against *policy*.
 
