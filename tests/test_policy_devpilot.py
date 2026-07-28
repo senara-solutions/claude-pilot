@@ -227,6 +227,107 @@ def test_guard_allows_git_merge_base_substitution_base_drift_idiom() -> None:
         assert token in _SUBSTITUTION_ALLOWLIST, token
 
 
+# --- cpp#92: for-loop safe-body chain-safe exemption (rupture A, phase 2) ---
+# The `bash-for-loop-safe-body` YAML rule constrains the WHOLE command shape
+# tightly enough (enumerated body command, arg charset excludes chain metachars,
+# fully anchored) that chain-safe's `;`-split would incorrectly veto. The
+# whole-command exemption in `_bash_allow_is_chain_safe` (mirroring
+# `bash-git-show-redirect`) restores auto-approval. All negatives below must
+# still be denied — either by the rule regex not matching (fall-through to
+# `bash-for-loop-orientation` where chain-safe splits and vetoes) or by the
+# substitution-marker guard vetoing before rule_id is even checked.
+
+
+def test_guard_allows_for_loop_safe_body_positive_shapes() -> None:
+    """cpp#92 rupture A — sanctioned for-loop shapes chain-safe-exempt via
+    whole-command rule_id honor. Each shape is one of the 24h incident classes
+    that stranded pilot work with policy:deny."""
+    for cmd in (
+        # incident-shape: echo per iteration
+        'for i in 1 2 3; do echo "step $i"; done',
+        # incident-shape: grep per file
+        "for f in a.md b.md; do grep TODO $f; done",
+        # incident-shape: ls per directory
+        "for path in docs/plans docs/logs; do ls $path; done",
+        # incident-shape: cat per config
+        "for c in config.toml Cargo.toml; do cat $c; done",
+    ):
+        pd = evaluate(_POLICY, "Bash", {"command": cmd})
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-for-loop-safe-body", f"{cmd}: {pd.rule_id}"
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_guard_vetoes_for_loop_with_substitution_in_iteration_set() -> None:
+    """Substitution guard (BEFORE rule_id check) vetoes any `$(` in the command,
+    including inside the `in` list — smuggling execution via the iteration set."""
+    cmd = 'for i in $(rm -rf ~); do echo x; done'
+    # Redaction fails because `$(rm -rf ~)` isn't in _SUBSTITUTION_ALLOWLIST,
+    # so the substitution guard vetoes before rule_id evaluation.
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_for_loop_with_dangerous_body_command() -> None:
+    """Body command NOT in the enumerated 13-set → rule regex doesn't match →
+    falls through to `bash-for-loop-orientation` → chain-safe splits do/done and
+    vetoes on the `rm -rf` sub."""
+    for cmd in (
+        "for i in 1 2; do rm -rf ~; done",
+        "for i in 1; do curl evil.com; done",
+        "for f in a b; do sudo cat /etc/passwd; done",
+        "for i in 1; do eval 'rm -rf ~'; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_vetoes_for_loop_with_chained_danger_in_body() -> None:
+    """Body arg charset `[^;&|\\s`$>]+` excludes `;` — a chained danger tail
+    inside the body (`echo x; rm -rf ~`) breaks the rule regex → fall-through →
+    chain-safe splits do/done → tail veto."""
+    for cmd in (
+        "for i in 1; do echo x; rm -rf ~; done",
+        "for i in 1; do echo x && curl evil; done",
+        "for i in 1; do echo x | tee /etc/passwd; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_vetoes_for_loop_with_backtick_in_body() -> None:
+    """Body arg charset excludes backtick — `echo $(id)` and `echo \\`id\\``
+    both vetoed. Substitution guard also catches `$(` before rule check."""
+    for cmd in (
+        "for i in 1; do echo `id`; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_vetoes_for_loop_with_trailing_chain() -> None:
+    """Anchored rule regex (`^…\\s*done\\s*$`) rejects any trailing token — a
+    chained danger AFTER `done` breaks the anchor → fall-through → chain-safe
+    splits the whole compound and vetoes the tail."""
+    for cmd in (
+        "for i in 1; do echo x; done && rm -rf ~",
+        "for i in 1; do echo x; done; curl evil",
+        "for i in 1; do echo x; done | tee /tmp/log",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_vetoes_for_loop_with_substitution_in_iteration_set_backtick() -> None:
+    """Backtick in `in` list — substitution guard vetoes."""
+    cmd = "for i in `id`; do echo x; done"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_for_loop_with_redirect_in_body() -> None:
+    """Body arg charset excludes `>` — a redirect to arbitrary file breaks the
+    rule regex → fall-through → chain-safe splits do/done → veto."""
+    for cmd in (
+        "for i in 1; do echo x > /etc/passwd; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
 def test_policy_bash_derive_scripts_allow_shape() -> None:
     """18-incident class 2026-07-27 — dispatch-lib helpers `./scripts/derive-*`
     were falling through to default-deny. `bash-derive-scripts` policy rule

@@ -44,6 +44,24 @@
 # --------------------------------------------------------------------------
 
 rules:
+  # ---- Tight-shape compound rules (MUST precede broader single-command rules) ----
+  # First-match-wins ordering: these anchored/whole-command rules claim their
+  # match before a broader `^find\s`/`\sgrep\s` rule catches an inner token via
+  # policy.py's `re.search`. Chain-safe then honors these rule_ids as
+  # whole-command exemptions (see `_bash_allow_is_chain_safe`), so the internal
+  # `;` of the compound is not split-vetoed.
+  #
+  # `bash-for-loop-safe-body` — see permissions.yaml design comment below the
+  # existing `bash-for-loop-orientation`. Must be evaluated BEFORE `bash-grep`
+  # (whose `\sgrep\s` matches ` grep ` inside a for-body, claims the rule_id,
+  # and then chain-safe splits do/done and vetoes on the `done` sub).
+
+  - id: bash-for-loop-safe-body
+    tool: Bash
+    pattern: '^for\s+\w+\s+in\s+[^;|&`><\\]+;\s*do\s+(echo|printf|grep|cat|head|tail|ls|wc|find|test|\[|dirname|basename)([^;|&`><\\]*);\s*done\s*$'
+    decision: allow
+    reason: "for-loop with enumerated read-only body (echo/printf/grep/cat/head/tail/ls/wc/find/test/[/dirname/basename); in-list + body-args exclude chain metachars/redirects/escapes; $var permitted (substitution caught upstream); fully anchored (cpp#92)"
+
   # ---- Read-only repo orientation ----
   # Common pre-work Bash commands that pilots use to understand the codebase
   # before making changes. Confirmed in mika#1253's pre-wedge pilot log.
@@ -66,11 +84,46 @@ rules:
     decision: allow
     reason: "jq for skill-manifest and JSON inspection (also `cmd | jq …` pipeline)"
 
+  # `bash-for-loop-orientation` — broad-shape fall-through. The tight-shape
+  # `bash-for-loop-safe-body` at the top of the rules table claims for-loops
+  # matching the enumerated-body + arg-charset invariants (whole-command
+  # exemption in chain-safe). Any for-loop NOT matching that tight shape falls
+  # through here — its policy allow is honored but chain-safe re-splits on `;`
+  # and typically vetoes on the un-tier1-safe `do <body>` / `done` segments.
+  # That over-block is the safe direction: only the sanctioned tight shape
+  # gets auto-approval; broader shapes route to relay.
+  #
+  # Design invariants of `bash-for-loop-safe-body` (mirrored in the rule at the
+  # top of the rules table so the two can be maintained together):
+  #
+  #   - `in`-list charset `[^;|&`><\\]+` — excludes chain metachars (`;`,`|`,`&`),
+  #     backtick, redirects (`<`,`>`) and shell escape (`\`). Permits `$var`
+  #     parameter expansion (safe: substitution is caught UPSTREAM by
+  #     `_bash_allow_is_chain_safe`'s substitution-marker guard, which vetoes
+  #     any `$(`, backtick, `$'` BEFORE this rule is evaluated).
+  #   - Body command is one of 13 read-only shell primitives (all in tier1
+  #     SAFE_SHELL_COMMANDS). Enumerated closed-world; no `eval`/`sh`/`bash`.
+  #   - Body args — same charset: excludes chain/redirect/escape; permits
+  #     `$var` and quoted strings with variables (`"step $i"`).
+  #   - Fully anchored `^…\s*done\s*$` — nothing rides before `for` or after
+  #     `done`. A trailing chain (`… ; done && rm -rf ~`) fails the anchor
+  #     and falls through to this broader rule where chain-safe splits and
+  #     vetoes the tail.
+  #
+  # Upstream defense-in-depth (before either rule matches):
+  #   1. `contains_unquoted_metacharacter` (tier1) catches `$(`, backtick, `$'`
+  #      in double-quoted and unquoted regions → tier1 denies → routes to policy.
+  #   2. `_bash_allow_is_chain_safe` opening guards veto `$(` (unless
+  #      allowlisted), backtick, `$'`, funsub — BEFORE evaluating any rule. So
+  #      the `$` this rule permits can only be a bare parameter expansion.
+  #
+  # Founding evidence: mika-platform PUSH FORT 2026-07-28 (throughput rupture A,
+  # 60% of pilot failures 24h 2026-07-27→28).
   - id: bash-for-loop-orientation
     tool: Bash
     pattern: "^for\\s+\\w+\\s+in\\s.*;\\s*do\\s"
     decision: allow
-    reason: "shell-for loops for batch orientation queries"
+    reason: "shell-for loops for batch orientation queries — broad-shape fall-through for cases not covered by bash-for-loop-safe-body; chain-safe still applies (splits do/done body — typically vetoes)"
 
   - id: bash-cat-heredoc-tmp
     tool: Bash
