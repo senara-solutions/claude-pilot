@@ -365,6 +365,24 @@ def _bash_allow_is_chain_safe(
     if pd.decision == "allow" and pd.rule_id == "bash-git-show-redirect":
         return True
 
+    # `bash-for-loop-safe-body` (cpp#92) — sanctioned exception to chain-safe's
+    # segment split, mirroring `bash-git-show-redirect`. The rule's YAML regex
+    # constrains the ENTIRE command shape (anchored `^for … done$`, enumerated
+    # body command, arg charset excludes `;`/`|`/`&`/backtick/`$`/`>`, in-list
+    # charset excludes `$`/backtick), so no chained danger can ride any layer
+    # of the compound. Splitting on the internal `;` between `in`/`do`/`done`
+    # would incorrectly veto — the split segments (`for x in y`, `do echo`,
+    # `done`) are each individually not tier1-safe and not policy-allow, so
+    # chain-safe would deny a shape the tight rule already provably vetted.
+    # The rule_id coupling fails CLOSED — if the YAML rule is renamed or
+    # dropped, this never fires and the command routes through the broader
+    # `bash-for-loop-orientation` rule where chain-safe DOES split (typically
+    # denying — which is the pre-cpp#92 60%-throughput-loss failure mode this
+    # exception is designed to close). See cpp#92 for the founding evidence
+    # (mika-platform PUSH FORT diagnostic 2026-07-28, rupture A).
+    if pd.decision == "allow" and pd.rule_id == "bash-for-loop-safe-body":
+        return True
+
     segments = _split_compound_command(command)
     if not segments:
         return False
