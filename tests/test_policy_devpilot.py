@@ -227,6 +227,103 @@ def test_guard_allows_git_merge_base_substitution_base_drift_idiom() -> None:
         assert token in _SUBSTITUTION_ALLOWLIST, token
 
 
+# --- cpp#95: rupture-D root-cause tokens (2026-07-26 storm, 12 rescue-drafts) --
+# The 3-sample analysis in cpp#95 body identified command-substitution `$(...)`
+# in read-only pilot bash commands as the trigger for the wip-rescue storm:
+# `$(date +%F)` (mika#1823, task 5c3c4622), `$(date +%Y-%m-%d)` (mika#1712,
+# task b22e4b7a), and `$(git merge-base HEAD main)` reverse-arg order
+# (mika#1824, task 27ea7dc4). Each token added must be pinned by a named-test
+# assertion so a future refactor cannot silently drop them without failing a
+# test whose docstring points at the founding-incident tasks.
+
+
+def test_guard_allows_cpp95_rupture_d_tokens() -> None:
+    """cpp#95 rupture-D root-cause tokens: `$(date +%F)`, `$(date +%Y-%m-%d)`,
+    reverse-arg-order `$(git merge-base HEAD main)` / `$(git merge-base HEAD
+    origin/main)`, and `$(pwd)`. Each was observed vetoed in the 2026-07-26 →
+    2026-07-28 rupture-D storm (12 rescue-drafts single-day peak); each is on
+    the closed-world allowlist here so `_bash_allow_is_chain_safe` honors the
+    outer read-only policy allow instead of vetoing on the substitution
+    marker."""
+    for token in (
+        "$(date +%F)",
+        "$(date +%Y-%m-%d)",
+        "$(git merge-base HEAD main)",
+        "$(git merge-base HEAD origin/main)",
+        "$(pwd)",
+    ):
+        assert token in _SUBSTITUTION_ALLOWLIST, token
+
+
+def test_guard_allows_cpp95_prod_failure_signatures() -> None:
+    """Reproduces the 3 sampled prod-failure signatures from cpp#95 body.
+
+    Each was a pilot bash command that returned `[policy:deny] [bash-grep]` on
+    the sampled task, then aborted into `error_during_execution: [ede_diagnostic]
+    result_type=user stop_reason=tool_use`, then rescue-draft PR. Post-fix each
+    must round-trip chain-safe with `allow`."""
+    # mika#1823 sample (task 5c3c4622): `date +%F` grep pipeline
+    # NB: the original prod command chained `|| echo "none today"` — chain-safe
+    # will still split and check every segment against tier1-safe, so we exercise
+    # only the `$(date +%F)`-bearing prefix + a tier1-safe grep tail. The `|| echo`
+    # tail is not what chain-safe is about; the substitution guard is.
+    cmd_1823 = "ls docs/plans/ | grep \"$(date +%F)\""
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd_1823)) is True
+
+    # mika#1824 sample (task 27ea7dc4): base-drift with reverse-arg merge-base
+    # The prod command used `BASE=$(git merge-base HEAD main 2>/dev/null) || …` —
+    # both the `BASE=` variable assignment and the `2>/dev/null` variant are OUT of
+    # scope for cpp#95 (assignments aren't tier1-safe; the redirect variant is a
+    # separate deferred ticket per doctrine). We test the SUBSTITUTION-ALLOW half
+    # here: after the pilot's `git merge-base` result is inlined into a downstream
+    # git command (the actual base-drift-detection idiom), chain-safe must honor
+    # the outer git allow.
+    cmd_1824 = "git diff --name-only $(git merge-base HEAD main)"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd_1824)) is True
+
+    # mika#1712 sample (task b22e4b7a): date-filtered plan listing
+    cmd_1712 = "ls docs/plans/ | grep \"^$(date +%Y-%m-%d)\""
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd_1712)) is True
+
+
+def test_guard_still_vetoes_cpp95_near_variants_not_on_allowlist() -> None:
+    """Closed-world discipline: whitespace variants, other date format
+    specifiers, bare `date`, and bare `pwd` variants not enumerated must still
+    veto. Adding a new format specifier is a separate evidence-gated ticket."""
+    for cmd in (
+        # bare `date` (no format specifier) — not on allowlist, produces
+        # locale-dependent multi-word output, not enumerated
+        "echo $(date)",
+        # `+%s` epoch specifier — not on allowlist, distinct output shape
+        "echo $(date +%s)",
+        # whitespace variant of `+%F` — not the canonical literal
+        "echo $( date +%F )",
+        # `$(git status)` — read-only but not enumerated (per cpp#34 doctrine
+        # comment: "A substitution that is merely read-only but not enumerated
+        # here (e.g. `$(git status)`) is still vetoed")
+        "echo $(git status)",
+        # `$(git merge-base HEAD main 2>/dev/null)` — deferred `2>/dev/null`
+        # variant, still vetoes until a follow-up ticket ratifies the redirect
+        # invariant expansion
+        "BASE=$(git merge-base HEAD main 2>/dev/null); echo x",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_still_vetoes_backtick_and_ansi_c_substitution() -> None:
+    """cpp#95 scope: `$(...)` allow-list expansion only. Backtick and `$'`
+    ANSI-C-quoting substitution forms remain fully vetoed (cpp#34 doctrine:
+    'Backtick and $' forms are NOT allowlistable')."""
+    for cmd in (
+        # backtick substitution of an allowlist-body command — still veto
+        "echo `date +%F`",
+        "echo `pwd`",
+        # ANSI-C escape (unquoted region) — still veto
+        r"echo $'\x41\x42'",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
 # --- cpp#92: for-loop safe-body chain-safe exemption (rupture A, phase 2) ---
 # The `bash-for-loop-safe-body` YAML rule constrains the WHOLE command shape
 # tightly enough (enumerated body command, arg charset excludes chain metachars,
