@@ -25,6 +25,27 @@ from pathlib import Path
 from typing import Any
 
 
+# DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
+#
+# Applies per senara-solutions/mika @
+# crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+#
+#   "This agent structurally cannot do X" applies to pre-classifier engine
+#   gates only, NEVER to LLM classifier decisions.
+#
+# THIS IS THE TIER-1 CLASSIFIER ENTRY POINT. Decisions here are POLICY
+# (allowlist-based fast-path for read-only tools + safe-command shapes),
+# NOT structural gates. Agents downstream (mika-dev, mika-qa) MUST NOT
+# frame tier-1 denials as "structurally cannot" or "structural denial" —
+# those framings are reserved for the pre-classifier structural gates in
+# mika-agent (`validate_dispatch_readiness`, `is_unauthorized_webhook_dispatch`
+# — see mika@crates/mika-agent/src/skills/executor.rs and
+# mika@crates/mika-agent/src/webhook_dispatch.rs for canonical shape).
+#
+# Retirement reference: mika#1193 moved the `permission-policy` skill's
+# classifier tiers from mika-agent into claude-pilot-py; this function
+# is one of the three landing sites (tier1/tier2/tier3) named in cpp#83
+# (this ticket) as needing the AC2 anchor.
 def is_tier1_auto_approve(tool_name: str, tool_input: dict[str, Any], cwd: str) -> bool:
     if tool_name in ("Read", "Glob", "Grep"):
         return True
@@ -150,6 +171,21 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+# DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
+#
+# Applies per senara-solutions/mika @
+# crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+#
+#   "This agent structurally cannot do X" applies to pre-classifier engine
+#   gates only, NEVER to LLM classifier decisions.
+#
+# THIS IS THE TIER-3 CLASSIFIER ENTRY POINT — the danger-pattern denylist
+# consulted by `is_safe_bash_command` after tier1 allowlist matching. Decisions
+# here are POLICY (regex denylist), NOT structural gates. Agents downstream
+# MUST NOT frame tier-3 denials as "structurally cannot" — same discipline
+# as tier-1 above. Companion pre-classifier structural gates in mika-agent:
+# `validate_dispatch_readiness`, `is_unauthorized_webhook_dispatch` (see the
+# tier-1 anchor above for the retirement reference — mika#1193).
 def is_tier3_dangerous(command: str) -> bool:
     # Strip universal fd-to-/dev/null silencing before the dangerous-pattern
     # check (see _FD_DEVNULL_RE comment). The strip is invisible to all other
