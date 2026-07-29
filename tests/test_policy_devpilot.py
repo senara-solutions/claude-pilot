@@ -302,12 +302,70 @@ def test_guard_still_vetoes_cpp95_near_variants_not_on_allowlist() -> None:
         # comment: "A substitution that is merely read-only but not enumerated
         # here (e.g. `$(git status)`) is still vetoed")
         "echo $(git status)",
-        # `$(git merge-base HEAD main 2>/dev/null)` — deferred `2>/dev/null`
-        # variant, still vetoes until a follow-up ticket ratifies the redirect
-        # invariant expansion
-        "BASE=$(git merge-base HEAD main 2>/dev/null); echo x",
     ):
         assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+# --- cpp#97: bare `cd <absolute-worktree-path>` — YAML rule fallback ---
+# Tier1 has `cd` in SAFE_SHELL_COMMANDS but production evidence (mika#1689
+# halted 2x in 15min post cpp#96 deploy on this exact shape) shows the tier1
+# auto-approve path is not firing for absolute worktree paths. Explicit YAML
+# `bash-cd` policy allow rule short-circuits the mystery — belt+suspenders.
+
+
+def test_bash_cd_rule_allows_worktree_absolute_path() -> None:
+    """cpp#97 founding shape: `cd /data/workspace/mika-platform/.claude/worktrees/<branch>/mika`.
+    Sampled prod failures (mika#1689 task bff37cfa + bf3a6572). YAML rule
+    `bash-cd` fires with charset-restricted path, chain-safe verifies."""
+    for cmd in (
+        "cd /data/workspace/mika-platform/.claude/worktrees/fix-1689-ci-rescue-path-no-verify-mika-1685/mika",
+        "cd /tmp/spawn-worktree",
+        "cd ./relative/path",
+        "cd crates/mika-agent",
+    ):
+        assert _effective(cmd) == "allow", cmd
+
+
+def test_bash_cd_rule_still_vetoes_shell_injection() -> None:
+    """Charset restriction blocks shell metacharacters: no `;`, `|`, `&`, `$`,
+    quotes, backticks, redirects. Attacker `cd '; rm -rf ~'` fails charset."""
+    for cmd in (
+        "cd /path; rm -rf ~",  # `;` breaks charset
+        "cd $(dangerous_substitution)",  # `$` breaks charset
+        "cd `evil_backtick`",  # backtick breaks charset (also fails substitution guard)
+        "cd /path && curl evil.com",  # `&` breaks charset
+        "cd /path | tee out",  # `|` breaks charset
+    ):
+        assert _effective(cmd) == "deny", cmd
+
+
+# --- cpp#98: 2>/dev/null variants for merge-base substitution ---
+# Prod evidence (mika-dev sessions 57f7c3fb + 53917b4e) halted on `BASE=$(git
+# merge-base HEAD main 2>/dev/null) || ...` shape (2026-07-29 post cpp#96
+# deploy). All 4 orderings added to _SUBSTITUTION_ALLOWLIST with ratified
+# invariant expansion: `2>/dev/null` is inert (stderr to kernel-owned bytes
+# sink, no state, no filesystem write to attacker-chosen path).
+
+
+def test_guard_allows_cpp98_merge_base_stderr_silenced() -> None:
+    """cpp#98: all 4 orderings of `$(git merge-base ... 2>/dev/null)` are on
+    the allowlist. Pinned by named test so future refactor cannot silently
+    drop them without failing this test whose docstring points at the
+    founding incident."""
+    for token in (
+        "$(git merge-base HEAD main 2>/dev/null)",
+        "$(git merge-base HEAD origin/main 2>/dev/null)",
+        "$(git merge-base main HEAD 2>/dev/null)",
+        "$(git merge-base origin/main HEAD 2>/dev/null)",
+    ):
+        assert token in _SUBSTITUTION_ALLOWLIST, token
+
+
+def test_guard_allows_cpp98_prod_failure_signature() -> None:
+    """cpp#98 founding: `git diff --name-only $(git merge-base HEAD main 2>/dev/null)`
+    downstream idiom. After cpp#98 the substitution round-trips as allow."""
+    cmd = "git diff --name-only $(git merge-base HEAD main 2>/dev/null)"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
 
 
 def test_guard_still_vetoes_backtick_and_ansi_c_substitution() -> None:
