@@ -200,13 +200,26 @@ _SUBSTITUTION_ALLOWLIST = (
     # orderings drops one of the three sampled cpp#95 prod-failure classes
     # (mika-db tasks id `27ea7dc4-5dfb-40cf-bc44-85970cd28e72`, mika#1824).
     #
-    # NOT added (deferred to follow-up): the `2>/dev/null` variants
-    # (`$(git merge-base HEAD main 2>/dev/null)`). The `2>` inside the
-    # substitution violates the "no nested redirect" invariant of this doctrine.
-    # Even though `/dev/null` is inert, admitting redirects into the allow-list
-    # requires a separate architectural pass to prove the invariant expansion.
+    # cpp#98: 2>/dev/null variants for merge-base — the branch-drift detection
+    # idiom uses stderr silencing when HEAD/base are unresolvable (fresh clone,
+    # detached HEAD). Invariant expansion RATIFIED: `2>/dev/null` is the ONE
+    # accepted redirect inside `$(...)` because:
+    #   1. `2>` targets stderr only (never stdout — the substituted value)
+    #   2. `/dev/null` is a literal inert bytes sink (no filesystem write to
+    #      attacker-chosen path — `/dev/null` is a kernel-owned device with no
+    #      state, no observability channel, no side effect)
+    #   3. Combined: the sole effect of `2>/dev/null` is dropping stderr; the
+    #      command's stdout capture (which the substitution embeds) is unchanged
+    # Founding evidence: mika-dev pilot sessions 57f7c3fb + 53917b4e halted on
+    # `BASE=$(git merge-base HEAD main 2>/dev/null) || BASE=main; ...` shape
+    # (2026-07-29 post cpp#96 deploy). All 4 orderings (main/HEAD, origin/main,
+    # both directions) added to match the commutative git-merge-base semantics.
     "$(git merge-base HEAD main)",
     "$(git merge-base HEAD origin/main)",
+    "$(git merge-base HEAD main 2>/dev/null)",
+    "$(git merge-base HEAD origin/main 2>/dev/null)",
+    "$(git merge-base main HEAD 2>/dev/null)",
+    "$(git merge-base origin/main HEAD 2>/dev/null)",
     # cpp#95: `$(date +%F)` and `$(date +%Y-%m-%d)`. `date` is a POSIX read-only
     # utility with no filesystem or ref-mutation side effects. `+%F` and
     # `+%Y-%m-%d` are literal format specifiers producing a fixed-length
