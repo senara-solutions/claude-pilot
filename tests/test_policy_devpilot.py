@@ -1162,3 +1162,104 @@ def test_handler_vetoes_chained_rce_with_interrupt() -> None:
     )
     assert isinstance(result, PermissionResultDeny)
     assert result.interrupt is True
+
+
+# --- cpp#100: dev-groom explore-script-fallback whole-command exemption ------
+# The `bash-explore-script-fallback` YAML rule anchors the 4-segment compound
+# dispatch-lib uses to sanity-check derivation scripts: `cat <path> [2>/dev/null]
+# [| head -N] ; echo "<literal>" ; ./scripts/<name> [<quoted-args>] [2>/dev/null]
+# [|| echo "<literal>"]`. `_bash_allow_is_chain_safe` honors the rule_id and
+# short-circuits without `;`/`||`-splitting the compound, mirroring cpp#35
+# (`bash-git-show-redirect`) and cpp#92 (`bash-for-loop-safe-body`). All negatives
+# below must still be denied — either by the rule regex not matching (charset
+# excludes chain metachars) or by the substitution-marker guard vetoing before
+# rule_id is reached.
+#
+# Founding evidence: mika-spirit task 1a4244b6 (groom mika#1867) halted
+# 2026-08-03T08:02:14Z on this exact shape. 5-day mika-platform loop stall.
+
+
+def test_guard_allows_cpp100_explore_script_fallback_shape() -> None:
+    """cpp#100 — pin the EXACT halt-event signature (with real-world
+    derive-branch-name, args from the founding-halt trace, both `2>/dev/null`
+    redirects, and the `|| echo` fallback)."""
+    cmd = (
+        'cat scripts/derive-branch-name 2>/dev/null | head -30; '
+        'echo "===DERIVE==="; '
+        './scripts/derive-branch-name "fix" "1867" '
+        '"fidelity mika ressert le meme contenu" 2>/dev/null '
+        '|| echo "(script signature diff)"'
+    )
+    pd = evaluate(_POLICY, "Bash", _bash(cmd))
+    assert pd.decision == "allow", f"{cmd}: {pd}"
+    assert pd.rule_id == "bash-explore-script-fallback", f"{cmd}: {pd.rule_id}"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_guard_allows_cpp100_variant_no_stderr_redirect() -> None:
+    """cpp#100 — variant where segment 1 has no `2>/dev/null` (rule marks it
+    optional). Still a canonical explore-then-execute-with-fallback shape."""
+    cmd = (
+        'cat scripts/derive-branch-name | head -30; '
+        'echo "===DERIVE==="; '
+        './scripts/derive-branch-name "fix" "1867" 2>/dev/null '
+        '|| echo "(fallback text)"'
+    )
+    pd = evaluate(_POLICY, "Bash", _bash(cmd))
+    assert pd.decision == "allow", f"{cmd}: {pd}"
+    assert pd.rule_id == "bash-explore-script-fallback", f"{cmd}: {pd.rule_id}"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_guard_still_vetoes_cpp100_near_variants_not_on_allowlist() -> None:
+    """cpp#100 — closed-world discipline. Dangerous near-variants that break
+    any of the anchored regex's per-segment invariants must still veto: wrong
+    script directory (`./bin/`), chain metachar in place of quoted arg,
+    unquoted expansion, piped exec (not `head`), missing middle echo segment.
+    Each falls through to broader rules (`bash-find`, etc.) where chain-safe
+    then splits and vetoes."""
+    for cmd in (
+        # wrong dir: ./bin/ instead of ./scripts/
+        'cat scripts/foo 2>/dev/null | head -30; echo "X"; '
+        './bin/foo "arg" 2>/dev/null || echo "Y"',
+        # dangerous chain riding a quoted-arg slot — charset excludes `;`
+        # so this doesn't match the rule regex; falls through and vetoes
+        'cat scripts/foo | head -30; echo "X"; '
+        './scripts/foo "arg;rm -rf /" || echo "Y"',
+        # unquoted `$` expansion in an arg — charset excludes `$` (arg is
+        # bare, not quoted, so doesn't match the rule regex either)
+        'cat scripts/foo | head -30; echo "X"; ./scripts/foo $EVIL || echo "Y"',
+        # piped exec (not `head`) — rule regex requires `head -\d+`
+        'cat scripts/foo | sh; echo "X"; ./scripts/foo || echo "Y"',
+        # missing middle `echo "..."` segment
+        'cat scripts/foo 2>/dev/null | head -30; ./scripts/foo || echo "Y"',
+    ):
+        assert (
+            _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+        ), cmd
+
+
+def test_guard_still_vetoes_backtick_and_funsub_in_cpp100_matching_shape() -> None:
+    """cpp#100 — the existing backtick/funsub veto (permissions.py:380-381)
+    fires BEFORE substitution-marker redaction and thus before the rule_id
+    short-circuit is reached. Even a shape that would otherwise match must
+    veto when it contains `` ` `` or `$'...'` funsub anywhere. Also verifies
+    a nested `$(...)` unrecognized token still vetoes via substitution-marker
+    guard."""
+    # Backtick anywhere (in a literal, as a segment tail) — vetoes
+    for cmd in (
+        'cat scripts/foo 2>/dev/null | head -30; '
+        'echo "hello `id`"; '
+        './scripts/foo "arg" 2>/dev/null || echo "fallback"',
+        # Funsub `$'...'` in a segment — vetoes at the backtick/funsub guard
+        "cat scripts/foo | head -30; echo $'evil'; "
+        './scripts/foo "arg" || echo "fallback"',
+        # Unrecognized `$(...)` substitution — vetoes at substitution-marker guard
+        # (rule regex wouldn't match anyway because `$` excluded from arg charset,
+        # but the substitution veto runs first regardless of rule shape)
+        'cat scripts/foo | head -30; echo "$(rm -rf /)"; '
+        './scripts/foo "arg" || echo "fallback"',
+    ):
+        assert (
+            _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+        ), cmd

@@ -62,6 +62,41 @@ rules:
     decision: allow
     reason: "for-loop with enumerated read-only body (echo/printf/grep/cat/head/tail/ls/wc/find/test/[/dirname/basename); in-list + body-args exclude chain metachars/redirects/escapes; $var permitted (substitution caught upstream); fully anchored (cpp#92)"
 
+  # cpp#100: dev-groom's "explore-then-execute-with-fallback" compound.
+  # Founding evidence — mika-spirit task 1a4244b6 (groom mika#1867) halted
+  # 2026-08-03T08:02:14Z on the exact shape:
+  #   cat scripts/derive-branch-name 2>/dev/null | head -30;
+  #   echo "===DERIVE===";
+  #   ./scripts/derive-branch-name "fix" "1867" "..." 2>/dev/null || echo "..."
+  # Loop stall context: mika-platform autonomous loop produced 0 auto-merges
+  # for 5 days (since #1874) — every groom hit this wall. Vincent-ratified
+  # 2026-08-03 via samidarko-proxy (Option A, extend allowlist).
+  #
+  # Shape template (Vincent-worded):
+  #   <safe-read> ; <echo-literal> ; <script-exec-with-args> [2>/dev/null] || <echo-literal>
+  #
+  # Per-segment safety invariants (embedded in the anchored regex):
+  #   1. <safe-read>: `cat <path>` with optional `2>/dev/null` + optional
+  #      `| head -N`. Path charset excludes shell metachars.
+  #   2. <echo-literal>: `echo "<quoted>"` — quoted body charset excludes
+  #      `"`, backtick, `$`, `;`, `|`, `<`, `>`, `&`, `\` (no substitution,
+  #      no chained danger, no escapes).
+  #   3. <script-exec-with-args>: `./scripts/<name>` where <name> is POSIX-safe
+  #      (no `..`, no `/` — single-level under `scripts/`), plus 0+ quoted
+  #      args with the same restricted charset as (2). Optional `2>/dev/null`.
+  #   4. `|| <echo-literal>` fallback optional.
+  # Full-command anchoring (`^...$`) + charset-restricted quoted args prevent
+  # chained danger from riding any layer. Chain-safe honors the `rule_id` as
+  # a whole-command exemption (mirroring `bash-git-show-redirect` cpp#35 and
+  # `bash-for-loop-safe-body` cpp#92 patterns) — no `;`/`||` split-veto.
+  # The rule_id coupling fails CLOSED: if renamed or dropped, dispatch reverts
+  # to the current veto (safe direction).
+  - id: bash-explore-script-fallback
+    tool: Bash
+    pattern: '^cat\s+[A-Za-z0-9_./\-]+(\s+2>/dev/null)?(\s*\|\s*head\s+-\d+)?\s*;\s*echo\s+"[^"`$;|<>&\\]*"\s*;\s*\./scripts/[A-Za-z0-9_.\-]+(\s+"[^"`$;|<>&\\]*")*(\s+2>/dev/null)?(\s*\|\|\s*echo\s+"[^"`$;|<>&\\]*")?$'
+    decision: allow
+    reason: "dev-groom explore-then-execute-with-fallback: cat<path>[2>/dev/null][|head-N] ; echo\"<literal>\" ; ./scripts/<name>[<quoted-args>][2>/dev/null] [|| echo\"<literal>\"]; fully anchored, charset-restricted quoted args exclude chain metachars (cpp#100 — 5-day loop stall)"
+
   # ---- Read-only repo orientation ----
   # Common pre-work Bash commands that pilots use to understand the codebase
   # before making changes. Confirmed in mika#1253's pre-wedge pilot log.
