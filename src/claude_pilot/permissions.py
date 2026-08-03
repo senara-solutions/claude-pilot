@@ -434,6 +434,22 @@ def _bash_allow_is_chain_safe(
     if pd.decision == "allow" and pd.rule_id == "bash-for-loop-safe-body":
         return True
 
+    # `bash-explore-script-fallback` (cpp#100) — sanctioned exception mirroring
+    # `bash-git-show-redirect` (cpp#35) and `bash-for-loop-safe-body` (cpp#92).
+    # The rule's YAML pattern anchors the ENTIRE compound: `^cat <path>
+    # [2>/dev/null] [| head -N] ; echo "<literal>" ; ./scripts/<name>
+    # [<quoted-args>] [2>/dev/null] [|| echo "<literal>"]$`, charset-restricted
+    # quoted args exclude chain metachars (`;`/`|`/`&`/backtick/`$`/`<`/`>`/`\`),
+    # so no dangerous tail can ride any layer of the compound. Chain-safe honors
+    # the rule_id without splitting on `;`/`||`.
+    # Founding evidence: mika-spirit task 1a4244b6 halted 2026-08-03T08:02:14Z
+    # (5-day mika-platform loop stall, groom-stage substrate block).
+    # The rule_id coupling fails CLOSED — if the YAML rule is renamed or
+    # dropped, this never fires and dispatch reverts to the compound-split
+    # veto (safe direction).
+    if pd.decision == "allow" and pd.rule_id == "bash-explore-script-fallback":
+        return True
+
     segments = _split_compound_command(command)
     if not segments:
         return False
