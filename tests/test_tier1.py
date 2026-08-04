@@ -1500,3 +1500,108 @@ def test_bash_jq_pattern_in_shipped_policy_file() -> None:
     assert r"[;|]\\s*jq\\s" in content, (
         "bash-jq policy must allow `cmd | jq ...` (mika#625 regression class)"
     )
+
+
+# ── Exec-si-contenu (Vincent-ratified 2026-08-04) ───────────────────────────
+#
+# Invariant: `<safe-exec>` primitives (node, python3) autorized SSI the pilot
+# runs under mika's dispatch-lib.sh Phase 2b bwrap containment, attested via
+# `MIKA_PILOT_CONTAINED=1` env var. Absent the attestation, they remain
+# denied. Also covers the ce-work Setup preamble whole-shape exception.
+
+
+def _set_contained(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+    """Helper: set / unset MIKA_PILOT_CONTAINED for the test scope."""
+    if value is None:
+        monkeypatch.delenv("MIKA_PILOT_CONTAINED", raising=False)
+    else:
+        monkeypatch.setenv("MIKA_PILOT_CONTAINED", value)
+
+
+def test_safe_exec_denied_without_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, None)
+    assert not is_safe_bash_command("node script.js")
+    assert not is_safe_bash_command("python3 x.py")
+    assert not is_safe_bash_command("node /abs/path/context.mjs")
+
+
+def test_safe_exec_allowed_when_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert is_safe_bash_command("node script.js")
+    assert is_safe_bash_command("python3 x.py")
+    assert is_safe_bash_command("node /abs/path/context.mjs")
+    assert is_safe_bash_command("python3 /path/y.py arg1 arg2")
+
+
+def test_safe_exec_bare_interpreter_still_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`node` / `python3` alone = interactive REPL, not a leaf-effect script."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("node")
+    assert not is_safe_bash_command("python3")
+
+
+def test_safe_exec_metachar_guard_still_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even under attestation, upstream metachar/tier3 guards protect against
+    injection shapes that would bypass per-sub classification."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    # Command substitution injects arbitrary code; must be caught.
+    assert not is_safe_bash_command("node $(evil)")
+    assert not is_safe_bash_command("node `cat /etc/passwd`")
+
+
+def test_ce_work_preamble_allowed_when_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compound-engineering ce-work Setup preamble is the concrete
+    canary of the invariant. Whole-compound match, no per-sub classify."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    preamble = (
+        'SKILL_DIR="/home/samidarko/.claude/plugins/cache/'
+        'every-marketplace/compound-engineering/3.21.0/skills/ce-work";\n'
+        'NODE="$(for c in node nodejs; do command -v "$c" >/dev/null 2>&1 '
+        '&& "$c" -e \'\' >/dev/null 2>&1 && { echo "$c"; break; }; done)";\n'
+        'if [ -n "$NODE" ]; then\n'
+        '"$NODE" "$SKILL_DIR/scripts/context.mjs" || echo "context failed";\n'
+        'else\n'
+        'echo "no Node runtime";\n'
+        'fi'
+    )
+    assert is_safe_bash_command(preamble)
+
+
+def test_ce_work_preamble_denied_without_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, None)
+    preamble = (
+        'SKILL_DIR="/opt/plugin/skills/ce-work";\n'
+        'NODE="$(for c in node nodejs; do command -v "$c" >/dev/null 2>&1 '
+        '&& "$c" -e \'\' >/dev/null 2>&1 && { echo "$c"; break; }; done)";\n'
+        'if [ -n "$NODE" ]; then\n'
+        '"$NODE" "$SKILL_DIR/scripts/context.mjs" || echo "failed";\n'
+        'else\n'
+        'echo "no node";\n'
+        'fi'
+    )
+    assert not is_safe_bash_command(preamble)
+
+
+def test_ce_work_preamble_attacker_append_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regex is `$`-anchored: trailing content breaks the match, keeps
+    the compound in the standard-deny path even under attestation."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    preamble = (
+        'SKILL_DIR="/opt/plugin/skills/ce-work";\n'
+        'NODE="$(for c in node nodejs; do command -v "$c" >/dev/null 2>&1 '
+        '&& "$c" -e \'\' >/dev/null 2>&1 && { echo "$c"; break; }; done)";\n'
+        'if [ -n "$NODE" ]; then\n'
+        '"$NODE" "$SKILL_DIR/scripts/context.mjs" || echo "failed";\n'
+        'else\n'
+        'echo "no node";\n'
+        'fi\n'
+        '; touch /etc/hosts'
+    )
+    assert not is_safe_bash_command(preamble)

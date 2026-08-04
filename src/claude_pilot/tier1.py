@@ -20,9 +20,40 @@ contract.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+
+# ── Exec-si-contenu attestation (Vincent-ratified 2026-08-04) ────────────────
+#
+# The pilot subprocess sets `MIKA_PILOT_CONTAINED=1` when — and ONLY when — it
+# runs under mika's dispatch-lib.sh Phase 2b bwrap wrapper (fs+kernel+env+net
+# cut ALL active, with hostname-allowlist egress relay). See
+# `mika/skills/bundled/_shared/dispatch-lib.sh::_run_pilot_sandboxed` for the
+# emitter side. The attestation is:
+#
+#   * Not forgeable from inside the sandbox — bwrap uses `--clearenv` +
+#     explicit `--setenv MIKA_PILOT_CONTAINED "1"`. Nothing from the host env
+#     survives into the sandbox unless bwrap injects it; MIKA_PILOT_CONTAINED
+#     is injected by dispatch-lib SOLELY in Phase 2b full mode.
+#   * Not settable outside dispatch-lib — production pilots always launch via
+#     dispatch-lib; dev / test invocations that skip dispatch-lib get the
+#     Phase 2a fallback (fs cut only, no MIKA_PILOT_CONTAINED, no safe-exec).
+#
+# Under the attestation, the invariant "Exec autorisé SSI contenu" allows
+# `<safe-exec>` primitives (node, python3) as leaf-effect tier1 commands —
+# their arbitrary side-effects are bounded by the sandbox. Hors containment,
+# these stay denied (invariant enforced).
+def _is_pilot_contained() -> bool:
+    """True iff the process runs under dispatch-lib.sh Phase 2b containment.
+
+    Read at classify-time (per-decision), NOT at import — so a helper
+    invoked outside the sandbox (e.g. unit tests, dev shells) sees False
+    naturally. Env-var read is cheap; no caching required.
+    """
+    return os.environ.get("MIKA_PILOT_CONTAINED") == "1"
 
 
 # DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
@@ -452,6 +483,16 @@ def contains_unquoted_metacharacter(command: str) -> bool:
 
 
 def is_safe_bash_command(command: str) -> bool:
+    # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
+    # a legitimate multi-line compound (for-loop + if + $()) that stalls the
+    # standard classifier BUT is bounded by containment when
+    # MIKA_PILOT_CONTAINED=1. Match BEFORE the metachar/tier3 guards — the
+    # anchored regex + charset constraints inside the shape are the safety
+    # boundary here, not the generic guards. Fails CLOSED if attestation
+    # absent or shape drifts (see `is_ce_work_preamble_when_contained` doc).
+    if is_ce_work_preamble_when_contained(command):
+        return True
+
     if contains_unquoted_metacharacter(command):
         return False
     if is_tier3_dangerous(command):
@@ -472,7 +513,136 @@ def _is_safe_sub_command(sub: str) -> bool:
         or is_safe_shell_command(sub)
         or is_safe_gh_command(sub)
         or is_safe_mika_dispatch(sub)
+        or is_safe_exec_when_contained(sub)
     )
+
+
+# ── Safe-exec primitives (Exec-si-contenu, Vincent-ratified 2026-08-04) ──────
+#
+# Under the containment attestation (`MIKA_PILOT_CONTAINED=1`, set by mika's
+# dispatch-lib.sh Phase 2b bwrap wrapper — fs+net+kernel cut with
+# hostname-allowlist egress), these interpreter primitives become leaf-effect
+# tier1 commands. Their arbitrary side effects are bounded by the sandbox:
+# fs writes land in tmpfs or the branch worktree, net calls go through the
+# egress relay allowlist, kernel namespaces isolate the process. Hors
+# containment, they remain denied (invariant enforced).
+#
+# Founding case: the compound-engineering ce-work plugin's Setup preamble
+# runs `node "$SKILL_DIR/scripts/context.mjs"` — a legitimate Node script the
+# LLM invokes to emit workflow context. Pre-containment, this required either
+# a fragile per-shape allowlist (cpp#100-class enumeration) or a plugin
+# source patch (workspace-brittle). Post-containment, it becomes a direct
+# tier1 pass — the effect IS bounded.
+#
+# Scope:
+#   * `node <script>` — with args, redirect chains upstream-classified.
+#   * `python3 <script>` — same shape as node.
+#   * Chain safety (compound `;`/`||`/`&&`) is handled by the upstream
+#     `_split_compound_command` + all-subs-safe loop — each sub still needs
+#     to pass a tier1 predicate. safe-exec here is one such predicate.
+#
+# Not covered here (intentionally):
+#   * `python -c 'code'` — arbitrary inline code deserves a separate rule
+#     if needed. The founding case uses `python3 <script>` shape.
+#   * `node -e 'code'` — same rationale.
+#   * `bash <script>` — sub-shell has its own compound checker path.
+#
+# The is_tier3_dangerous + contains_unquoted_metacharacter checks upstream
+# still apply — even under containment, a `node "$(rm -rf /)"` shape trips
+# the metacharacter guard before reaching this predicate.
+
+_NODE_EXEC_RE = re.compile(r"^\s*node\s+\S")
+_PYTHON3_EXEC_RE = re.compile(r"^\s*python3\s+\S")
+
+
+def is_safe_exec_when_contained(sub: str) -> bool:
+    """Allow `node <script>` / `python3 <script>` iff pilot is contained.
+
+    The `MIKA_PILOT_CONTAINED=1` env is set by dispatch-lib SOLELY when the
+    Phase 2b full containment shape is active. Absent it (dev shells,
+    Phase 2a fallback with net open, direct classifier tests) → False.
+    """
+    if not _is_pilot_contained():
+        return False
+    if _NODE_EXEC_RE.match(sub):
+        return True
+    if _PYTHON3_EXEC_RE.match(sub):
+        return True
+    return False
+
+
+# ── ce-work Setup preamble compound (Exec-si-contenu specific case) ──────────
+#
+# The compound-engineering plugin's `ce-work` skill defines a Setup section
+# that the pilot's Claude Code invokes at every `/ce:work` (see
+# `~/.claude/plugins/cache/every-marketplace/compound-engineering/3.21.0/
+# skills/ce-work/SKILL.md::Setup`). Shape (single Bash string, multi-line):
+#
+#     SKILL_DIR="<absolute path>";
+#     NODE="$(for c in node nodejs; do
+#         command -v "$c" >/dev/null 2>&1 && "$c" -e '' >/dev/null 2>&1 &&
+#         { echo "$c"; break; };
+#     done)";
+#     if [ -n "$NODE" ]; then
+#     "$NODE" "$SKILL_DIR/scripts/context.mjs" || echo "<literal>";
+#     else
+#     echo "<literal>";
+#     fi
+#
+# The compound uses `$(...)` command substitution + a `for` loop + `if`
+# statement — hits `contains_unquoted_metacharacter` upstream and never
+# reaches per-sub classification. Pre-containment: legitimate deny (the
+# effect could touch anything). Post-containment (`MIKA_PILOT_CONTAINED=1`):
+# the effect is bounded by bwrap — fs writes land in tmpfs/worktree, net
+# calls go through the egress allowlist. Auto-approving the whole compound
+# is safe.
+#
+# The founding blocker: this preamble stalled EVERY dev-pilot dispatch for
+# days before Exec-si-contenu was ratified (2026-08-04). It's the concrete
+# canary of the invariant.
+#
+# The regex anchors the entire compound with charset constraints on:
+#   * SKILL_DIR path: `[^"]+` (no `"` — nothing quoted around it)
+#   * Script path within SKILL_DIR: `[^"]+`
+#   * echo literals: `[^"]+`
+# All other content is literal-matched. The rule fails CLOSED — variant
+# preambles (different plugin, different Setup) do not match. If the
+# compound-engineering plugin changes the Setup shape, this rule stops
+# firing and the compound reverts to the standard-deny path.
+
+_CE_WORK_PREAMBLE_RE = re.compile(
+    r'^SKILL_DIR="[^"]+";\s*'
+    r'NODE="\$\(for c in node nodejs; do '
+    r'command -v "\$c" >/dev/null 2>&1 && '
+    r'"\$c" -e \'\' >/dev/null 2>&1 && '
+    r'\{ echo "\$c"; break; \}; '
+    r'done\)";\s*'
+    r'if \[ -n "\$NODE" \]; then\s*'
+    r'"\$NODE" "\$SKILL_DIR/scripts/[^"]+" \|\| echo "[^"]+";\s*'
+    r'else\s*'
+    r'echo "[^"]+";\s*'
+    r'fi\s*$',
+    re.DOTALL,
+)
+
+
+def is_ce_work_preamble_when_contained(command: str) -> bool:
+    """Match the compound-engineering ce-work Setup preamble under containment.
+
+    Returns True IFF the command is the exact ce-work Setup shape AND the
+    pilot subprocess is contained (`MIKA_PILOT_CONTAINED=1`). Anywhere else
+    (dev shells, Phase 2a fallback, variant preambles) → False.
+
+    Called from `is_safe_bash_command` BEFORE the metachar guard, so the
+    `$(...)` command substitution inside the anchored shape doesn't trip
+    the standard-deny path. The anchored regex + charset constraints on
+    the three variable-content zones (SKILL_DIR path, script path, echo
+    literal) mean no attacker-controlled substring can carry chain
+    metachars or additional side-effects.
+    """
+    if not _is_pilot_contained():
+        return False
+    return bool(_CE_WORK_PREAMBLE_RE.match(command))
 
 
 # ── Safe git commands ────────────────────────────────────────────────────────
