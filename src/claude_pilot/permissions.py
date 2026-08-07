@@ -22,7 +22,7 @@ from typing import Any
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
-from . import audit, per_spawn
+from . import audit, per_spawn, permission_events
 from .guardrails import SessionGuardrails
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
@@ -682,6 +682,40 @@ def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
     notify_escalation(f"{tool_name}: {detail}: {reason}")
 
 
+def _record_decision(
+    result: PermissionResult,
+    *,
+    tool_name: str,
+    rule_id: str,
+    cwd: str,
+    ctx: ToolPermissionContext,
+) -> PermissionResult:
+    """Fire the cm#99 permission-event side-channel and return ``result``.
+
+    Wraps every terminal return in :func:`create_permission_handler` so cm
+    observes an event for each allow / deny (AC1) with the classifier rule
+    that produced it. The emitter is fail-OPEN and non-blocking
+    (:mod:`permission_events` — bounded queue, background worker), so this
+    call is a bounded-cost no-op on the classifier's critical path even when
+    cm is unreachable (AC2).
+
+    A ``PermissionResultAllow`` maps to wire ``"allow"``; a
+    ``PermissionResultDeny`` maps to wire ``"deny"``. AskUserQuestion answers
+    are structurally ``PermissionResultAllow`` (they carry the answers dict
+    as ``updated_input``) and therefore emit as ``allow``.
+    """
+    decision = "allow" if isinstance(result, PermissionResultAllow) else "deny"
+    permission_events.emit(
+        tool_name=tool_name,
+        decision=decision,
+        rule_id=rule_id,
+        cwd=cwd,
+        tool_use_id=ctx.tool_use_id or "",
+        agent_id=ctx.agent_id,
+    )
+    return result
+
+
 def create_permission_handler(
     *,
     config: PilotConfig | None,
@@ -735,7 +769,13 @@ def create_permission_handler(
                         _summarize_input(tool_name, tool_input),
                         "AUTO",
                     )
-                    return PermissionResultAllow(updated_input=tool_input)
+                    return _record_decision(
+                        PermissionResultAllow(updated_input=tool_input),
+                        tool_name=tool_name,
+                        rule_id="per-spawn-allow",
+                        cwd=cwd,
+                        ctx=ctx,
+                    )
                 audit.emit(
                     "perm_policy_rollback",
                     {
@@ -751,13 +791,25 @@ def create_permission_handler(
         # Tier 1 fast path
         if is_tier1_auto_approve(tool_name, tool_input, cwd):
             log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
-            return PermissionResultAllow(updated_input=tool_input)
+            return _record_decision(
+                PermissionResultAllow(updated_input=tool_input),
+                tool_name=tool_name,
+                rule_id="tier1-auto-approve",
+                cwd=cwd,
+                ctx=ctx,
+            )
 
         # Tier 1.5 fast path — deterministic auto-answer (compact-safe)
         auto_answer = try_tier_1_5_auto_answer(tool_name, tool_input)
         if auto_answer is not None:
             log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
-            return _map_response(tool_name, tool_input, auto_answer)
+            return _record_decision(
+                _map_response(tool_name, tool_input, auto_answer),
+                tool_name=tool_name,
+                rule_id="tier1.5-auto-answer",
+                cwd=cwd,
+                ctx=ctx,
+            )
 
         # Tier 2: deterministic policy-file lookup (mika#1192).
         # cpp#20 joint 2: denial paths return PermissionResultDeny(interrupt=True)
@@ -781,7 +833,13 @@ def create_permission_handler(
                         "allowed prefix"
                     )
                     log_policy_deny(tool_name, detail, pd.rule_id)
-                    return PermissionResultDeny(message=veto_reason, interrupt=True)
+                    return _record_decision(
+                        PermissionResultDeny(message=veto_reason, interrupt=True),
+                        tool_name=tool_name,
+                        rule_id=f"{pd.rule_id}:chain-veto",
+                        cwd=cwd,
+                        ctx=ctx,
+                    )
                 # Destination validation for write-capable structural rules:
                 # worktree containment (cpp#38) + control-plane denylist (cpp#42).
                 # Runs here because it needs the worktree root (`cwd`), which the
@@ -793,12 +851,30 @@ def create_permission_handler(
                     )
                     if dest_veto is not None:
                         log_policy_deny(tool_name, detail, pd.rule_id)
-                        return PermissionResultDeny(message=dest_veto, interrupt=True)
+                        return _record_decision(
+                            PermissionResultDeny(message=dest_veto, interrupt=True),
+                            tool_name=tool_name,
+                            rule_id=f"{pd.rule_id}:destination-veto",
+                            cwd=cwd,
+                            ctx=ctx,
+                        )
                 log_policy_allow(tool_name, detail, pd.rule_id)
-                return PermissionResultAllow(updated_input=tool_input)
+                return _record_decision(
+                    PermissionResultAllow(updated_input=tool_input),
+                    tool_name=tool_name,
+                    rule_id=pd.rule_id or "policy-default",
+                    cwd=cwd,
+                    ctx=ctx,
+                )
             if pd.decision == "deny":
                 log_policy_deny(tool_name, detail, pd.rule_id)
-                return PermissionResultDeny(message=pd.reason, interrupt=True)
+                return _record_decision(
+                    PermissionResultDeny(message=pd.reason, interrupt=True),
+                    tool_name=tool_name,
+                    rule_id=pd.rule_id or "policy-default",
+                    cwd=cwd,
+                    ctx=ctx,
+                )
             # Wire-format `escalate` = deny-with-notify: best-effort operator
             # notify + halt the pilot loop. Wire keyword preserved for
             # back-compat with existing operator overlays; runtime semantics
@@ -806,14 +882,27 @@ def create_permission_handler(
             # side-effect (cpp#21 rename is source-only).
             log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
             _fire_notify(tool_name, detail, pd.reason)
-            return PermissionResultDeny(message=pd.reason, interrupt=True)
+            return _record_decision(
+                PermissionResultDeny(message=pd.reason, interrupt=True),
+                tool_name=tool_name,
+                rule_id=pd.rule_id or "policy-default",
+                cwd=cwd,
+                ctx=ctx,
+            )
 
         # TODO(mika#1193 Phase C): remove relay block below once policy has soaked >= 7 days.
         # The relay path is only reachable when MIKA_PILOT_POLICY_DISABLED=1 (emergency rollback).
 
         # No relay → interactive fallback
         if not relay or config is None:
-            return await _interactive_fallback(tool_name, tool_input)
+            fb_result = await _interactive_fallback(tool_name, tool_input)
+            return _record_decision(
+                fb_result,
+                tool_name=tool_name,
+                rule_id="interactive-fallback",
+                cwd=cwd,
+                ctx=ctx,
+            )
 
         event = PilotEvent(
             type="question" if tool_name == "AskUserQuestion" else "permission",
@@ -840,7 +929,13 @@ def create_permission_handler(
                 response = await invoke_command(config, event, verbose, task_id)
                 latency_ms = int((time.monotonic() - start) * 1000)
                 log_relay_recv(tool_name, response.action, latency_ms)
-                return _map_response(tool_name, tool_input, response)
+                return _record_decision(
+                    _map_response(tool_name, tool_input, response),
+                    tool_name=tool_name,
+                    rule_id=f"relay-{response.action}",
+                    cwd=cwd,
+                    ctx=ctx,
+                )
             except TransportError as err:
                 latency_ms = int((time.monotonic() - start) * 1000)
                 log_relay_recv(tool_name, "error", latency_ms)
@@ -861,12 +956,25 @@ def create_permission_handler(
                     response = await invoke_command(config, retry_event, verbose, task_id)
                     latency_ms = int((time.monotonic() - start) * 1000)
                     log_relay_recv(tool_name, response.action, latency_ms)
-                    return _map_response(tool_name, tool_input, response)
+                    return _record_decision(
+                        _map_response(tool_name, tool_input, response),
+                        tool_name=tool_name,
+                        rule_id=f"relay-retry-{response.action}",
+                        cwd=cwd,
+                        ctx=ctx,
+                    )
                 except TransportError as retry_err:
                     latency_ms = int((time.monotonic() - start) * 1000)
                     log_relay_recv(tool_name, "error", latency_ms)
                     log_fallback(str(retry_err))
-                    return await _interactive_fallback(tool_name, tool_input)
+                    fb_result = await _interactive_fallback(tool_name, tool_input)
+                    return _record_decision(
+                        fb_result,
+                        tool_name=tool_name,
+                        rule_id="relay-fallback-interactive",
+                        cwd=cwd,
+                        ctx=ctx,
+                    )
         finally:
             if guardrails is not None:
                 guardrails.resume_idle_timer()
