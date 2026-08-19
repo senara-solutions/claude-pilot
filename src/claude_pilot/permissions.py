@@ -24,6 +24,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 
 from . import audit, per_spawn, permission_events
 from .guardrails import SessionGuardrails
+from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
     _split_compound_command,
@@ -956,6 +957,15 @@ def create_permission_handler(
                     response = await invoke_command(config, retry_event, verbose, task_id)
                     latency_ms = int((time.monotonic() - start) * 1000)
                     log_relay_recv(tool_name, response.action, latency_ms)
+                    # cpp#111 D8-2 Transition 3: tool-call recovery. Fires
+                    # only when the bounded retry succeeded — the first-try
+                    # TransportError was recovered without escalating to the
+                    # interactive fallback. Fire-and-forget; a cm outage
+                    # never masks the successful recovery.
+                    emit_heartbeat(
+                        "recovery:tool",
+                        meta={"tool": tool_name, "action": response.action},
+                    )
                     return _record_decision(
                         _map_response(tool_name, tool_input, response),
                         tool_name=tool_name,

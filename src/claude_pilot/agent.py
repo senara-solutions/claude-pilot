@@ -23,6 +23,7 @@ from claude_agent_sdk.types import (
 )
 
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
+from .heartbeat import emit_heartbeat, emit_heartbeat_throttled
 from .inbox_writer import post_handoff
 from .permissions import CanUseTool
 from .tier1 import DENIED_BASH_PATTERNS_HINT
@@ -41,6 +42,12 @@ from .ui import (
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
 
+# cpp#111 D8-2: per-turn heartbeats are throttled to at most one per minute so
+# a tool-heavy stream does not flood cm-api. Session-start / session-end /
+# tool-recovery are all rare enough that they fire unthrottled.
+_HEARTBEAT_TURN_THROTTLE_SECS: float = 60.0
+_HEARTBEAT_TURN_KEY: str = "pilot:turn"
+
 
 async def run_agent(
     *,
@@ -51,7 +58,48 @@ async def run_agent(
     permission_handler: CanUseTool,
     guardrails: SessionGuardrails,
 ) -> int:
-    """Run the agent session. Returns the intended process exit code."""
+    """Run the agent session. Returns the intended process exit code.
+
+    Thin wrapper around :func:`_run_agent_inner` that fires cm heartbeats at
+    the session-lifecycle boundaries (cpp#111 D8-2 Transitions 1 and 4). The
+    session-start emit fires before any SDK work so cm sees liveness the
+    instant the subprocess begins — even a spawn that never manages to
+    complete an ``init`` handshake still shows a fresh heartbeat. The
+    session-end emit is in a ``finally`` so it fires on every exit path:
+    natural completion, early return from a guardrail trip, and any
+    exception propagating out of the SDK client.
+    """
+    reason_tag = task_id or "unknown"
+    emit_heartbeat(f"session:{reason_tag}")
+    exit_code = 1
+    try:
+        exit_code = await _run_agent_inner(
+            prompt=prompt,
+            cwd=cwd,
+            verbose=verbose,
+            task_id=task_id,
+            permission_handler=permission_handler,
+            guardrails=guardrails,
+        )
+        return exit_code
+    finally:
+        emit_heartbeat(
+            f"complete:{reason_tag}",
+            meta={"exit_code": exit_code},
+        )
+
+
+async def _run_agent_inner(
+    *,
+    prompt: str,
+    cwd: str,
+    verbose: bool,
+    task_id: str | None,
+    permission_handler: CanUseTool,
+    guardrails: SessionGuardrails,
+) -> int:
+    """Actual agent session body. Extracted so :func:`run_agent` can wrap it
+    with lifecycle heartbeats without reindenting the whole implementation."""
     start_time = time.monotonic()
     session_id: str | None = None
     seen_init: bool = False
@@ -145,6 +193,14 @@ async def run_agent(
                         # started. cpp#10 — surface drift turns that produced
                         # no text and no tool calls.
                         _on_boundary(event)
+                        # cpp#111 D8-2 Transition 2: turn completion. Throttled
+                        # to 1/min so a tool-heavy stream does not flood cm-api.
+                        emit_heartbeat_throttled(
+                            f"turn:{event.just_closed_turn}",
+                            throttle_key=_HEARTBEAT_TURN_KEY,
+                            min_interval_secs=_HEARTBEAT_TURN_THROTTLE_SECS,
+                            meta={"task_id": task_id} if task_id else None,
+                        )
                     for block in _content_blocks(message):
                         text = _text_of(block)
                         if text:
