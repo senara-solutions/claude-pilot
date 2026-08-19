@@ -82,6 +82,11 @@ From `claude_agent_sdk`:
 
 `docs/solutions/` — documented solutions to past problems (bugs, security findings, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas — e.g. the permission classifier (`policy.py`/`permissions.py`/`tier1.py`) has a load-bearing learning on command-string allow-rule safety.
 
+Subsystem docs (non-solution):
+
+- `docs/permission-mode.md` — `MIKA_PERMISSION_POLICY_MODE` selector between the classic tier1/policy Bash evaluator and the `per_spawn` bashlex evaluator (mika#1708).
+- `docs/permissions-interactive-fallback.md` — the interactive fallback in `permissions.py` (`--no-relay` / relay-double-fault path). Documents trigger conditions, prompt shape, transport, and its current unreachability under the default policy-enabled posture. Read before extending interactive functionality (cpp#69).
+
 ## Planning Documents
 
 - Plan: `senara-solutions/mika-platform/docs/plans/2026-04-14-001-feat-port-claude-pilot-to-python-plan.md`

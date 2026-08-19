@@ -1066,6 +1066,23 @@ async def _interactive_fallback(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> PermissionResult:
+    """Prompt the operator on stderr for a permission or question decision.
+
+    Entry point for both interactive fallback call sites in
+    :func:`create_permission_handler`: the "no relay" branch and the
+    "relay-exhausted after retry" branch. Reachability caveat: in the default
+    posture (policy enabled) the Tier 2 policy block above always returns
+    terminally, so neither call site is exercised — see
+    ``docs/permissions-interactive-fallback.md``.
+
+    TTY-gates on ``sys.stdin.isatty()`` — a non-TTY session (subprocess pipe,
+    systemd, CI) auto-denies with ``interrupt=False`` so the SDK surfaces the
+    denial to the LLM as a tool_result rather than aborting the loop. This
+    diverges from the Tier 2 policy path which uses ``interrupt=True``.
+
+    Routes ``AskUserQuestion`` to :func:`_interactive_question`; every other
+    tool routes to :func:`_interactive_permission`.
+    """
     if not sys.stdin.isatty():
         log_denied(tool_name, "non-interactive mode — auto-denied")
         return PermissionResultDeny(
@@ -1081,6 +1098,17 @@ async def _interactive_permission(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> PermissionResult:
+    """Prompt ``Allow? (y/n):`` on stderr for a non-question tool.
+
+    Allow rule is deliberately permissive: any input whose stripped-lowercase
+    form STARTS WITH ``"y"`` maps to Allow — ``y``, ``Y``, ``yes``, ``yep``,
+    ``yolo`` all pass. Anything else (``n``, empty, ``no``, whitespace-only,
+    garbage) maps to Deny with the literal message ``"Denied by user"``.
+    Denial uses ``interrupt=False`` — see :func:`_interactive_fallback`.
+
+    No other affordances: no allow-with-modifications, no deny-with-reason,
+    no defer-to-relay. cpp#69 owns extending this surface.
+    """
     detail = _summarize_input(tool_name, tool_input)
     log_escalate(tool_name, detail)
     answer = await _ainput("  Allow? (y/n): ")
@@ -1092,6 +1120,20 @@ async def _interactive_permission(
 
 
 async def _interactive_question(tool_input: dict[str, Any]) -> PermissionResult:
+    """Prompt the operator on stderr for an ``AskUserQuestion`` tool call.
+
+    For each question in ``tool_input["questions"]``: renders the question,
+    lists numbered options (when ``q["options"]`` is a list), then reads one
+    line. Integer input in ``[1, len(options)]`` selects the labeled option
+    verbatim; anything else — non-integer, out-of-range, empty — is taken as
+    a free-text answer. Questions without ``options`` are always free-text.
+    ``AskUserQuestion`` never denies through this path; the only Deny return
+    is the malformed-input guard below.
+
+    Answers are keyed by question text and returned as
+    ``PermissionResultAllow(updated_input={"questions": ..., "answers": ...})``,
+    matching the SDK's expected shape for :class:`AskUserQuestion`.
+    """
     questions = tool_input.get("questions")
     if not isinstance(questions, list):
         return PermissionResultDeny(
@@ -1132,6 +1174,23 @@ async def _interactive_question(tool_input: dict[str, Any]) -> PermissionResult:
 
 
 async def _ainput(prompt: str) -> str:
+    """Async-safe blocking stdin readline paired with a stderr prompt.
+
+    Bridges synchronous ``sys.stdin.readline`` into the asyncio event loop by
+    dispatching the blocking call to the default thread executor. The event
+    loop stays responsive (guardrail watchdogs, background emitters keep
+    firing), but the SDK's ``can_use_tool`` callback that awaited this
+    function is held until the operator hits enter — so the Claude session
+    itself is blocked at the tool boundary, same shape as a slow relay.
+
+    ``prompt`` is written directly to ``sys.stderr`` and NOT routed through
+    :func:`claude_pilot.logger.write_log`, so under ``--log-dir`` the prompt
+    text does not reach the file sink. Escalation logs above the prompt
+    still do. See ``docs/permissions-interactive-fallback.md``.
+
+    No timeout. A stuck ``readline`` returns only on newline, EOF, or a
+    signal that unwinds the executor (SIGINT via the CLI's signal handler).
+    """
     import asyncio
 
     sys.stderr.write(prompt)
