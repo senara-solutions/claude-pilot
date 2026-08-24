@@ -10,7 +10,7 @@ dependencies = [
   "claude-agent-sdk==0.2.116",
   "pydantic>=2.13.4,<3",
   "pyyaml>=6.0.3,<7",
-  "python-dotenv>=1.0",
+  "python-dotenv>=1.2.3",
   # Transitive security pins for cpp#66 (2026-07-04 Dependabot cleanup — public-flip alert cleanup).
   # These packages are pulled in by claude-agent-sdk / cryptography stack but cpp does not
   # directly import them; pinning here forces uv lock to select patched versions across the
