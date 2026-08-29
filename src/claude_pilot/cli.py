@@ -24,6 +24,7 @@ from .agent import run_agent
 from .guardrails import SessionGuardrails, resolve_guardrail_defaults
 from .logger import close_file_log, init_file_log
 from .permissions import create_permission_handler
+from .shell import run_shell
 from .types import GuardrailConfig, PilotConfig, ResultJson
 from .ui import log_config, log_env
 
@@ -53,6 +54,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--command", dest="command", default=None)
     p.add_argument("--verbose", dest="verbose", action="store_true", default=False)
+    # cpp#69: interactive REPL. When set, the positional prompt is OPTIONAL
+    # (used as an opening turn if given) and the shell drives one persistent
+    # session instead of the headless one-shot; no ResultJson is emitted.
+    p.add_argument(
+        "-i",
+        "--interactive",
+        dest="interactive",
+        action="store_true",
+        default=False,
+        help="Open an interactive REPL/shell instead of a one-shot run",
+    )
 
     p.add_argument("--max-turns", dest="max_turns", type=int, default=None)
     p.add_argument("--max-budget", dest="max_budget", type=float, default=None)
@@ -90,10 +102,14 @@ def _validate_args(ns: argparse.Namespace, parser: argparse.ArgumentParser) -> N
         _usage(parser)
 
 
-def _collect_prompt(parser: argparse.ArgumentParser, ns: argparse.Namespace) -> str:
+def _collect_prompt(
+    parser: argparse.ArgumentParser, ns: argparse.Namespace, *, required: bool = True
+) -> str:
     # argparse.REMAINDER keeps `--` as a literal first element if present
     words = [w for w in ns.prompt if w != "--"]
     if not words:
+        if not required:
+            return ""  # interactive mode: prompt is an optional opening turn
         sys.stderr.write("Error: prompt is required\n")
         _usage(parser)
     return " ".join(words)
@@ -184,7 +200,7 @@ def main() -> None:
     parser = _build_parser()
     ns = parser.parse_args()
     _validate_args(ns, parser)
-    prompt = _collect_prompt(parser, ns)
+    prompt = _collect_prompt(parser, ns, required=not ns.interactive)
 
     if ns.verbose:
         log_env(str(env_path), loaded, count)
@@ -219,6 +235,10 @@ def main() -> None:
     if not relay and ns.relay_config:
         sys.stderr.write("Warning: --relay-config is ignored when --no-relay is active\n")
 
+    if ns.interactive:
+        # Never returns — _run_interactive always sys.exit()s with the shell's code.
+        _run_interactive(ns, cwd=cwd, config=config, relay=relay, opening=prompt)
+
     guardrail_config = _merge_guardrails(
         config.guardrails if config else None,
         _cli_overrides(ns),
@@ -243,6 +263,53 @@ def main() -> None:
         sys.exit(130)
     except Exception as err:
         _emit_fatal(str(err))
+        traceback.print_exc(file=sys.stderr)
+        close_file_log()
+        sys.exit(1)
+
+    close_file_log()
+    sys.exit(exit_code)
+
+
+def _run_interactive(
+    ns: argparse.Namespace,
+    *,
+    cwd: Path,
+    config: PilotConfig | None,
+    relay: bool,
+    opening: str,
+) -> NoReturn:
+    """Launch the interactive REPL (cpp#69) and exit with its code.
+
+    Unlike the headless path this NEVER writes a ResultJson line to stdout —
+    the shell is operator-facing, and the machine contract is headless-only.
+    A fatal is reported on stderr only, for the same reason.
+    """
+    opening_prompt: str | None = None
+    if ns.command and opening:
+        opening_prompt = f"{ns.command} {opening}"
+    elif ns.command:
+        opening_prompt = ns.command
+    elif opening:
+        opening_prompt = opening
+
+    try:
+        exit_code = asyncio.run(
+            run_shell(
+                cwd=str(cwd),
+                verbose=ns.verbose,
+                config=config,
+                relay=relay,
+                task_id=ns.task_id or None,
+                opening_prompt=opening_prompt,
+            )
+        )
+    except KeyboardInterrupt:
+        sys.stderr.write("\nShutting down...\n")
+        close_file_log()
+        sys.exit(130)
+    except Exception as err:
+        sys.stderr.write(f"Fatal: {err}\n")
         traceback.print_exc(file=sys.stderr)
         close_file_log()
         sys.exit(1)
