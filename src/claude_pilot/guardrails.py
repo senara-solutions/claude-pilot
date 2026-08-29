@@ -93,6 +93,17 @@ class SessionGuardrails:
         # Detection: any ToolUseBlock where name=="Bash" and command contains
         # "gh pr create" (substring match, false-positives accepted per plan).
         self._pr_created: bool = False
+        # cpp#119: sticky "currently rate-limited" flag. Set when a rate-limit
+        # signal is observed on the stream (a CLI RateLimitEvent with
+        # status=="rejected", or an AssistantMessage carrying error=="rate_limit")
+        # and reported to `note_rate_limit`. Cleared when the model produces a
+        # fresh turn (the retry succeeded → we are producing again) or when a
+        # recovered rate-limit signal arrives. Read by `_idle_watchdog` so a
+        # stall that fires WHILE we are throttled is classified `rate_limited`
+        # instead of being misattributed to `idle_timeout`.
+        self._rate_limited: bool = False
+        self._rate_limit_detail: str | None = None
+        self._rate_limit_api_status: int | None = None
         self._reset_idle_timer()
 
     @property
@@ -124,6 +135,47 @@ class SessionGuardrails:
         assert self._abort_reason is not None
         return self._abort_reason
 
+    @property
+    def rate_limited(self) -> bool:
+        """True while a rate-limit signal is active (observed and not yet
+        cleared by resumed progress). cpp#119 — read by the idle watchdog to
+        classify a throttled stall distinctly."""
+        return self._rate_limited
+
+    def note_rate_limit(
+        self,
+        *,
+        rejected: bool,
+        detail: str | None = None,
+        api_error_status: int = 429,
+    ) -> None:
+        """Record a rate-limit signal observed on the SDK message stream (cpp#119).
+
+        The Claude Code CLI surfaces throttling on the wire — a `RateLimitEvent`
+        whose `rate_limit_info.status == "rejected"` means the subscription
+        limit has been hit, and an `AssistantMessage.error == "rate_limit"`
+        marks an individual turn refused for the same reason. agent.py observes
+        those as they arrive and reports them here, because the terminal
+        `ResultMessage.api_error_status` (cpp#54) never arrives when the idle
+        guardrail fires between the SDK's silent retries.
+
+        `rejected=True` arms the sticky flag; `rejected=False` (a recovered
+        signal — status back to `allowed` / `allowed_warning`) clears it. The
+        flag is also cleared whenever the model produces a fresh turn, since
+        that means a retry succeeded and we are producing output again.
+        """
+        if rejected:
+            self._rate_limited = True
+            self._rate_limit_detail = detail
+            self._rate_limit_api_status = api_error_status
+        else:
+            self._clear_rate_limit()
+
+    def _clear_rate_limit(self) -> None:
+        self._rate_limited = False
+        self._rate_limit_detail = None
+        self._rate_limit_api_status = None
+
     def on_assistant_message(
         self,
         content: list[dict[str, Any]] | Any,
@@ -154,6 +206,13 @@ class SessionGuardrails:
         text_len = sum(
             len((_block_text(b) or "").strip()) for b in blocks if _block_type(b) == "text"
         )
+
+        # cpp#119: productive output means a throttle-retry succeeded — clear
+        # any armed rate-limit flag so a LATER genuine idle stall is not
+        # misclassified as `rate_limited`. A refused/empty turn (no text, no
+        # tool_use) leaves the flag intact.
+        if has_tool_use or text_len > 0:
+            self._clear_rate_limit()
 
         # mika#940: PR-creation detection. Scan tool_use blocks for Bash
         # invocations whose command substring includes `gh pr create`. Set
@@ -312,11 +371,25 @@ class SessionGuardrails:
         except asyncio.CancelledError:
             return
         secs = round(self._config.idleTimeoutMs / 1000)
-        self._abort("idle_timeout", f"No meaningful progress for {secs}s")
+        # cpp#119: a stall that fires WHILE a rate-limit signal is active is not
+        # a genuine idle timeout — the session is silent because the SDK is
+        # backing off between throttled retries, not because the model stopped
+        # producing. Classify it distinctly so the operator/dispatch-lib can
+        # wait it out instead of treating it as a dead session.
+        if self._rate_limited:
+            detail = self._rate_limit_detail or (
+                f"Rate-limited: no progress for {secs}s while the API is throttling "
+                "(429); session was backing off between retries, not idle"
+            )
+            self._abort("rate_limited", detail)
+        else:
+            self._abort("idle_timeout", f"No meaningful progress for {secs}s")
 
     def _abort(
         self,
-        guardrail: Literal["stall_detected", "empty_response", "idle_timeout"],
+        guardrail: Literal[
+            "stall_detected", "empty_response", "idle_timeout", "rate_limited"
+        ],
         detail: str,
     ) -> None:
         if self._abort_event.is_set():
@@ -325,6 +398,12 @@ class SessionGuardrails:
             guardrail=guardrail,
             turns=self._turn_count,
             detail=detail,
+            # cpp#119: carry the API status onto the abort path so agent.py can
+            # populate ResultJson.api_error_status even though no terminal
+            # ResultMessage (cpp#54's source) ever arrives here.
+            api_error_status=(
+                self._rate_limit_api_status if guardrail == "rate_limited" else None
+            ),
         )
         self.dispose()
         self._abort_event.set()

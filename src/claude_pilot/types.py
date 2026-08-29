@@ -151,9 +151,22 @@ class GuardrailAbortReason(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["guardrail"] = "guardrail"
-    guardrail: Literal["stall_detected", "empty_response", "idle_timeout"]
+    # cpp#119: `rate_limited` distinguishes a stall caused by Anthropic
+    # throttling (429 / subscription rate-limit rejection) from a genuine
+    # `idle_timeout` (the model simply stopped producing). Additive to the
+    # three cpp#54-era values — consumers that only recognize the original
+    # three still parse the JSON shape; they just do not special-case the new
+    # value. See GuardrailAbortReason.api_error_status below.
+    guardrail: Literal[
+        "stall_detected", "empty_response", "idle_timeout", "rate_limited"
+    ]
     turns: int
     detail: str
+    # cpp#119: HTTP status of the API error that caused a `rate_limited` abort
+    # (429). Lets agent.py surface `api_error_status` on the abort path — not
+    # only on the terminal ResultMessage (cpp#54) which never arrives when the
+    # idle guardrail fires mid-retry-storm. None for the other guardrail kinds.
+    api_error_status: int | None = None
 
 
 class TransportError(Exception):
