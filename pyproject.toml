@@ -39,7 +39,7 @@ dev = [
   "pytest-asyncio>=1.4.0",
   "ruff>=0.16.3",
   "mypy>=2.3.0",
-  "types-PyYAML>=6.0.12.20260518",
+  "types-PyYAML>=6.0.12.20260815",
   "ipython>=9.16.1",  # exercises the [ipython] extra's magics in the test suite
 ]
 
