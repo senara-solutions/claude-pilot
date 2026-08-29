@@ -17,6 +17,7 @@ from typing import Any, Literal
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import (
     AssistantMessage,
+    RateLimitEvent,
     ResultMessage,
     SystemMessage,
     SystemPromptPreset,
@@ -160,6 +161,11 @@ async def _run_agent_inner(
                             cost_usd=None,  # unknown — ResultMessage not yet received
                             duration_ms=duration_ms,
                             termination_reason=reason.detail,
+                            # cpp#119: surface the API-error status on the abort
+                            # path (429 for a `rate_limited` trip). None for the
+                            # other guardrail kinds — serialized absent via
+                            # exclude_none, so existing consumers are unaffected.
+                            api_error_status=reason.api_error_status,
                         )
                     )
                     emitted_terminal = True  # cpp#20 joint 2 mutual-exclusion guard (Site 1)
@@ -181,8 +187,34 @@ async def _run_agent_inner(
                         log_reconnect(session_id or "", model or "unknown")
                     continue
 
+                if isinstance(message, RateLimitEvent):
+                    # cpp#119: the CLI emits this whenever subscription rate-limit
+                    # state transitions. `status == "rejected"` means the limit is
+                    # hit and the SDK is (silently) backing off — arm the guardrail
+                    # so a stall firing during that backoff is classified
+                    # `rate_limited`, not `idle_timeout`. Any other status is a
+                    # recovery/warning that clears the flag.
+                    info = message.rate_limit_info
+                    rejected = info.status == "rejected"
+                    guardrails.note_rate_limit(
+                        rejected=rejected,
+                        detail=_rate_limit_detail(info) if rejected else None,
+                    )
+                    if rejected:
+                        log_guardrail("rate_limited", _rate_limit_detail(info))
+                    continue
+
                 if isinstance(message, AssistantMessage):
                     session_id = getattr(message, "session_id", session_id) or session_id
+                    # cpp#119: an individual turn refused for throttling carries
+                    # error=="rate_limit". Treat it as a rate-limit signal too, so
+                    # a subsequent idle stall is attributed correctly even if no
+                    # RateLimitEvent preceded it.
+                    if getattr(message, "error", None) == "rate_limit":
+                        guardrails.note_rate_limit(
+                            rejected=True,
+                            detail="Assistant turn refused: rate_limit (429)",
+                        )
                     event = guardrails.on_assistant_message(
                         _content_blocks(message),
                         message_id=getattr(message, "message_id", None),
@@ -336,6 +368,20 @@ async def _run_agent_inner(
 
 
 _GUARDRAIL_TRIP: Any = object()
+
+
+def _rate_limit_detail(info: Any) -> str:
+    """cpp#119: human-readable one-liner for a rejected rate-limit signal,
+    used both for the operator log line and as the guardrail abort detail.
+    Reads only status-level fields (no message content) — safe to log."""
+    parts = ["Anthropic rate limit rejected (429)"]
+    rl_type = getattr(info, "rate_limit_type", None)
+    if rl_type:
+        parts.append(f"window={rl_type}")
+    resets_at = getattr(info, "resets_at", None)
+    if resets_at:
+        parts.append(f"resets_at={resets_at}")
+    return "; ".join(parts)
 
 
 async def _merge_stream(

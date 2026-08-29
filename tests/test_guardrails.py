@@ -10,6 +10,8 @@ the abort prematurely (claude-pilot-py#4).
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from claude_agent_sdk.types import TextBlock, ThinkingBlock, ToolUseBlock
 
@@ -293,3 +295,83 @@ async def test_pr_created_substring_match(guardrails: SessionGuardrails) -> None
         message_id="msg_1",
     )
     assert guardrails.pr_created is True
+
+
+# ── Rate-limited stall classification (cpp#119) ──────────────────────────────
+
+
+def _idle_config(idle_ms: int = 40) -> ResolvedGuardrailConfig:
+    """Config with a very short idle timeout so the watchdog fires promptly in
+    tests, and stall/empty detection effectively disabled."""
+    return ResolvedGuardrailConfig(
+        maxTurns=200,
+        maxBudgetUsd=0.0,
+        stallThreshold=0,
+        emptyResponseThreshold=0,
+        idleTimeoutMs=idle_ms,
+        minTurnsBeforeDetection=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_stall_classified_as_rate_limited_not_idle_timeout() -> None:
+    """cpp#119: when a rate-limit signal is active and the idle watchdog fires,
+    the abort is classified `rate_limited` (with api_error_status 429), NOT
+    `idle_timeout`. The two conditions were previously collapsed."""
+    guardrails = SessionGuardrails(_idle_config())
+    # A CLI RateLimitEvent(status="rejected") arrived on the stream — the SDK is
+    # now backing off between throttled retries and produces nothing.
+    guardrails.note_rate_limit(rejected=True, detail="Anthropic rate limit rejected (429)")
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    # `rate_limited` and `idle_timeout` are mutually exclusive literals — this
+    # equality proves the throttled stall is NOT misattributed to idle_timeout.
+    assert reason.guardrail == "rate_limited"
+    assert reason.api_error_status == 429
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_genuine_idle_stall_still_classifies_as_idle_timeout() -> None:
+    """cpp#119: with no rate-limit signal active, a stalled session still
+    classifies as `idle_timeout` and carries no api_error_status — the existing
+    behaviour is preserved."""
+    guardrails = SessionGuardrails(_idle_config())
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_productive_turn_clears_rate_limit_flag_before_idle() -> None:
+    """cpp#119: a productive turn means a throttle-retry succeeded — the sticky
+    flag clears, so a LATER genuine idle stall is `idle_timeout`, not
+    `rate_limited`."""
+    guardrails = SessionGuardrails(_idle_config())
+    guardrails.note_rate_limit(rejected=True)
+    assert guardrails.rate_limited is True
+
+    # Real output arrives → throttle cleared (and idle timer reset).
+    guardrails.on_assistant_message([_text("back to work")], message_id="msg_1")
+    assert guardrails.rate_limited is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovered_rate_limit_signal_clears_flag() -> None:
+    """cpp#119: a recovered rate-limit signal (status back to allowed) clears
+    the sticky flag."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=10_000))
+    guardrails.note_rate_limit(rejected=True)
+    assert guardrails.rate_limited is True
+    guardrails.note_rate_limit(rejected=False)
+    assert guardrails.rate_limited is False
+    guardrails.dispose()
