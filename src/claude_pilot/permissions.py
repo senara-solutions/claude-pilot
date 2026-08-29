@@ -726,7 +726,23 @@ def create_permission_handler(
     guardrails: SessionGuardrails | None = None,
     task_id: str | None = None,
     policy_path: Path | None = None,
+    interactive: bool = False,
 ) -> CanUseTool:
+    """Build the ``can_use_tool`` callback (Tier 1 → Tier 1.5 → policy → relay
+    → interactive fallback).
+
+    ``interactive`` (cpp#69) opts into the operator-driven shell posture. When
+    ``True`` *and* stdin is a TTY, a **default** deny — the policy's fail-closed
+    "no rule matched, unknown request" verdict (``rule_id is None``) — is
+    surfaced to the live operator through the existing interactive fallback
+    (:func:`_interactive_fallback`) instead of hard-halting the session. This
+    reuses the one interactive path already in this module; it never adds a
+    second permission path, and it never overrides an EXPLICIT decision: rule-
+    based denies, deny-with-notify, and the allow-branch safety vetoes
+    (chain-danger, destination-escape / control-plane) all stay hard denies the
+    operator cannot wave through. Left ``False`` (the default), every existing
+    caller — the headless pilot included — keeps its exact behavior.
+    """
     # Load policy once at handler creation time (cached for session).
     policy = load_policy(policy_path)
     policy_enabled = os.environ.get("MIKA_PILOT_POLICY_DISABLED", "").strip() != "1"
@@ -868,6 +884,22 @@ def create_permission_handler(
                     ctx=ctx,
                 )
             if pd.decision == "deny":
+                # cpp#69 interactive shell: when an operator is live-driving at
+                # a TTY, surface a DEFAULT deny (rule_id is None — no rule
+                # matched, the "unknown, ask a human" case) to them via the
+                # existing interactive fallback rather than hard-halting the
+                # session. Explicit rule-based denies (rule_id set) still halt.
+                # TTY-gated so a piped / non-interactive shell keeps the
+                # fail-closed default-deny (interrupt=True) posture.
+                if interactive and pd.rule_id is None and sys.stdin.isatty():
+                    fb_result = await _interactive_fallback(tool_name, tool_input)
+                    return _record_decision(
+                        fb_result,
+                        tool_name=tool_name,
+                        rule_id="interactive-operator",
+                        cwd=cwd,
+                        ctx=ctx,
+                    )
                 log_policy_deny(tool_name, detail, pd.rule_id)
                 return _record_decision(
                     PermissionResultDeny(message=pd.reason, interrupt=True),
@@ -1070,10 +1102,11 @@ async def _interactive_fallback(
 
     Entry point for both interactive fallback call sites in
     :func:`create_permission_handler`: the "no relay" branch and the
-    "relay-exhausted after retry" branch. Reachability caveat: in the default
-    posture (policy enabled) the Tier 2 policy block above always returns
-    terminally, so neither call site is exercised — see
-    ``docs/permissions-interactive-fallback.md``.
+    "relay-exhausted after retry" branch — plus the cpp#69 operator-shell
+    default-deny branch (``interactive=True``). Reachability caveat for the
+    first two: in the default headless posture (policy enabled, non-interactive)
+    the Tier 2 policy block above always returns terminally, so neither of those
+    two call sites is exercised — see ``docs/permissions-interactive-fallback.md``.
 
     TTY-gates on ``sys.stdin.isatty()`` — a non-TTY session (subprocess pipe,
     systemd, CI) auto-denies with ``interrupt=False`` so the SDK surfaces the
@@ -1107,7 +1140,9 @@ async def _interactive_permission(
     Denial uses ``interrupt=False`` — see :func:`_interactive_fallback`.
 
     No other affordances: no allow-with-modifications, no deny-with-reason,
-    no defer-to-relay. cpp#69 owns extending this surface.
+    no defer-to-relay. cpp#69 makes this path reachable from the operator shell
+    (``create_permission_handler(interactive=True)`` routes a policy default-deny
+    here); richer affordances remain future work.
     """
     detail = _summarize_input(tool_name, tool_input)
     log_escalate(tool_name, detail)
