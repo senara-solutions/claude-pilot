@@ -19,6 +19,7 @@ from claude_agent_sdk.types import (
     AssistantMessage,
     RateLimitEvent,
     ResultMessage,
+    StreamEvent,
     SystemMessage,
     SystemPromptPreset,
 )
@@ -39,9 +40,28 @@ from .ui import (
     log_reconnect,
     log_text,
     log_turn_summary,
+    log_unhandled_message,
 )
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
+
+# cpp#123: raw Anthropic SSE event types that prove the model is still
+# producing. `ping` is a connection keepalive and `error` is a failure signal —
+# neither is progress, and rearming the idle guardrail on a keepalive would
+# make it inert for as long as the socket stays open. An allow-list is used
+# rather than excluding `ping` so a future keepalive under a new name cannot
+# silently disarm the guardrail; `log_unhandled_message` keeps the blind spot
+# observable if the SDK ever adds a top-level event type.
+_PROGRESS_STREAM_EVENT_TYPES = frozenset(
+    {
+        "message_start",
+        "message_delta",
+        "message_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    }
+)
 
 # cpp#111 D8-2: per-turn heartbeats are throttled to at most one per minute so
 # a tool-heavy stream does not flood cm-api. Session-start / session-end /
@@ -145,6 +165,9 @@ async def _run_agent_inner(
         await client.query(prompt)
 
         guardrail_watcher = asyncio.create_task(guardrails.wait_aborted())
+        # cpp#123: SDK message types already reported as unhandled, so the
+        # terminal branch below logs at most one line per type per session.
+        unhandled_message_types: set[str] = set()
         try:
             async for message in _merge_stream(client, guardrail_watcher):
                 if message is _GUARDRAIL_TRIP:
@@ -175,6 +198,17 @@ async def _run_agent_inner(
                     except Exception:
                         pass
                     return 1
+
+                # cpp#123: StreamEvent is the highest-volume message on the
+                # stream (`include_partial_messages=True`, agent.py options
+                # below) and carries the only evidence that a turn is still
+                # producing — the turn boundary AssistantMessage keys on does
+                # not arrive until the turn ENDS. Feed content-bearing events
+                # to the guardrail so a long turn is not killed mid-generation.
+                if isinstance(message, StreamEvent):
+                    if _stream_event_is_progress(message):
+                        guardrails.note_stream_activity()
+                    continue
 
                 if isinstance(message, SystemMessage) and message.subtype == "init":
                     session_id = _extract_session_id(message)
@@ -328,6 +362,18 @@ async def _run_agent_inner(
                     else:
                         log_error(subtype, errors or [])
                         exit_code = 1
+                    continue
+
+                # cpp#123: terminal branch. Every message type above ends in a
+                # `continue`, so anything reaching here matched no branch. This
+                # bug existed because StreamEvent was discarded silently right
+                # at this spot; name the type once per session so the next
+                # union member the SDK adds is visible on its first occurrence
+                # instead of costing another round of diagnosis.
+                type_name = type(message).__name__
+                if type_name not in unhandled_message_types:
+                    unhandled_message_types.add(type_name)
+                    log_unhandled_message(type_name)
         finally:
             guardrail_watcher.cancel()
             guardrails.dispose()
@@ -368,6 +414,19 @@ async def _run_agent_inner(
 
 
 _GUARDRAIL_TRIP: Any = object()
+
+
+def _stream_event_is_progress(message: StreamEvent) -> bool:
+    """cpp#123: True when a StreamEvent carries model production.
+
+    `StreamEvent.event` is the raw Anthropic stream event dict. Reads are
+    guarded so an SDK shape change degrades to "not progress" — which keeps the
+    guardrail conservative — rather than raising inside the message loop.
+    """
+    event = getattr(message, "event", None)
+    if not isinstance(event, dict):
+        return False
+    return event.get("type") in _PROGRESS_STREAM_EVENT_TYPES
 
 
 def _rate_limit_detail(info: Any) -> str:
