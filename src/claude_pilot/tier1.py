@@ -230,9 +230,8 @@ def is_tier3_dangerous(command: str) -> bool:
 # Prevention-only half of mika#1409 (Approach #2). The headless pilot model has
 # no preflight visibility into the deny-list above, so it reaches for forbidden
 # shell idioms (`find … -exec`, cross-worktree `md5sum`, `sed -i`) when an
-# auto-approved native tool serves the same goal. A policy denial returns
-# `PermissionResultDeny(interrupt=True)` (permissions.py / cpp#20 joint 2) and
-# the session DIES — so a single bad reach forces a manual rescue.
+# auto-approved native tool serves the same goal. Every such reach costs a turn
+# and a refusal; the hint is there to make them rarer.
 #
 # This constant is injected into the SDK system prompt by agent.py. It lives
 # HERE, next to the patterns it describes (TIER3_PATTERNS, FIND_EXEC_SAFE_COMMANDS,
@@ -241,10 +240,14 @@ def is_tier3_dangerous(command: str) -> bool:
 # crashed the mika#1381 groom) and 548191b8 (cross-worktree md5sum crashed the
 # mika#1255 AC verification).
 #
-# Honest-closure note: this hint reduces the RATE of denied reaches; it does
-# NOT close the session-fatality class. Novel denied patterns still crash the
-# session — that class closes only when cpp#20 joint 2's contract is revised to
-# distinguish adaptation from fabrication (mika#1410).
+# Honest-closure note (UPDATED, cpp#128): this hint only ever reduced the RATE
+# of denied reaches. The session-fatality class it could not close — a novel
+# denied pattern crashing the run — was closed by cpp#128, which revised
+# cpp#20 joint 2's contract to distinguish adaptation from fabrication exactly
+# as mika#1410 asked. A denied reach now returns to the model as a tool_result
+# error it can adapt to; only a destination veto or a tier3-dangerous command
+# still ends the run (`permissions._denial_is_terminal`). The hint stays useful:
+# a reach that never happens costs no turn at all.
 #
 # Scope note (cpp#59): this constant grew beyond denied-Bash patterns. It is the
 # single model-facing prevention-hint payload appended to the system prompt, and
@@ -258,11 +261,14 @@ def is_tier3_dangerous(command: str) -> bool:
 # sessions, mika#1652), it does not close the class; the disallowed_tools guard in
 # agent.py is best-effort defense-in-depth on top.
 DENIED_BASH_PATTERNS_HINT: str = """\
-## Bash commands that crash this session — use the native tool instead
+## Bash commands the policy DENIES — use the native tool instead
 
-The permission policy DENIES the Bash patterns below, and a denied Bash call
-terminates this session immediately (no retry, no recovery). Never reach for
-them — use the auto-approved native tool, which accomplishes the same goal:
+The permission policy DENIES the Bash patterns below. A denied call costs you a
+turn and comes back as an error you must work around. Some of them — `sed -i`,
+shell redirects (`>`, `>>`), `eval`, `bash -c`, `sh -c`, and anything writing
+outside this worktree — additionally END this session immediately, with no
+retry and no recovery. Never reach for any of them; use the auto-approved native
+tool, which accomplishes the same goal:
 
 - `find … -exec`/`-execdir`/`-ok`/`-okdir` with a NON-read-only inner command
   (e.g. `find … -exec rm`, `find … -exec sh -c …`, `find … -exec sudo …`), and

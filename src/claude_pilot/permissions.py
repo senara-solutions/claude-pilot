@@ -464,6 +464,108 @@ def _bash_allow_is_chain_safe(
     return True
 
 
+# ── Denial lethality (cpp#128) ────────────────────────────────────────────────
+#
+# A policy refusal has two independent properties: the DECISION (the command is
+# refused and never executed) and the LETHALITY (whether the SDK agent loop is
+# aborted along with it). cpp#20 joint 2 fused them: every denial returned
+# `interrupt=True`, so any refusal killed the session.
+#
+# Measured on the 60 most recent pilot sessions (cpp#128 body,
+# `/var/log/claude-pilot/*.stderr`): 11 sessions carried a `[policy:deny]`, 11
+# ended in `error_during_execution`, and they were the SAME 11 — the tool-call
+# counts of the eleven were 22, 5, 5, 4, 4, 3, 3, 2, 2, 2, 1, with no zero among
+# them. Every session that did any work was killed by this path. The refused
+# shapes were not dangerous commands but the ordinary probe idiom
+# `echo "label"; command`, each tripping a different rule id.
+#
+# This helper splits the two properties back apart. The decision is untouched:
+# nothing below turns a deny into an allow, and no rule is widened. Only the
+# lethality is narrowed, to the two classes that genuinely warrant ending the
+# run (cpp#128 option B):
+#
+#   * `_destination_veto_reason` — worktree containment / control-plane
+#     denylist (cpp#38, cpp#42). Hard-coded terminal at its own call site, and
+#     ALSO consulted by this helper so the containment boundary is terminal on
+#     every denial route, not only on the one that happened to match a
+#     write-capable allow rule. Without that second check the boundary degrades
+#     from a one-shot tripwire into a probing oracle: `mkdir -p /outside/x`
+#     matches `bash-mkdir`, reaches the veto at its own call site and halts,
+#     while `echo "go"; mkdir -p /outside/x` fails chain-safety, never reaches
+#     that call site, and would otherwise let a prompt-injected pilot keep
+#     guessing spellings once per turn for the rest of its budget.
+#     Coverage is exactly `_segment_write_kind`'s: `mkdir`, `cp`/`mv`, and
+#     `git show >`. A write verb it does not classify (`touch`, `tee`, ...) is
+#     still REFUSED — nothing is written — but non-terminally. Closing that gap
+#     means teaching `_segment_write_kind` more verbs, which is its own change.
+#   * tier3-dangerous Bash — the codebase's own name for a genuinely dangerous
+#     command. `is_tier3_dangerous` is a whole-string `re.search`, so a
+#     dangerous tail chained onto an allowed prefix (`mkdir x && rm -rf /tmp/y`)
+#     is still caught here and still terminal.
+#
+# Both are Bash-shaped notions. A denial for any other tool is non-terminal.
+#
+# Everything else comes back to the model as a `tool_result` error it can adapt
+# to — the open class `tier1.py`'s prevention hint named ("that class closes
+# only when cpp#20 joint 2's contract is revised to distinguish adaptation from
+# fabrication", mika#1410).
+#
+# NOT corroboration: `policies/permissions.yaml:147` claims broader shapes
+# "route to relay". They do not, and did not before this change either — the
+# relay block below is reachable only under MIKA_PILOT_POLICY_DISABLED=1. That
+# comment is wrong in both worlds; it is named here so the next reader does not
+# mistake it for a description of this behavior.
+#
+# The counter-reason recorded at cpp#20 joint 2 — that a non-terminal denial
+# "surfaces the denial as a tool_result error the LLM can fabricate around" —
+# does not depend on `interrupt=True`. A refusal loop IS bounded, and ends
+# honestly with a terminal `ResultJson`. But be precise about what bounds it,
+# because three of the four session guardrails structurally cannot:
+#
+#   * `maxTurns=200` (`types.py:42`) — the real bound. SDK-native; ends the run
+#     with `error_max_turns`, a genuine ResultMessage.
+#   * `stallThreshold=5` — does NOT fire. `guardrails.py` resets
+#     `_consecutive_stall_turns = 0` on any turn with `has_tool_use`, and a
+#     refused call is still a tool use.
+#   * `emptyResponseThreshold=5` — same reset; a refusal loop produces content.
+#   * `idleTimeoutMs=300_000` — rearmed by turn boundaries and content-bearing
+#     stream events; a busy loop keeps it alive.
+#
+# The first three detect a SILENT or degenerate session, not a busy-but-fruitless
+# one. `maxTurns` carries this alone, and `--no-guardrails` / `--stall-threshold 0`
+# (`cli.py`) can zero the other three but not it. A pilot that adapts to a
+# refusal is not a dishonest pilot; a pilot that never stops would be, and
+# `maxTurns` is what actually stands in the way.
+
+
+def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) -> bool:
+    """Whether a policy denial must also abort the SDK agent loop (cpp#128).
+
+    ``False`` — the refusal is surfaced to the model as a ``tool_result`` error
+    and the run continues — for every tool other than Bash, and for a Bash
+    command that is neither tier3-dangerous nor a containment escape.
+
+    ``True`` for a tier3-dangerous Bash command, for a Bash command whose write
+    destination escapes ``cwd`` or lands on the control plane, and for a Bash
+    request that carries no parseable ``command`` at all — a missing key and a
+    non-string value are the same condition and must classify the same way, so
+    both fail closed. An explicitly EMPTY string is a parseable command and is
+    not dangerous, so it stays non-terminal.
+
+    ``_destination_veto_reason`` is defined below; it is total (``None`` for a
+    non-string or empty command, segments classified structurally by their
+    leading command word), so it is safe to run on an already-refused command.
+    """
+    if tool_name != "Bash":
+        return False
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return True
+    if is_tier3_dangerous(command):
+        return True
+    return _destination_veto_reason(command, cwd) is not None
+
+
 # ── Destination validation for write-capable structural rules (cpp#38, cpp#42) ─
 #
 # `_bash_allow_is_chain_safe` (above) proves a command is shape-safe and that no
@@ -676,7 +778,8 @@ def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
     Wire-format keeps the legacy ``escalate`` decision string for back-compat
     with existing operator-authored permissions.yaml overlays; the runtime
     semantics post-cpp#20 joint 2 are deny-with-notify (no relay roundtrip,
-    pilot loop halts via ``interrupt=True``).
+    pilot loop halts via ``interrupt=True``). cpp#128 left this path terminal:
+    an escalate exists to put a human in the loop.
     """
     from .notify import notify_escalation
 
@@ -735,7 +838,10 @@ def create_permission_handler(
     ``True`` *and* stdin is a TTY, a **default** deny — the policy's fail-closed
     "no rule matched, unknown request" verdict (``rule_id is None``) — is
     surfaced to the live operator through the existing interactive fallback
-    (:func:`_interactive_fallback`) instead of hard-halting the session. This
+    (:func:`_interactive_fallback`) instead of being auto-refused. Post-cpp#128
+    the distinguishing property is "the operator gets a say", not "avoids a
+    halt" — a headless default-deny of an ordinary command no longer halts
+    either. This
     reuses the one interactive path already in this module; it never adds a
     second permission path, and it never overrides an EXPLICIT decision: rule-
     based denies, deny-with-notify, and the allow-branch safety vetoes
@@ -829,20 +935,31 @@ def create_permission_handler(
             )
 
         # Tier 2: deterministic policy-file lookup (mika#1192).
-        # cpp#20 joint 2: denial paths return PermissionResultDeny(interrupt=True)
-        # so the SDK aborts the agent loop instead of surfacing the denial as a
-        # tool_result error the LLM can fabricate around. The pilot exits
-        # honestly; downstream parsers (mika dispatch-lib `_run_claude_pilot`)
-        # see a clean terminal ResultJson with status != "success" via the
-        # synthetic-emit guard in agent.py.
+        #
+        # Denial lethality is decided by `_denial_is_terminal` (cpp#128): a
+        # refusal is ALWAYS a refusal — the command is never executed and the
+        # audit event fires either way — but only a tier3-dangerous Bash command
+        # or a destination veto also aborts the SDK agent loop. Every other
+        # refusal comes back to the model as a `tool_result` error it can adapt
+        # to. See the doctrine block above `_denial_is_terminal` for the
+        # measurement that forced this split and for why cpp#20 joint 2's
+        # fabrication counter-reason is carried by the session guardrails
+        # instead. When a denial IS terminal, downstream parsers (mika
+        # dispatch-lib `_run_claude_pilot`) still see a clean terminal ResultJson
+        # with status != "success" via the synthetic-emit guard in agent.py.
         if policy_enabled:
             pd = evaluate(policy, tool_name, tool_input)
             detail = _summarize_input(tool_name, tool_input)
             if pd.decision == "allow":
                 # Chained-danger guard (claude-pilot#25): a policy allow rule
                 # matches a whole-command regex; veto it if a dangerous tail is
-                # chained onto the allowed prefix. Halt honestly (interrupt=True)
-                # like every other policy denial (cpp#20 joint 2).
+                # chained onto the allowed prefix. The veto stands either way —
+                # the command is never executed. Whether it also ends the run is
+                # `_denial_is_terminal`'s call (cpp#128): a genuinely dangerous
+                # tail (`mkdir x && rm -rf /tmp/y`) is caught by the whole-string
+                # tier3 search and halts; a merely un-allowlisted segment
+                # (`echo "label"; cmd`, `for … do … done`) is refused and the run
+                # continues.
                 if not _bash_allow_is_chain_safe(policy, tool_name, tool_input):
                     veto_reason = (
                         f"policy allow ({pd.rule_id}) vetoed — command chains a "
@@ -851,7 +968,10 @@ def create_permission_handler(
                     )
                     log_policy_deny(tool_name, detail, pd.rule_id)
                     return _record_decision(
-                        PermissionResultDeny(message=veto_reason, interrupt=True),
+                        PermissionResultDeny(
+                            message=veto_reason,
+                            interrupt=_denial_is_terminal(tool_name, tool_input, cwd),
+                        ),
                         tool_name=tool_name,
                         rule_id=f"{pd.rule_id}:chain-veto",
                         cwd=cwd,
@@ -860,8 +980,16 @@ def create_permission_handler(
                 # Destination validation for write-capable structural rules:
                 # worktree containment (cpp#38) + control-plane denylist (cpp#42).
                 # Runs here because it needs the worktree root (`cwd`), which the
-                # string-only policy guard does not carry. Halts honestly like
-                # every other policy denial (cpp#20 joint 2).
+                # string-only policy guard does not carry.
+                #
+                # THE EXCEPTION (cpp#128): this is the one denial class that
+                # keeps an unconditional `interrupt=True`. It does not consult
+                # `_denial_is_terminal`. A destination veto means the pilot tried
+                # to write OUTSIDE its own worktree or into the control plane —
+                # a containment breach, not a refused idiom. There is nothing for
+                # the model to usefully adapt to, and letting the run continue
+                # past one would keep a session alive that has already left its
+                # sandbox in intent. It halts.
                 if tool_name == "Bash":
                     dest_veto = _destination_veto_reason(
                         tool_input.get("command", ""), cwd
@@ -887,10 +1015,12 @@ def create_permission_handler(
                 # cpp#69 interactive shell: when an operator is live-driving at
                 # a TTY, surface a DEFAULT deny (rule_id is None — no rule
                 # matched, the "unknown, ask a human" case) to them via the
-                # existing interactive fallback rather than hard-halting the
-                # session. Explicit rule-based denies (rule_id set) still halt.
+                # existing interactive fallback rather than auto-refusing.
+                # Explicit rule-based denies (rule_id set) are never
+                # handed to the operator — they stand as refusals, and halt only
+                # when `_denial_is_terminal` says so (cpp#128).
                 # TTY-gated so a piped / non-interactive shell keeps the
-                # fail-closed default-deny (interrupt=True) posture.
+                # fail-closed default-deny posture.
                 if interactive and pd.rule_id is None and sys.stdin.isatty():
                     fb_result = await _interactive_fallback(tool_name, tool_input)
                     return _record_decision(
@@ -902,7 +1032,10 @@ def create_permission_handler(
                     )
                 log_policy_deny(tool_name, detail, pd.rule_id)
                 return _record_decision(
-                    PermissionResultDeny(message=pd.reason, interrupt=True),
+                    PermissionResultDeny(
+                        message=pd.reason,
+                        interrupt=_denial_is_terminal(tool_name, tool_input, cwd),
+                    ),
                     tool_name=tool_name,
                     rule_id=pd.rule_id or "policy-default",
                     cwd=cwd,
@@ -913,6 +1046,15 @@ def create_permission_handler(
             # back-compat with existing operator overlays; runtime semantics
             # post-cpp#20 joint 2 are identical to `deny` plus the notify
             # side-effect (cpp#21 rename is source-only).
+            #
+            # UNCHANGED by cpp#128, deliberately. `escalate` means "put a human
+            # in the loop", so continuing past it defeats its only purpose, and
+            # it is outside the class cpp#128 measured (all 11 killed sessions
+            # logged `[policy:deny]`, none `[policy:deny_with_notify]`). It also
+            # has no dedup or rate limit — `_fire_notify` spawns a detached
+            # `mika notify` per call — so making it non-terminal would turn a
+            # retry loop into an operator-notification flood on the very channel
+            # that compensates for non-lethal denials elsewhere.
             log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
             _fire_notify(tool_name, detail, pd.reason)
             return _record_decision(
@@ -1110,8 +1252,10 @@ async def _interactive_fallback(
 
     TTY-gates on ``sys.stdin.isatty()`` — a non-TTY session (subprocess pipe,
     systemd, CI) auto-denies with ``interrupt=False`` so the SDK surfaces the
-    denial to the LLM as a tool_result rather than aborting the loop. This
-    diverges from the Tier 2 policy path which uses ``interrupt=True``.
+    denial to the LLM as a tool_result rather than aborting the loop. Since
+    cpp#128 the Tier 2 policy path shares that default; it reserves
+    ``interrupt=True`` for a destination veto or a tier3-dangerous Bash command
+    (:func:`_denial_is_terminal`).
 
     Routes ``AskUserQuestion`` to :func:`_interactive_question`; every other
     tool routes to :func:`_interactive_permission`.

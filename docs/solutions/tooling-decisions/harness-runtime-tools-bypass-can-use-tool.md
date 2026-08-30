@@ -55,10 +55,15 @@ incident transcript: look at the `tool_result` for the call.
   No classifier rule will ever catch it.
 
 Corroborating signal: claude-pilot has **no allow path** for an unknown tool
-(`tier1` → `False`, `tier1.5` → `None`, policy default → `deny` +
-`interrupt=True`). So if such a tool *succeeds*, it provably bypassed the chain —
-had it reached `can_use_tool`, the default-deny would have **halted** the session
-with a deny message, not returned success.
+(`tier1` → `False`, `tier1.5` → `None`, policy default → `deny`). So if such a
+tool *succeeds*, it provably bypassed the chain — had it reached `can_use_tool`,
+the default-deny would have returned a **deny message**, not success. Compare
+the `tool_result` text, which is the reliable tell.
+
+(Post-cpp#128 the denial no longer also halts the session: `interrupt=True` is
+reserved for a destination veto and tier3-dangerous Bash, and `ScheduleWakeup`
+is neither. The *diagnostic* above is unchanged — deny message vs. success — but
+do not expect a dead session as the signal.)
 
 **Where the viable controls live (SDK options layer, `agent.py`):**
 

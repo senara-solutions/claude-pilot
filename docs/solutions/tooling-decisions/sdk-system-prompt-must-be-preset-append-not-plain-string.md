@@ -1,17 +1,26 @@
 ---
 title: "claude-agent-sdk system_prompt must be preset+append, never a plain string"
 date: 2026-06-05
+last_updated: 2026-08-30
 module: claude_pilot.agent
 component: sdk-options
 problem_type: tooling_decision
 category: tooling-decisions
-tags: [claude-agent-sdk, system-prompt, claude-code-preset, headless, permission-policy, mika-1409, drift-guard]
+tags: [claude-agent-sdk, system-prompt, claude-code-preset, headless, permission-policy, mika-1409, mika-1410, claude-pilot-128, drift-guard]
 applies_when: "setting or reviewing ClaudeAgentOptions.system_prompt, or adding a model-facing hint to a headless claude-pilot session"
 ---
 
 # claude-agent-sdk system_prompt must be preset+append, never a plain string
 
 ## Context
+
+> **Superseded in part by cpp#128 (2026-08-30).** The world described below —
+> where *every* policy denial carried `interrupt=True` and killed the session —
+> no longer exists. Lethality is now narrowed to a destination veto and
+> tier3-dangerous Bash (`permissions._denial_is_terminal`). The SDK
+> `system_prompt` lesson (preset+append, never a plain string) is unaffected and
+> remains the point of this document; the fatality framing is history. See
+> `a-refusal-and-its-lethality-are-two-decisions-not-one.md`.
 
 mika#1409: headless claude-pilot sessions die with `error_during_execution` when
 the model reaches for a policy-denied Bash command (e.g. `find … -exec`). The
@@ -105,9 +114,16 @@ specific to the pilot's dispatch model. What ships is deterministically proven
 closes only when cpp#20 joint-2's contract distinguishes adaptation from
 fabrication — **mika#1410**.
 
+**Closed 2026-08-30 by cpp#128**, which made exactly that distinction: an
+ordinary refusal comes back as a `tool_result` error the model adapts to, and
+only a destination veto or a tier3-dangerous command still ends the run. The
+hint keeps its value — a reach that never happens costs no turn at all — but it
+is no longer the only thing standing between a denied reach and a dead session.
+
 ## Related
 
 - mika#1409 — this fix (prevention-only)
 - mika#1410 — recoverable-denial follow-up (cpp#20 joint-2 contract revision)
-- claude-pilot-py#20 — the `interrupt=True` honest-halt contract
+- claude-pilot-py#20 — the original `interrupt=True` honest-halt contract (narrowed by cpp#128)
+- claude-pilot#128 — the lethality split; `a-refusal-and-its-lethality-are-two-decisions-not-one.md`
 - `docs/solutions/security-issues/` — command-string policy allow-rule safety (the enforcement side)
