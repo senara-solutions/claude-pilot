@@ -22,6 +22,7 @@ from claude_agent_sdk.types import (
     StreamEvent,
     SystemMessage,
     SystemPromptPreset,
+    UserMessage,
 )
 
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
@@ -41,6 +42,7 @@ from .ui import (
     log_text,
     log_turn_summary,
     log_unhandled_message,
+    log_verbose,
 )
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
@@ -64,14 +66,16 @@ _PROGRESS_STREAM_EVENT_TYPES = frozenset(
 )
 
 # cpp#123: union members the loop ignores ON PURPOSE, so the unhandled-message
-# branch below stays quiet about them. `UserMessage` carries tool results and
-# arrives on essentially every session; a `SystemMessage` whose subtype is not
-# `init` is likewise a deliberate skip. Without this set the branch prints two
-# lines every run, and a genuinely new union member would be indistinguishable
-# from that standing baseline — which is the exact diagnosis cost it exists to
+# branch below stays quiet about them. A `SystemMessage` whose subtype is not
+# `init` is a deliberate skip. Without this set the branch would print a line
+# every run, and a genuinely new union member would be indistinguishable from
+# that standing baseline — which is the exact diagnosis cost it exists to
 # prevent. Matched on the exact class name, so SDK SystemMessage SUBCLASSES
 # (TaskProgressMessage, HookEventMessage, ...) still get reported.
-_KNOWN_IGNORED_MESSAGE_TYPES = frozenset({"UserMessage", "SystemMessage"})
+# cpp#125: `UserMessage` used to live here too, but it now has an explicit
+# isinstance branch (rearm + debug log) and never reaches the terminal branch,
+# so it no longer needs a silent-ignore entry.
+_KNOWN_IGNORED_MESSAGE_TYPES = frozenset({"SystemMessage"})
 
 # cpp#111 D8-2: per-turn heartbeats are throttled to at most one per minute so
 # a tool-heavy stream does not flood cm-api. Session-start / session-end /
@@ -216,8 +220,33 @@ async def _run_agent_inner(
                 # not arrive until the turn ENDS. Feed content-bearing events
                 # to the guardrail so a long turn is not killed mid-generation.
                 if isinstance(message, StreamEvent):
-                    if _stream_event_is_progress(message):
+                    is_progress = _stream_event_is_progress(message)
+                    if is_progress:
                         guardrails.note_stream_activity()
+                    # cpp#125: a StreamEvent no longer falls through the loop
+                    # silently. Progress rearms the idle timer above; here we
+                    # also leave a debug trace so the highest-volume message on
+                    # the stream is observable when the operator asks for it.
+                    # Gated on `verbose` (the codebase's debug level) so the
+                    # non-verbose path stays flood-free — a turn emits thousands
+                    # of these — preserving cpp#123's anti-flood design.
+                    if verbose:
+                        log_verbose(
+                            f"stream event: {_stream_event_type(message)} "
+                            f"(progress={is_progress})"
+                        )
+                    continue
+
+                if isinstance(message, UserMessage):
+                    # cpp#125: UserMessage carries tool results — inbound SDK
+                    # traffic that proves the session is still alive. Rearm the
+                    # idle deadline (without inflating the content-stream
+                    # counter, since a tool result is not model production) and
+                    # leave a debug trace, so it no longer falls through
+                    # silently the way StreamEvent once did.
+                    guardrails.note_activity()
+                    if verbose:
+                        log_verbose("user message (tool result) received")
                     continue
 
                 if isinstance(message, SystemMessage) and message.subtype == "init":
@@ -440,6 +469,20 @@ def _stream_event_is_progress(message: StreamEvent) -> bool:
     if not isinstance(event, dict):
         return False
     return event.get("type") in _PROGRESS_STREAM_EVENT_TYPES
+
+
+def _stream_event_type(message: StreamEvent) -> str:
+    """cpp#125: the raw Anthropic SSE event type for the debug log line.
+
+    Guarded the same way as `_stream_event_is_progress` so a shape change
+    degrades to a readable placeholder instead of raising in the loop.
+    """
+    event = getattr(message, "event", None)
+    if isinstance(event, dict):
+        t = event.get("type")
+        if isinstance(t, str):
+            return t
+    return "unknown"
 
 
 def _rate_limit_detail(info: Any) -> str:

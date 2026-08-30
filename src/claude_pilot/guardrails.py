@@ -188,6 +188,31 @@ class SessionGuardrails:
         """
         self._stream_activity_count += 1
         self._clear_rate_limit()
+        self._bump_idle_deadline()
+
+    def note_activity(self) -> None:
+        """Record non-generation SDK liveness on the message stream (cpp#125).
+
+        A `UserMessage` carries tool results — inbound traffic that proves the
+        session is still alive, but is NOT model production. Unlike
+        `note_stream_activity` this moves the idle deadline forward WITHOUT
+        incrementing the content-stream counter (whose reported meaning is
+        "content stream events this session") and WITHOUT clearing the sticky
+        rate-limit flag: a tool result is no evidence that a throttled
+        generation retry has succeeded. Deliberately cheap — it only moves a
+        deadline and never touches the watchdog task.
+        """
+        self._bump_idle_deadline()
+
+    def _bump_idle_deadline(self) -> None:
+        """Push the idle deadline to now, at O(1) cost (cpp#123/#125).
+
+        Shared by `note_stream_activity` and `note_activity`. The watchdog task
+        recomputes its remaining budget against `_last_activity_at` on each wake,
+        so moving this timestamp rearms the timer without cancelling/recreating
+        the task — no churn across the thousands of deltas a turn emits. A no-op
+        outside a running loop (constructor-time defensive guard).
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -324,8 +349,12 @@ class SessionGuardrails:
         self._stall_incremented_for_current_turn = False
         self._empty_incremented_for_current_turn = False
         # Reset idle timer on each new turn — even empty ones.
-        # Stall/empty detection handles degenerate-content cases; idle timeout
-        # is reserved for "nothing at all" from the SDK.
+        # Stall/empty detection handles degenerate-content cases. idle_timeout
+        # now fires only on GENUINE SDK silence: no stream deltas AND no new
+        # turn boundary for the whole idleTimeoutMs window. cpp#123 wired
+        # generation deltas to `note_stream_activity`, so this is no longer the
+        # weaker "no new turn boundary" / "between turns" predicate that killed
+        # a turn mid-generation — the comment now matches what the code does.
         self._reset_idle_timer()
 
         if self._turn_count < self._config.minTurnsBeforeDetection:
