@@ -104,6 +104,16 @@ class SessionGuardrails:
         self._rate_limited: bool = False
         self._rate_limit_detail: str | None = None
         self._rate_limit_api_status: int | None = None
+        # cpp#123: intra-turn liveness. `_last_activity_at` is the event-loop
+        # timestamp of the most recent progress signal — a turn boundary, a
+        # relay resume, or a content-bearing SDK StreamEvent. `_idle_watchdog`
+        # measures against it instead of sleeping a fixed span, so activity
+        # rearms the timer at O(1) cost with no task churn (a turn produces
+        # thousands of deltas). `_stream_activity_count` is reported in the
+        # idle abort detail so a silent session is distinguishable from a
+        # producing one straight from the log.
+        self._last_activity_at: float = 0.0
+        self._stream_activity_count: int = 0
         self._reset_idle_timer()
 
     @property
@@ -141,6 +151,36 @@ class SessionGuardrails:
         cleared by resumed progress). cpp#119 — read by the idle watchdog to
         classify a throttled stall distinctly."""
         return self._rate_limited
+
+    @property
+    def stream_activity_count(self) -> int:
+        """Number of content-bearing SDK stream events observed this session
+        (cpp#123). Reported in the `idle_timeout` abort detail."""
+        return self._stream_activity_count
+
+    def note_stream_activity(self) -> None:
+        """Record intra-turn progress from the SDK message stream (cpp#123).
+
+        `agent.py` sets `include_partial_messages=True`, so the SDK delivers a
+        `StreamEvent` per raw Anthropic SSE event throughout a turn. Those
+        events are the only evidence that a turn is still producing: the turn
+        boundary that `on_assistant_message` keys on does not arrive until the
+        turn ENDS.
+
+        Without this signal the idle timer measured "no new turn boundary",
+        not "nothing at all from the SDK" as its own contract claims, and a
+        turn whose generation ran past `idleTimeoutMs` was aborted mid-flight.
+
+        Deliberately cheap: it moves a deadline and does not touch the
+        watchdog task. `agent.py` calls it once per content-bearing stream
+        event; keepalives are filtered there, not here.
+        """
+        self._stream_activity_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._last_activity_at = loop.time()
 
     def note_rate_limit(
         self,
@@ -363,11 +403,22 @@ class SessionGuardrails:
             # The SessionGuardrails is expected to be constructed inside
             # asyncio.run(); this is a defensive no-op.
             return
+        self._last_activity_at = loop.time()
         self._idle_task = loop.create_task(self._idle_watchdog())
 
     async def _idle_watchdog(self) -> None:
+        # cpp#123: deadline-driven rather than a single fixed sleep. Activity
+        # pushes `_last_activity_at` forward while this task sleeps, so on wake
+        # the remaining budget is recomputed and the task sleeps again. One
+        # task per timer arming, regardless of how many deltas arrive.
+        timeout = self._config.idleTimeoutMs / 1000.0
         try:
-            await asyncio.sleep(self._config.idleTimeoutMs / 1000.0)
+            loop = asyncio.get_running_loop()
+            while True:
+                remaining = self._last_activity_at + timeout - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
         except asyncio.CancelledError:
             return
         secs = round(self._config.idleTimeoutMs / 1000)
@@ -383,7 +434,15 @@ class SessionGuardrails:
             )
             self._abort("rate_limited", detail)
         else:
-            self._abort("idle_timeout", f"No meaningful progress for {secs}s")
+            # cpp#123: name the observed stream-event count. A session that
+            # produced nothing and one that streamed for hours used to render
+            # the same line, which is what made mika#2029 take six rounds to
+            # diagnose.
+            self._abort(
+                "idle_timeout",
+                f"No meaningful progress for {secs}s "
+                f"({self._stream_activity_count} content stream events this session)",
+            )
 
     def _abort(
         self,
