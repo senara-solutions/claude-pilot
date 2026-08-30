@@ -183,11 +183,16 @@ def test_no_relay_config_graceful() -> None:
         assert result is None, "_load_config should return None for missing config"
 
 
-# cpp#20 joint 1 / joint 2 fail-closed regression tests.
+# cpp#20 joint 1 fail-closed regression tests.
 # Composition: load failure -> empty Policy -> default-deny -> evaluate returns
-# deny -> handler returns PermissionResultDeny(interrupt=True) -> pilot loop
-# halts. These tests pin the load -> evaluate half of the chain; the handler
-# half lives in tests/test_permissions.py.
+# a refusal -> handler returns PermissionResultDeny. These tests pin the
+# load -> evaluate half of the chain; the handler half lives in
+# tests/test_permissions.py.
+#
+# "halt" in the names below is historical. Post-cpp#128 `evaluate` returns a
+# DECISION (deny / escalate); whether the run also ends is a separate axis owned
+# by `permissions._denial_is_terminal`. The assertions here are about the
+# decision only, and are unaffected.
 
 class TestFailClosedSafety:
     """Architect-required tests (cpp#20 joint 1 safety property)."""

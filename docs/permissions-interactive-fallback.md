@@ -134,7 +134,7 @@ Rendered to stderr:
 
 - `_interactive_fallback` immediately auto-denies when `sys.stdin.isatty()` is false (`permissions.py:1069-1073`), returning `PermissionResultDeny(message="Non-interactive mode: auto-denied", interrupt=False)`.
 - This means: cpp invoked via subprocess from a mika-skills handler, or via `mika ask --agent` piping, or under systemd, or in CI, cannot use the interactive fallback — it silently denies. Not configurable; TTY detection is hard-coded to `sys.stdin`.
-- `interrupt=False` on the deny means the SDK returns the denial as a tool_result to the LLM (not an interrupt); the pilot continues and the model may fabricate around the denial. Contrast with the Tier 2 policy denial path, which returns `interrupt=True` (`permissions.py:838`, `permissions.py:873`, `permissions.py:887`) to abort the loop honestly (cpp#20 joint 2).
+- `interrupt=False` on the deny means the SDK returns the denial as a tool_result to the LLM (not an interrupt); the pilot continues and adapts. **Post-cpp#128 the Tier 2 policy path shares this default** — it calls `permissions._denial_is_terminal` and reserves `interrupt=True` for a destination veto (worktree containment / control plane) and tier3-dangerous Bash. The old contrast ("interactive is soft, Tier 2 is always hard") no longer holds; the two differ in *who decides*, not in lethality.
 
 ---
 
@@ -193,7 +193,7 @@ Suggested minimum coverage before extending — file as separate follow-up ticke
 1. **Fallback is largely dead code today.** The comment at `permissions.py:894-895` is honest ("only reachable when `MIKA_PILOT_POLICY_DISABLED=1`"), but the implication that the fallback surface is legacy is not documented anywhere else. cpp#69 planning should decide whether to fork (b), unify (c), or delete this path as part of a broader redesign.
 2. **Interactive prompt not captured in `--log-dir`.** `_ainput` writes directly to `sys.stderr` bypassing `write_log`, so the `Allow? (y/n):` line and option-numbered choices appear on stderr but never make it into the log file. `log_escalate` / `log_question_escalate` above them do. Operators reading log files see the escalation event but not the exact input prompt. Suggest either routing `_ainput`'s prompt through `write_log` (writes both) OR adding a `write_file_log(prompt)` mirror before the executor call. Follow-up: fine to bundle into cpp#69 or file separately as a minor observability fix — no urgency.
 3. **No prompt timeout, no operator-away recovery.** A hung `_ainput` holds the SDK session forever (only SIGINT unwedges it). If cpp#69 puts the interactive path in a live loop, it should introduce a prompt timeout with a default-deny recovery, or at minimum a `KeyboardInterrupt`-friendly cancel path.
-4. **Interactive denial uses `interrupt=False`.** Tier 2 policy denials use `interrupt=True` (cpp#20 joint 2 rationale in `permissions.py:816-821`) so the SDK aborts and the LLM cannot fabricate around the denial. Interactive denials from `_interactive_permission` (`permissions.py:1091`) return with `interrupt=False`, so the LLM sees the deny as a tool_result and may fabricate. Debatable whether that's the intended semantic for an operator-driven deny (operator said no — arguably that IS an interrupt); if cpp#69 wants to align the two, this is the switch to flip.
+4. ~~**Interactive denial uses `interrupt=False`** while Tier 2 uses `interrupt=True`.~~ **RESOLVED by cpp#128.** The two are now aligned by default: an ordinary Tier 2 refusal is also `interrupt=False`, and `interrupt=True` is reserved for a destination veto and tier3-dangerous Bash. The "LLM can fabricate around the denial" rationale this residual recorded is the same counter-reason cpp#128 argues is carried by the session guardrails — specifically by `maxTurns=200`, since `stallThreshold` / `emptyResponseThreshold` / `idleTimeoutMs` cannot fire on a busy refusal-retry loop. Nothing left for cpp#69 to flip here.
 
 None of the above are fixed in this ticket per the guardrails (`NO refactor of permissions.py logic`).
 
@@ -205,9 +205,9 @@ The existing interactive fallback:
 
 - has a working stdin/stderr transport with async-safe input dispatch,
 - offers only binary (`y`/`n`) or numeric-selection answers with no timeouts, no rate-limiting, no logfile capture of the prompt itself, and no configurability,
-- is unreachable in the default deployment posture (Tier 2 policy always terminates first),
+- is unreachable in the default deployment posture (Tier 2 policy always *decides* first — post-cpp#128 it terminates only on a destination veto or tier3-dangerous Bash, but it still returns before the fallback either way),
 - has zero test coverage,
-- returns `interrupt=False` on deny (unlike Tier 2 which uses `interrupt=True`).
+- returns `interrupt=False` on deny — which post-cpp#128 is what Tier 2 does too for an ordinary refusal, so this is no longer a divergence.
 
 **Recommendation for cpp#69:** **(b) fork** — share the transport primitives (`_ainput`, `_summarize_input`, stderr renderers) but build a fresh interactive loop with configurable enable/disable, prompt timeout with default-deny, first-class logfile capture, and consistent `interrupt=` semantics. Option (a) "extend" would inherit the dead-code position and the design residuals above. Option (c) "unify" (delete + replace) is defensible if cpp#69 decides the fallback is fully redundant with the new mode; that call needs a broader look at the emergency-rollback posture (`MIKA_PILOT_POLICY_DISABLED=1`) before committing.
 

@@ -9,7 +9,10 @@ test_ipython_magics.py:
 * The permission relay *in an interactive context* is exercised against the
   real ``create_permission_handler(interactive=True)`` with a stubbed TTY stdin:
   a policy DEFAULT deny is surfaced to the operator and their y/n flows back,
-  while explicit rule denies and the non-TTY posture stay hard halts. The
+  while explicit rule denies are never handed to the operator and the non-TTY
+  posture stays fail-closed. (Post-cpp#128 those two refusals are no longer
+  hard halts — an ordinary refused command is non-terminal — but they are still
+  refusals, and the operator is still never consulted for them.) The
   permission chain internals themselves remain owned by test_permissions.py /
   test_tier1.py — this only pins the interactive wiring cpp#69 adds.
 """
@@ -302,9 +305,13 @@ def test_default_deny_surfaces_to_operator_who_denies(
 def test_explicit_rule_deny_stays_hard_even_in_interactive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An EXPLICIT rule-based deny is never handed to the operator — it halts
-    the session (interrupt=True) exactly as headlessly. The operator drives
-    only the unknown space, never overrides an explicit 'no'."""
+    """An EXPLICIT rule-based deny is never handed to the operator. The
+    operator drives only the unknown space, never overrides an explicit 'no' —
+    that is the load-bearing property here, and it is unchanged.
+
+    Since cpp#128 the refusal is non-terminal for a non-tier3 command
+    (`curl https://evil.test`): the deny stands, the operator is still not
+    consulted, and the REPL keeps driving instead of the session dying."""
     policy_file = tmp_path / "rule_deny.yaml"
     policy_file.write_text(
         "rules:\n"
@@ -322,23 +329,26 @@ def test_explicit_rule_deny_stays_hard_even_in_interactive(
     handler = _interactive_handler(policy_file)
     result = asyncio.run(handler("Bash", {"command": "curl https://evil.test"}, _ctx()))
     assert isinstance(result, PermissionResultDeny)
-    assert result.interrupt is True  # ...but the explicit deny still halts
     assert result.message == "rule-based test deny"
     assert stdin.readline_calls == 0  # operator was NEVER consulted
+    assert result.interrupt is False  # cpp#128: refused, not fatal
 
 
 def test_non_tty_interactive_keeps_fail_closed_default_deny(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """interactive=True but a non-TTY stdin (piped / CI) keeps the headless
-    fail-closed default-deny with interrupt=True — the shell never silently
-    widens privilege off a TTY."""
+    fail-closed default-deny — the shell never silently widens privilege off a
+    TTY, and it never consults an operator that is not there.
+
+    cpp#128: the deny is still a deny; it is non-terminal because
+    `curl https://example.com` is not tier3-dangerous."""
     stdin = _FakeStdin([], tty=False)
     monkeypatch.setattr("sys.stdin", stdin)
     handler = _interactive_handler(Path("/nonexistent/policy.yaml"))
     result = asyncio.run(handler("Bash", {"command": "curl https://example.com"}, _ctx()))
     assert isinstance(result, PermissionResultDeny)
-    assert result.interrupt is True
+    assert result.interrupt is False  # cpp#128 — refused, not fatal
     assert stdin.readline_calls == 0
 
 

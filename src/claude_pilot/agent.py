@@ -427,6 +427,13 @@ async def _run_agent_inner(
     #     causing the Claude Code CLI to close its stdio pipe without a
     #     terminal ResultMessage (the Case-B failure mode the friend-Claude
     #     review converged on; architect verdict READY).
+    #     NARROWED by cpp#128: `interrupt=True` is no longer returned for every
+    #     policy denial, only for a destination veto or a tier3-dangerous Bash
+    #     command (`permissions._denial_is_terminal`). This guard STAYS — those
+    #     two classes still reach it, and so does every transport drop. What
+    #     changed is that an ordinary refusal (`echo "label"; cmd`) no longer
+    #     arrives here at all: the SDK hands it to the model as a tool_result
+    #     error and the run continues to a real ResultMessage.
     #   * Transport drop / clean upstream close for any other reason.
     # Without this guard cpp would exit silently with empty stdout, and
     # dispatch-lib's `jq -r '.status // empty'` extraction would yield an
