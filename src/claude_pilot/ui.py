@@ -161,3 +161,14 @@ def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
     if config.maxBudgetUsd > 0:
         parts.append(f"maxBudget=${config.maxBudgetUsd}")
     _log(f"{DIM}[guardrails]{RESET} {' '.join(parts)}")
+
+
+def log_unhandled_message(type_name: str) -> None:
+    """cpp#123: name an SDK message type the agent loop does not handle.
+
+    Emitted once per type per session. The bug this closes existed because
+    `StreamEvent` fell off the end of the message loop without a trace, and a
+    failure path that logs nothing is indistinguishable from a path that was
+    never taken.
+    """
+    _log(f"{DIM}[unhandled]{RESET} SDK message type not handled: {type_name}")

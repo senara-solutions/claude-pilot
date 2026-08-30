@@ -375,3 +375,133 @@ async def test_recovered_rate_limit_signal_clears_flag() -> None:
     guardrails.note_rate_limit(rejected=False)
     assert guardrails.rate_limited is False
     guardrails.dispose()
+
+
+# ── Intra-turn stream activity rearms the idle timer (cpp#123) ───────────────
+#
+# Before cpp#123 the idle timer was rearmed only at a turn boundary (a
+# `message_id` change) and around the relay window. `include_partial_messages=
+# True` means the SDK delivers StreamEvents throughout a turn, but nothing fed
+# them to the guardrail, so a turn whose generation ran past idleTimeoutMs was
+# aborted while the model was still producing. Measured signature: session
+# duration tracked `turns x ~301s` — every terminal turn burned the whole
+# budget (mika#2029).
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_rearms_idle_timer_within_one_turn() -> None:
+    """AE1 / R1: a single turn that keeps streaming content past the idle
+    budget must NOT abort. No turn boundary occurs for the whole window — only
+    the intra-turn activity signal keeps the session alive."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+    guardrails.on_assistant_message([_text("starting the plan")], message_id="msg_1")
+
+    # Stream deltas for ~1.7x the idle budget without ever closing the turn.
+    # The per-delta gap (5ms) is 60x under the budget so an event-loop
+    # scheduling hiccup on a loaded runner cannot trip the watchdog, while the
+    # total span still exceeds it — widening the budget instead would make the
+    # test vacuous, since the timer would never expire even with no activity.
+    for _ in range(100):
+        await asyncio.sleep(0.005)
+        guardrails.note_stream_activity()
+
+    assert guardrails.aborted is False, (
+        "a turn that is still streaming content must not trip idle_timeout"
+    )
+    assert guardrails.stream_activity_count == 100
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_silence_after_stream_activity_still_aborts() -> None:
+    """AE2 / R2: the guardrail must keep detecting true silence. Activity
+    extends the deadline; it does not disarm the watchdog."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.on_assistant_message([_text("starting")], message_id="msg_1")
+    guardrails.note_stream_activity()
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_idle_abort_detail_reports_stream_activity_count() -> None:
+    """R7: the abort detail names how many content-bearing stream events the
+    session saw, so the next reader can tell a producing session from a silent
+    one without adding instrumentation. This is the line mika#2029 spent six
+    diagnostic rounds not having."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert "0 content stream events" in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_while_paused_does_not_resurrect_timer() -> None:
+    """AE4 / R4: the relay window pauses the timer. Activity arriving while
+    paused updates the deadline but must not start a watchdog, and the resume
+    grants a full fresh budget rather than inheriting the paused remainder."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=80))
+    guardrails.pause_idle_timer()
+    guardrails.note_stream_activity()
+
+    # Sleep well past the budget while paused — a paused guardrail never fires.
+    await asyncio.sleep(0.25)
+    assert guardrails.aborted is False
+
+    guardrails.resume_idle_timer()
+    # Resume grants a full budget, so nothing has fired yet a moment later.
+    await asyncio.sleep(0.02)
+    assert guardrails.aborted is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "idle_timeout"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_note_stream_activity_creates_no_asyncio_task() -> None:
+    """R5: rearming is O(1). A turn produces thousands of deltas — cancelling
+    and recreating the watchdog task per delta would be task churn, so the
+    activity signal only moves a deadline. Asserted structurally rather than by
+    timing: the watchdog task object must be identical across many signals."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=10_000))
+    tasks_before = len(asyncio.all_tasks())
+    watchdog_before = guardrails._idle_task
+
+    for _ in range(200):
+        guardrails.note_stream_activity()
+
+    assert len(asyncio.all_tasks()) == tasks_before
+    assert guardrails._idle_task is watchdog_before
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_clears_the_rate_limit_flag() -> None:
+    """Content on the wire means a throttle-retry succeeded, so the sticky
+    rate-limit flag must clear — stream events carry that proof strictly
+    earlier than a completed turn does.
+
+    Without this, a stream that dies mid-content-block after a recovered
+    throttle is reported `rate_limited` (api_error_status 429, a `resets_at`
+    already in the past) instead of `idle_timeout`, telling dispatch-lib to
+    wait out a session that is actually dead. Rearming the idle timer widens
+    that window, since a long content block is no longer capped at 300s.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.note_rate_limit(rejected=True)
+    assert guardrails.rate_limited is True
+
+    guardrails.note_stream_activity()
+    assert guardrails.rate_limited is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()

@@ -19,10 +19,12 @@ import pytest
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
+    StreamEvent,
     SystemMessage,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from claude_pilot import agent as agent_module
@@ -634,3 +636,208 @@ async def test_api_error_status_absent_omits_field(
     json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
     payload = json.loads(json_lines[0])
     assert "api_error_status" not in payload, payload
+
+
+# ── StreamEvent wiring and the silent-branch closure (cpp#123) ───────────────
+#
+# `include_partial_messages=True` makes the SDK deliver StreamEvents, but the
+# message loop branched on only four of the six `Message` union members.
+# StreamEvent fell through every isinstance check and was discarded with no log
+# line and no counter — a failure path indistinguishable from a path never
+# taken, which is why mika#2029 eliminated six other hypotheses first.
+
+
+def _stream(event_type: str) -> StreamEvent:
+    return StreamEvent(
+        uuid="evt_1",
+        session_id="sess_test",
+        event={"type": event_type},
+    )
+
+
+@pytest.mark.asyncio
+async def test_content_stream_events_reach_the_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1: content-bearing StreamEvents are fed to the guardrail as intra-turn
+    progress. Without this the timer only ever saw turn boundaries."""
+    messages: list[Any] = [
+        _init(),
+        _assistant([TextBlock(text="I'll start by reading the plan.")], "msg_1"),
+        _stream("content_block_start"),
+        _stream("content_block_delta"),
+        _stream("content_block_delta"),
+        _stream("content_block_stop"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    assert guardrails.stream_activity_count == 4
+
+
+@pytest.mark.asyncio
+async def test_ping_stream_events_do_not_count_as_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AE3 / R3: a keepalive proves the socket is open, not that the model is
+    producing. Rearming on `ping` would make the guardrail inert for as long as
+    the connection lives — a worse failure than the one being fixed."""
+    messages: list[Any] = [
+        _init(),
+        _assistant([TextBlock(text="thinking about it")], "msg_1"),
+        _stream("ping"),
+        _stream("ping"),
+        _stream("ping"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    assert guardrails.stream_activity_count == 0
+
+
+@pytest.mark.asyncio
+async def test_error_stream_event_is_not_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3: an SSE `error` event is not production either."""
+    messages: list[Any] = [_init(), _stream("error"), _result()]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    assert guardrails.stream_activity_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unhandled_message_type_is_logged_once_per_type(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6: this is the fix for the defect CLASS, not just its instance. A
+    message type the loop does not handle must leave a trace on first sight,
+    and must not flood the log on repeats."""
+
+    class _UnknownMessage:
+        pass
+
+    messages: list[Any] = [
+        _init(),
+        _UnknownMessage(),
+        _UnknownMessage(),
+        _UnknownMessage(),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert err.count("_UnknownMessage") == 1, (
+        "an unhandled message type logs on first sight, once per type"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliberately_ignored_message_types_stay_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6 regression: the unhandled-message branch must not fire on the two
+    union members the loop ignores on purpose.
+
+    `UserMessage` carries tool results and arrives on essentially every real
+    session; a `SystemMessage` with a non-`init` subtype is likewise a
+    deliberate skip. If these printed, every session would carry the same two
+    lines and a genuinely new union member would be invisible against that
+    baseline — costing exactly the diagnosis rounds this branch exists to save.
+    """
+    messages: list[Any] = [
+        _init(),
+        UserMessage(content="tool result"),
+        SystemMessage(subtype="compact_boundary", data={}),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert "[unhandled]" not in err, (
+        "deliberately-ignored union members must not trip the unhandled branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_system_message_subclass_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6: the ignore-list matches the exact class name, so an SDK
+    SystemMessage SUBCLASS (TaskProgressMessage, HookEventMessage, ...) is
+    still surfaced — that is a real new member, not a known skip."""
+
+    class TaskProgressMessage(SystemMessage):
+        pass
+
+    messages: list[Any] = [
+        _init(),
+        TaskProgressMessage(subtype="task_progress", data={}),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    assert "TaskProgressMessage" in capsys.readouterr().err
