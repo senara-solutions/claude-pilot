@@ -505,3 +505,64 @@ async def test_stream_activity_clears_the_rate_limit_flag() -> None:
     assert reason.guardrail == "idle_timeout"
     assert reason.api_error_status is None
     guardrails.dispose()
+
+
+# ── Non-generation liveness rearms the idle deadline (cpp#125) ───────────────
+#
+# `note_activity` is the UserMessage path: a tool result is inbound SDK traffic
+# that proves the session is alive, so it rearms the idle deadline — but it is
+# NOT model production, so it must not inflate the content-stream counter or
+# clear the sticky rate-limit flag the way `note_stream_activity` does.
+
+
+@pytest.mark.asyncio
+async def test_note_activity_rearms_idle_without_counting_as_stream() -> None:
+    """cpp#125: repeated `note_activity` past the idle budget keeps the session
+    alive (rearm works), yet the content-stream counter stays 0 — a tool result
+    is liveness, not model production."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+
+    # Rearm for ~1.7x the idle budget via the UserMessage path only.
+    for _ in range(100):
+        await asyncio.sleep(0.005)
+        guardrails.note_activity()
+
+    assert guardrails.aborted is False, (
+        "inbound tool-result liveness must keep the idle timer rearmed"
+    )
+    assert guardrails.stream_activity_count == 0, (
+        "note_activity must NOT count as a content stream event"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_note_activity_does_not_disarm_the_watchdog() -> None:
+    """cpp#125 anti-vacuity: `note_activity` extends the deadline, it does not
+    disarm the watchdog. After a single tool result, genuine silence still
+    fires `idle_timeout`."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.note_activity()
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_note_activity_does_not_clear_rate_limit_flag() -> None:
+    """cpp#125: unlike `note_stream_activity`, a tool result is no proof a
+    throttled generation retry has succeeded — so `note_activity` leaves the
+    sticky rate-limit flag intact, and a stall during backoff is still
+    classified `rate_limited`."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.note_rate_limit(rejected=True)
+    assert guardrails.rate_limited is True
+
+    guardrails.note_activity()
+    assert guardrails.rate_limited is True
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "rate_limited"
+    guardrails.dispose()

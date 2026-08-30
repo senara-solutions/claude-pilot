@@ -13,6 +13,7 @@ the integrated behavior (cpp#10 plan §Test strategy).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -841,3 +842,224 @@ async def test_system_message_subclass_is_still_reported(
     )
 
     assert "TaskProgressMessage" in capsys.readouterr().err
+
+
+# ── StreamEvent / UserMessage debug branches + idle wiring (cpp#125) ──────────
+#
+# cpp#123 wired StreamEvent to the guardrail and closed the silent fall-through
+# as a CLASS via the terminal unhandled-message branch. cpp#125 goes one step
+# further: StreamEvent and UserMessage each get an explicit branch that leaves a
+# debug trace (gated on `verbose`, the codebase's debug level) and UserMessage —
+# a tool result, inbound liveness — rearms the idle deadline. The debug gate
+# keeps the non-verbose path flood-free (a turn emits thousands of deltas),
+# preserving cpp#123's anti-flood design.
+
+
+class _DelayedClient:
+    """Fake client whose stream yields each (delay_secs, message) pair after
+    sleeping `delay_secs` first — lets a test span real wall-clock time so the
+    idle watchdog can race the message loop the way it does in production."""
+
+    def __init__(self, script: list[tuple[float, Any]]) -> None:
+        self._script = script
+
+    async def __aenter__(self) -> _DelayedClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        return None
+
+    async def query(self, _prompt: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    def receive_response(self) -> Any:
+        async def gen() -> Any:
+            for delay, msg in self._script:
+                if delay:
+                    await asyncio.sleep(delay)
+                yield msg
+
+        return gen()
+
+
+def _install_delayed_client(
+    monkeypatch: pytest.MonkeyPatch, script: list[tuple[float, Any]]
+) -> None:
+    def _factory(*_args: Any, **_kwargs: Any) -> _DelayedClient:
+        return _DelayedClient(script)
+
+    monkeypatch.setattr(agent_module, "ClaudeSDKClient", _factory)
+
+
+def _idle_config(idle_ms: int) -> ResolvedGuardrailConfig:
+    return ResolvedGuardrailConfig(
+        maxTurns=200,
+        maxBudgetUsd=0.0,
+        stallThreshold=0,
+        emptyResponseThreshold=0,
+        idleTimeoutMs=idle_ms,
+        minTurnsBeforeDetection=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_event_leaves_a_debug_trace_when_verbose(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#125: a StreamEvent no longer falls through silently — with
+    `verbose=True` it names the SSE type and whether it counted as progress."""
+    messages: list[Any] = [
+        _init(),
+        _stream("content_block_delta"),
+        _stream("ping"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=True,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    err = capsys.readouterr().err
+    assert "stream event: content_block_delta (progress=True)" in err
+    assert "stream event: ping (progress=False)" in err
+
+
+@pytest.mark.asyncio
+async def test_stream_event_stays_silent_when_not_verbose(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#125: the debug trace is gated on the debug level — the default path
+    stays flood-free even though a real turn emits thousands of deltas."""
+    messages: list[Any] = [_init(), _stream("content_block_delta"), _result()]
+    _install_fake_client(monkeypatch, messages)
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    err = capsys.readouterr().err
+    assert "stream event:" not in err
+    assert "[unhandled]" not in err
+
+
+@pytest.mark.asyncio
+async def test_user_message_branch_rearms_idle_and_logs_debug(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#125: UserMessage (a tool result) gets an explicit branch — it rearms
+    the idle deadline via `note_activity` and leaves a debug trace when verbose,
+    rather than sitting silently in the ignore set."""
+    calls: list[str] = []
+    guardrails = SessionGuardrails(_config())
+    monkeypatch.setattr(
+        guardrails, "note_activity", lambda: calls.append("note_activity")
+    )
+
+    messages: list[Any] = [
+        _init(),
+        UserMessage(content="tool result"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=True,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert calls == ["note_activity"], "UserMessage must rearm the idle deadline"
+    assert "user message (tool result) received" in err
+    assert "[unhandled]" not in err
+
+
+@pytest.mark.asyncio
+async def test_long_generation_with_deltas_is_not_killed_by_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#125 knob-breaking test, end-to-end through the agent loop: a single
+    turn whose generation runs PAST the idle threshold while emitting
+    StreamEvent deltas (and no turn boundary) must NOT be killed. This is the
+    exact mika#2029 failure: duration ~= turns x idleTimeoutMs."""
+    # 40 deltas x 3ms = ~120ms of streaming, 2x the 60ms idle budget, with the
+    # only AssistantMessage (turn boundary) up front. Gaps are 20x under budget
+    # so a loaded runner cannot trip the watchdog on scheduling jitter alone.
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _assistant([TextBlock(text="starting the long turn")], "msg_1")),
+    ]
+    for _ in range(40):
+        script.append((0.003, _stream("content_block_delta")))
+    script.append((0.0, _result()))
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    assert guardrails.aborted is False, "a streaming turn must not trip idle_timeout"
+    assert "idle_timeout" not in out
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_genuine_silence_still_fires_idle_timeout_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#125 anti-vacuity, end-to-end: a session that goes quiet — no deltas,
+    no turn boundary — past the idle budget must STILL be terminated as
+    `idle_timeout`. Proves the knob-breaking test above is not vacuous."""
+    # init, then a long silence before the (never-reached) result.
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (2.0, _result()),  # would arrive far after the 40ms budget expires
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    import json
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "terminated"
+    assert payload["subtype"] == "idle_timeout"
+    assert exit_code == 1
