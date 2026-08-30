@@ -393,18 +393,22 @@ async def test_stream_activity_rearms_idle_timer_within_one_turn() -> None:
     """AE1 / R1: a single turn that keeps streaming content past the idle
     budget must NOT abort. No turn boundary occurs for the whole window — only
     the intra-turn activity signal keeps the session alive."""
-    guardrails = SessionGuardrails(_idle_config(idle_ms=200))
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
     guardrails.on_assistant_message([_text("starting the plan")], message_id="msg_1")
 
-    # Stream deltas for ~2x the idle budget without ever closing the turn.
-    for _ in range(20):
-        await asyncio.sleep(0.02)
+    # Stream deltas for ~1.7x the idle budget without ever closing the turn.
+    # The per-delta gap (5ms) is 60x under the budget so an event-loop
+    # scheduling hiccup on a loaded runner cannot trip the watchdog, while the
+    # total span still exceeds it — widening the budget instead would make the
+    # test vacuous, since the timer would never expire even with no activity.
+    for _ in range(100):
+        await asyncio.sleep(0.005)
         guardrails.note_stream_activity()
 
     assert guardrails.aborted is False, (
         "a turn that is still streaming content must not trip idle_timeout"
     )
-    assert guardrails.stream_activity_count == 20
+    assert guardrails.stream_activity_count == 100
     guardrails.dispose()
 
 
@@ -475,4 +479,29 @@ async def test_note_stream_activity_creates_no_asyncio_task() -> None:
 
     assert len(asyncio.all_tasks()) == tasks_before
     assert guardrails._idle_task is watchdog_before
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_clears_the_rate_limit_flag() -> None:
+    """Content on the wire means a throttle-retry succeeded, so the sticky
+    rate-limit flag must clear — stream events carry that proof strictly
+    earlier than a completed turn does.
+
+    Without this, a stream that dies mid-content-block after a recovered
+    throttle is reported `rate_limited` (api_error_status 429, a `resets_at`
+    already in the past) instead of `idle_timeout`, telling dispatch-lib to
+    wait out a session that is actually dead. Rearming the idle timer widens
+    that window, since a long content block is no longer capped at 300s.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.note_rate_limit(rejected=True)
+    assert guardrails.rate_limited is True
+
+    guardrails.note_stream_activity()
+    assert guardrails.rate_limited is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
     guardrails.dispose()

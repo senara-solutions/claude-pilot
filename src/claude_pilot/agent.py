@@ -63,6 +63,16 @@ _PROGRESS_STREAM_EVENT_TYPES = frozenset(
     }
 )
 
+# cpp#123: union members the loop ignores ON PURPOSE, so the unhandled-message
+# branch below stays quiet about them. `UserMessage` carries tool results and
+# arrives on essentially every session; a `SystemMessage` whose subtype is not
+# `init` is likewise a deliberate skip. Without this set the branch prints two
+# lines every run, and a genuinely new union member would be indistinguishable
+# from that standing baseline — which is the exact diagnosis cost it exists to
+# prevent. Matched on the exact class name, so SDK SystemMessage SUBCLASSES
+# (TaskProgressMessage, HookEventMessage, ...) still get reported.
+_KNOWN_IGNORED_MESSAGE_TYPES = frozenset({"UserMessage", "SystemMessage"})
+
 # cpp#111 D8-2: per-turn heartbeats are throttled to at most one per minute so
 # a tool-heavy stream does not flood cm-api. Session-start / session-end /
 # tool-recovery are all rare enough that they fire unthrottled.
@@ -371,7 +381,10 @@ async def _run_agent_inner(
                 # union member the SDK adds is visible on its first occurrence
                 # instead of costing another round of diagnosis.
                 type_name = type(message).__name__
-                if type_name not in unhandled_message_types:
+                if (
+                    type_name not in _KNOWN_IGNORED_MESSAGE_TYPES
+                    and type_name not in unhandled_message_types
+                ):
                     unhandled_message_types.add(type_name)
                     log_unhandled_message(type_name)
         finally:

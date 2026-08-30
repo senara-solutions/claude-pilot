@@ -24,6 +24,7 @@ from claude_agent_sdk.types import (
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from claude_pilot import agent as agent_module
@@ -770,3 +771,73 @@ async def test_unhandled_message_type_is_logged_once_per_type(
     assert err.count("_UnknownMessage") == 1, (
         "an unhandled message type logs on first sight, once per type"
     )
+
+
+@pytest.mark.asyncio
+async def test_deliberately_ignored_message_types_stay_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6 regression: the unhandled-message branch must not fire on the two
+    union members the loop ignores on purpose.
+
+    `UserMessage` carries tool results and arrives on essentially every real
+    session; a `SystemMessage` with a non-`init` subtype is likewise a
+    deliberate skip. If these printed, every session would carry the same two
+    lines and a genuinely new union member would be invisible against that
+    baseline — costing exactly the diagnosis rounds this branch exists to save.
+    """
+    messages: list[Any] = [
+        _init(),
+        UserMessage(content="tool result"),
+        SystemMessage(subtype="compact_boundary", data={}),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert "[unhandled]" not in err, (
+        "deliberately-ignored union members must not trip the unhandled branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_system_message_subclass_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R6: the ignore-list matches the exact class name, so an SDK
+    SystemMessage SUBCLASS (TaskProgressMessage, HookEventMessage, ...) is
+    still surfaced — that is a real new member, not a known skip."""
+
+    class TaskProgressMessage(SystemMessage):
+        pass
+
+    messages: list[Any] = [
+        _init(),
+        TaskProgressMessage(subtype="task_progress", data={}),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    assert "TaskProgressMessage" in capsys.readouterr().err

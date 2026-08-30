@@ -174,8 +174,20 @@ class SessionGuardrails:
         Deliberately cheap: it moves a deadline and does not touch the
         watchdog task. `agent.py` calls it once per content-bearing stream
         event; keepalives are filtered there, not here.
+
+        Also clears any armed rate-limit flag, for the same reason
+        `on_assistant_message` does: content on the wire means a throttle-retry
+        succeeded. Stream events carry that proof strictly EARLIER than the
+        completed turn does, and rearming the idle timer now keeps a long
+        content block alive where the 300s cap used to end it — so without this
+        clear, a stream that dies mid-block would be reported `rate_limited`
+        with a `resets_at` already in the past.
+
+        The counter is incremented unconditionally; only the deadline needs a
+        running loop.
         """
         self._stream_activity_count += 1
+        self._clear_rate_limit()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
