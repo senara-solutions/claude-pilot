@@ -477,10 +477,46 @@ def test_tier3_dangerous_denial_stays_lethal() -> None:
     assert result.interrupt is True
 
 
+def test_devnull_redirect_denial_is_refused_but_not_lethal() -> None:
+    """cpp#130: a read-only command whose only tier3 trigger is a redirect to the
+    inert /dev/null sink is still REFUSED, but no longer ends the run.
+
+    Negative control in the same test: `echo hi > /etc/passwd` is a real write and
+    stays terminal — the two-character difference #130 names is now the difference
+    between a fatal write and an adaptable refusal, not between life and death for
+    an equally harmless command.
+    """
+    handler = _bundled_handler()
+
+    devnull = asyncio.run(
+        handler("Bash", {"command": "grep -c a b >/dev/null 2>&1"}, _mock_ctx())
+    )
+    assert isinstance(devnull, PermissionResultDeny), (
+        "a >/dev/null redirect is still refused — cpp#130 does not widen any allow"
+    )
+    assert devnull.interrupt is False, (
+        "a redirect to the inert /dev/null sink must not kill the session (cpp#130)"
+    )
+
+    real_write = asyncio.run(
+        handler("Bash", {"command": "echo hi > /etc/passwd"}, _mock_ctx())
+    )
+    assert isinstance(real_write, PermissionResultDeny)
+    assert real_write.interrupt is True, (
+        "a redirect to a real write target stays terminal in both worlds"
+    )
+
+
 def test_denial_is_terminal_predicate(tmp_path: Path) -> None:
     """Unit-level truth table for the helper (cpp#128 R1-R5)."""
     f = permissions_module._denial_is_terminal
     wt = str(tmp_path)
+    # cpp#130 — a redirect to the inert /dev/null sink is refused but NOT fatal;
+    # a real write target, or danger chained alongside it, stays fatal.
+    assert f("Bash", {"command": "grep -c a b >/dev/null"}, wt) is False
+    assert f("Bash", {"command": "grep -c a b >/dev/null 2>&1"}, wt) is False
+    assert f("Bash", {"command": "echo hi > /etc/passwd"}, wt) is True
+    assert f("Bash", {"command": "rm -rf /tmp/y >/dev/null"}, wt) is True
     # R1 — ordinary refused Bash: non-lethal.
     assert f("Bash", {"command": 'echo "label"; grep -c foo bar.rs'}, wt) is False
     assert f("Bash", {"command": _SESSION_09FEE003_COMMAND}, wt) is False
