@@ -19,6 +19,8 @@ from typing import Any
 import pytest
 from claude_agent_sdk.types import (
     AssistantMessage,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -1062,4 +1064,156 @@ async def test_genuine_silence_still_fires_idle_timeout_through_the_loop(
     payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
     assert payload["status"] == "terminated"
     assert payload["subtype"] == "idle_timeout"
+    assert exit_code == 1
+
+
+# ── Rate-limited stall classification end-to-end through run_agent (cpp#119) ──
+#
+# The guardrail UNIT is covered in tests/test_guardrails.py. These tests close
+# the integration seam the founding incident (2026-08-06, session c58c49b0-…)
+# actually travelled: a throttle signal arrives ON THE SDK MESSAGE STREAM, the
+# session goes silent while the bundled SDK backs off between retries, the idle
+# watchdog fires between them, and run_agent emits the terminal ResultJson. The
+# 429-on-a-stall must surface as `subtype=rate_limited` + `api_error_status=429`
+# — a quota refusal named as throttling, not misreported as `idle_timeout`.
+
+
+def _rejected_rate_limit_event() -> RateLimitEvent:
+    """A CLI RateLimitEvent whose subscription window has been rejected (429).
+    Mirrors what the Claude Code CLI puts on the stream when the limit is hit
+    and the SDK begins its silent backoff."""
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="rejected",
+            resets_at=None,
+            rate_limit_type="five_hour",
+            utilization=1.0,
+            overage_status=None,
+            overage_resets_at=None,
+            overage_disabled_reason=None,
+            raw={},
+        ),
+        uuid="rle_1",
+        session_id="sess_test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_event_reclassifies_the_stall_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#119 end-to-end: a RateLimitEvent(status="rejected") on the stream,
+    followed by silence past the idle budget, terminates the session as
+    `rate_limited` with api_error_status=429 — NOT `idle_timeout`. This is the
+    founding-incident path (2026-08-06), which the terminal-ResultMessage
+    source of cpp#54 never reaches because no ResultMessage ever arrives when
+    the guardrail fires between the SDK's silent retries."""
+    import json
+
+    # init and the throttle signal arrive immediately; the (never-reached)
+    # result would land far after the 60ms budget expires, so the watchdog
+    # fires during the simulated backoff while the flag is armed.
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _rejected_rate_limit_event()),
+        (2.0, _result()),
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_rl",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "terminated"
+    # The distinction the ticket is about: rate_limited, not idle_timeout.
+    assert payload["subtype"] == "rate_limited", payload
+    assert payload["api_error_status"] == 429, payload
+    assert payload["task_id"] == "task_rl"
+    assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_assistant_rate_limit_error_reclassifies_the_stall_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#119 end-to-end, second signal source: an AssistantMessage whose
+    turn was refused for throttling (error=="rate_limit") arms the guardrail
+    even when no RateLimitEvent preceded it, so a following idle stall is
+    classified `rate_limited` with api_error_status=429."""
+    import json
+
+    refused = AssistantMessage(
+        content=[],
+        model="claude-test",
+        message_id="msg_rl",
+        error="rate_limit",
+    )
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, refused),
+        (2.0, _result()),
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "terminated"
+    assert payload["subtype"] == "rate_limited", payload
+    assert payload["api_error_status"] == 429, payload
+    assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_genuine_idle_stall_carries_no_api_error_status_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#119 back-compat guard: with NO rate-limit signal on the stream, a
+    silent session still terminates as `idle_timeout` AND its ResultJson omits
+    `api_error_status` (exclude_none). Proves the reclassification above is
+    scoped to the throttled case and does not weaken the genuine-stall path for
+    consumers that only know the three original guardrail values."""
+    import json
+
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (2.0, _result()),  # far past the 40ms budget
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "terminated"
+    assert payload["subtype"] == "idle_timeout", payload
+    assert "api_error_status" not in payload, payload
     assert exit_code == 1
