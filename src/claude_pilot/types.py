@@ -23,6 +23,17 @@ class GuardrailConfig(BaseModel):
     emptyResponseThreshold: int | None = Field(default=None, ge=0)
     idleTimeoutMs: int | None = Field(default=None, ge=0, le=3_600_000)
     minTurnsBeforeDetection: int | None = Field(default=None, ge=0)
+    # cpp#133: how long the idle watchdog may keep a session alive while a
+    # rate-limit signal (cpp#119) is armed, before it finally terminates it as
+    # `rate_limited`. Under throttling the bundled SDK retries with its own
+    # backoff and produces nothing on the wire; the idle window would fire
+    # between retries and kill a session that is only waiting on quota. While
+    # the flag is armed the watchdog defers to that backoff up to this bound
+    # instead of aborting at `idleTimeoutMs`. 0 = no pilot ceiling (defer to the
+    # SDK indefinitely). Bounded above so a permanently-throttled loop cannot
+    # keep a zombie session alive forever (maxTurns does not bound a waiting
+    # pilot — it burns no turn while it waits).
+    rateLimitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
 
 
 class ResolvedGuardrailConfig(BaseModel):
@@ -36,6 +47,9 @@ class ResolvedGuardrailConfig(BaseModel):
     emptyResponseThreshold: int
     idleTimeoutMs: int
     minTurnsBeforeDetection: int
+    # cpp#133: bound on the throttled-backoff wait. Defaulted so existing
+    # all-fields constructors (and downstream callers) keep working unchanged.
+    rateLimitCeilingMs: int = 1_800_000
 
 
 GUARDRAIL_DEFAULTS = ResolvedGuardrailConfig(
@@ -45,6 +59,10 @@ GUARDRAIL_DEFAULTS = ResolvedGuardrailConfig(
     emptyResponseThreshold=5,
     idleTimeoutMs=300_000,
     minTurnsBeforeDetection=10,
+    # cpp#133: 30 min comfortably outlasts the SDK's own ~5 min backoff (the
+    # 2026-08-06 founding incident) and several retry cycles, while bounding a
+    # session that would otherwise wait forever under continuous throttling.
+    rateLimitCeilingMs=1_800_000,
 )
 
 

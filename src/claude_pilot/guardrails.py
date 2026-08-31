@@ -47,6 +47,7 @@ def resolve_guardrail_defaults(config: GuardrailConfig | None) -> ResolvedGuardr
         emptyResponseThreshold=config.emptyResponseThreshold if config.emptyResponseThreshold is not None else GUARDRAIL_DEFAULTS.emptyResponseThreshold,
         idleTimeoutMs=config.idleTimeoutMs if config.idleTimeoutMs is not None else GUARDRAIL_DEFAULTS.idleTimeoutMs,
         minTurnsBeforeDetection=config.minTurnsBeforeDetection if config.minTurnsBeforeDetection is not None else GUARDRAIL_DEFAULTS.minTurnsBeforeDetection,
+        rateLimitCeilingMs=config.rateLimitCeilingMs if config.rateLimitCeilingMs is not None else GUARDRAIL_DEFAULTS.rateLimitCeilingMs,
     )
 
 
@@ -98,12 +99,21 @@ class SessionGuardrails:
         # status=="rejected", or an AssistantMessage carrying error=="rate_limit")
         # and reported to `note_rate_limit`. Cleared when the model produces a
         # fresh turn (the retry succeeded → we are producing again) or when a
-        # recovered rate-limit signal arrives. Read by `_idle_watchdog` so a
-        # stall that fires WHILE we are throttled is classified `rate_limited`
-        # instead of being misattributed to `idle_timeout`.
+        # recovered rate-limit signal arrives. Read by `_idle_watchdog`: a stall
+        # that fires WHILE we are throttled does not kill the session (cpp#119
+        # named it `rate_limited`; cpp#133 makes it non-fatal) — the watchdog
+        # instead defers to the SDK's backoff up to `rateLimitCeilingMs`, and
+        # only terminates (as `rate_limited`) if the throttle outlasts it.
         self._rate_limited: bool = False
         self._rate_limit_detail: str | None = None
         self._rate_limit_api_status: int | None = None
+        # cpp#133: event-loop timestamp when the current throttle window began
+        # (first `note_rate_limit(rejected=True)` since the flag was last clear).
+        # The idle watchdog measures the backoff wait against it to enforce
+        # `rateLimitCeilingMs`. Kept at the EARLIEST arming — re-arming while
+        # already throttled does not push the ceiling out — and reset to None
+        # whenever the flag clears (progress resumed → a fresh window).
+        self._rate_limit_started_at: float | None = None
         # cpp#123: intra-turn liveness. `_last_activity_at` is the event-loop
         # timestamp of the most recent progress signal — a turn boundary, a
         # relay resume, or a content-bearing SDK StreamEvent. `_idle_watchdog`
@@ -242,6 +252,11 @@ class SessionGuardrails:
         that means a retry succeeded and we are producing output again.
         """
         if rejected:
+            if not self._rate_limited:
+                # cpp#133: stamp the start of the throttle window only on the
+                # transition into it, so a burst of `rejected` signals during
+                # one backoff does not keep pushing the ceiling out.
+                self._rate_limit_started_at = self._now()
             self._rate_limited = True
             self._rate_limit_detail = detail
             self._rate_limit_api_status = api_error_status
@@ -252,6 +267,14 @@ class SessionGuardrails:
         self._rate_limited = False
         self._rate_limit_detail = None
         self._rate_limit_api_status = None
+        self._rate_limit_started_at = None
+
+    def _now(self) -> float | None:
+        """Event-loop clock, or None outside a running loop (cpp#133)."""
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return None
 
     def on_assistant_message(
         self,
@@ -452,38 +475,73 @@ class SessionGuardrails:
         # pushes `_last_activity_at` forward while this task sleeps, so on wake
         # the remaining budget is recomputed and the task sleeps again. One
         # task per timer arming, regardless of how many deltas arrive.
+        #
+        # cpp#133: when the idle budget is exhausted WHILE a rate-limit signal
+        # (cpp#119) is armed, the session is silent because the bundled SDK is
+        # backing off between throttled retries — not because the model stopped
+        # producing. Killing it here loses in-flight work to a quota wait (the
+        # 2026-08-06 founding incident). So instead of aborting at the idle
+        # deadline, the watchdog DEFERS to the SDK's backoff: it keeps the
+        # session alive and re-checks each idle window. A resumed stream/turn
+        # clears the flag (and rearms the deadline), and the session continues.
+        # Only if the throttle wait exceeds `rateLimitCeilingMs` does it finally
+        # terminate — as `rate_limited`, never as a misattributed idle_timeout —
+        # so a permanently-throttled loop cannot leave a zombie alive forever.
         timeout = self._config.idleTimeoutMs / 1000.0
+        ceiling = self._config.rateLimitCeilingMs / 1000.0
         try:
             loop = asyncio.get_running_loop()
             while True:
                 remaining = self._last_activity_at + timeout - loop.time()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                if not self._rate_limited:
+                    break  # genuine idle silence → abort below
+                # cpp#133: throttled backoff. Defer to the SDK unless the wait
+                # has run past the ceiling, then terminate distinctly.
+                started = self._rate_limit_started_at
+                if started is None:
+                    # Armed outside a running loop (defensive); anchor now.
+                    started = loop.time()
+                    self._rate_limit_started_at = started
+                if ceiling > 0 and loop.time() - started >= ceiling:
+                    self._abort_rate_limit_ceiling(started, loop.time())
+                    return
+                # Re-check after one idle window: cheap, and bounds how long a
+                # resumed-then-stalled session waits before genuine idle detection
+                # resumes (the flag having cleared on the resumed activity).
+                await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
         secs = round(self._config.idleTimeoutMs / 1000)
-        # cpp#119: a stall that fires WHILE a rate-limit signal is active is not
-        # a genuine idle timeout — the session is silent because the SDK is
-        # backing off between throttled retries, not because the model stopped
-        # producing. Classify it distinctly so the operator/dispatch-lib can
-        # wait it out instead of treating it as a dead session.
-        if self._rate_limited:
-            detail = self._rate_limit_detail or (
-                f"Rate-limited: no progress for {secs}s while the API is throttling "
-                "(429); session was backing off between retries, not idle"
-            )
-            self._abort("rate_limited", detail)
-        else:
-            # cpp#123: name the observed stream-event count. A session that
-            # produced nothing and one that streamed for hours used to render
-            # the same line, which is what made mika#2029 take six rounds to
-            # diagnose.
-            self._abort(
-                "idle_timeout",
-                f"No meaningful progress for {secs}s "
-                f"({self._stream_activity_count} content stream events this session)",
-            )
+        # cpp#123: name the observed stream-event count. A session that produced
+        # nothing and one that streamed for hours used to render the same line,
+        # which is what made mika#2029 take six rounds to diagnose.
+        self._abort(
+            "idle_timeout",
+            f"No meaningful progress for {secs}s "
+            f"({self._stream_activity_count} content stream events this session)",
+        )
+
+    def _abort_rate_limit_ceiling(self, started: float, now: float) -> None:
+        """Terminate a session that has stayed throttled past the ceiling (cpp#133).
+
+        Distinct from a genuine `idle_timeout`: the abort reason is
+        `rate_limited` and carries the 429 `api_error_status`, so the operator
+        and dispatch-lib see "Anthropic throttled us for longer than we were
+        willing to wait", not "the model went silent".
+        """
+        waited = round(now - started)
+        ceiling_secs = round(self._config.rateLimitCeilingMs / 1000)
+        detail = (
+            f"Rate-limited beyond ceiling: throttled ~{waited}s "
+            f"(ceiling {ceiling_secs}s) with no progress; the SDK's backoff "
+            "outlasted the pilot's wait budget"
+        )
+        if self._rate_limit_detail:
+            detail = f"{self._rate_limit_detail}; {detail}"
+        self._abort("rate_limited", detail)
 
     def _abort(
         self,
