@@ -225,6 +225,42 @@ def is_tier3_dangerous(command: str) -> bool:
     return any(p.search(stripped) for p in TIER3_PATTERNS)
 
 
+# cpp#130: a plain STDOUT redirect whose target is the inert /dev/null sink
+# (`>/dev/null`, `>>/dev/null`, `1>/dev/null`, with or without a space before the
+# path) trips the bare-`>` TIER3_PATTERNS entry. `_FD_DEVNULL_RE` above only
+# strips an fd-NUMBERED redirect (`\d+>/dev/null`), so the bare `>` form still
+# classes tier3-dangerous. That is CORRECT for the REFUSAL — a `>` redirect is
+# not an allow-listed idiom, so is_tier3_dangerous keeps returning True and the
+# command stays denied — but WRONG for LETHALITY: `/dev/null` writes nowhere, so
+# ending the run over it is the two-character life-or-death gap cpp#130 names
+# (`grep … >/dev/null` dies while `… 2>&1 | tail` survives). This regex strips a
+# stdout/append redirect whose target is exactly /dev/null, mirroring
+# `_FD_DEVNULL_RE`'s trailing-boundary lookahead so `/dev/null/../etc/passwd`,
+# `/dev/nullified`, and `/dev/null.txt` do NOT strip and stay fatal.
+_STDOUT_DEVNULL_RE = re.compile(r"\d*>{1,2}\s*/dev/null(?![/\w.])")
+
+
+def is_tier3_dangerous_for_lethality(command: str) -> bool:
+    """`is_tier3_dangerous`, but a redirect to the inert /dev/null sink is not on
+    its own session-fatal (cpp#130).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision cpp#129 split from the refusal. The refusal path keeps calling the
+    unnarrowed ``is_tier3_dangerous``, so a `>/dev/null` redirect is still
+    REFUSED; this only makes that refusal non-terminal, so the model gets a
+    ``tool_result`` error it can adapt (reach for `2>&1 | tail` or a native tool)
+    instead of having the run killed.
+
+    A genuinely dangerous command remains fatal even when it also redirects to
+    /dev/null: the strip removes only the /dev/null sink, so `rm -rf x >/dev/null`
+    still matches the `rm -rf` pattern, and `> /etc/passwd` (a real write target)
+    is never stripped. Widening the exemption to in-worktree targets is left to
+    the destination veto (`permissions._destination_veto_reason`), which cpp#130
+    deliberately does not touch.
+    """
+    return is_tier3_dangerous(_STDOUT_DEVNULL_RE.sub(" ", command))
+
+
 # ── Model-facing prevention hint (mika#1409) ─────────────────────────────────
 #
 # Prevention-only half of mika#1409 (Approach #2). The headless pilot model has

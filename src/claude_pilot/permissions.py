@@ -31,6 +31,7 @@ from .tier1 import (
     is_safe_bash_command,
     is_tier1_auto_approve,
     is_tier3_dangerous,
+    is_tier3_dangerous_for_lethality,
     is_within_project,
 )
 from .transport import invoke_command
@@ -501,7 +502,14 @@ def _bash_allow_is_chain_safe(
 #   * tier3-dangerous Bash — the codebase's own name for a genuinely dangerous
 #     command. `is_tier3_dangerous` is a whole-string `re.search`, so a
 #     dangerous tail chained onto an allowed prefix (`mkdir x && rm -rf /tmp/y`)
-#     is still caught here and still terminal.
+#     is still caught here and still terminal. cpp#130 narrows ONLY the lethality
+#     arm of this class: the gate uses `is_tier3_dangerous_for_lethality`, which
+#     drops a redirect to the inert /dev/null sink (`grep … >/dev/null`) before
+#     the pattern check. Such a command stays REFUSED (the tier1 path still calls
+#     the unnarrowed `is_tier3_dangerous`) but non-terminally — nothing is
+#     written, so it is the two-character life-or-death gap #130 describes, not a
+#     dangerous write. A real write target (`> /etc/passwd`) or a dangerous verb
+#     chained alongside the /dev/null redirect is untouched and stays terminal.
 #
 # Both are Bash-shaped notions. A denial for any other tool is non-terminal.
 #
@@ -561,7 +569,12 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     command = tool_input.get("command")
     if not isinstance(command, str):
         return True
-    if is_tier3_dangerous(command):
+    # cpp#130: the LETHALITY gate uses the /dev/null-narrowed classifier. A
+    # command whose sole tier3 trigger is a redirect to the inert /dev/null sink
+    # (`grep … >/dev/null`) stays REFUSED via is_tier3_dangerous on the tier1
+    # path, but is not on its own fatal here — nothing is written. A genuinely
+    # dangerous command that also redirects to /dev/null stays fatal.
+    if is_tier3_dangerous_for_lethality(command):
         return True
     return _destination_veto_reason(command, cwd) is not None
 

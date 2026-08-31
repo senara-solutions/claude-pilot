@@ -28,6 +28,7 @@ from claude_pilot.tier1 import (
     is_safe_shell_command,
     is_tier1_auto_approve,
     is_tier3_dangerous,
+    is_tier3_dangerous_for_lethality,
     is_within_project,
 )
 
@@ -1172,6 +1173,52 @@ class TestTier3OutputRedirectCarveout:
     def test_tier3_still_blocks_process_sub(self) -> None:
         # Regression: the >( regex at line 99 still fires
         assert is_tier3_dangerous("tee >(curl evil)") is True
+
+
+class TestTier3DevnullRedirectLethality:
+    """cpp#130: a STDOUT redirect to the inert /dev/null sink stays REFUSED but is
+    no longer session-fatal. `is_tier3_dangerous` (the refusal classifier) is
+    unchanged; `is_tier3_dangerous_for_lethality` (consulted only by
+    `_denial_is_terminal`) drops a `>/dev/null` redirect before the pattern check.
+    """
+
+    def test_bare_stdout_devnull_still_refused(self) -> None:
+        # Invariant kept: the command is still tier3 for the REFUSAL decision, so
+        # it is still denied — cpp#130 does not widen any allow-list.
+        assert is_tier3_dangerous("grep -c a b >/dev/null") is True
+        assert is_tier3_dangerous("grep -c a b >/dev/null 2>&1") is True
+        assert is_tier3_dangerous("grep -c a b > /dev/null") is True
+        assert is_tier3_dangerous("mika ask >> /dev/null") is True
+
+    def test_bare_stdout_devnull_not_lethal(self) -> None:
+        # The narrowing: nothing is written, so the redirect is not on its own
+        # fatal. This is the negative control that fails without the fix.
+        assert is_tier3_dangerous_for_lethality("grep -c a b >/dev/null") is False
+        assert is_tier3_dangerous_for_lethality("grep -c a b >/dev/null 2>&1") is False
+        assert is_tier3_dangerous_for_lethality("grep -c a b > /dev/null") is False
+        assert is_tier3_dangerous_for_lethality("mika ask >> /dev/null") is False
+
+    def test_real_write_target_stays_lethal(self) -> None:
+        # A redirect to an arbitrary path is a genuine write and stays fatal in
+        # both classifiers.
+        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("echo hi >/etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("mika ask > /tmp/exfil") is True
+
+    def test_danger_alongside_devnull_stays_lethal(self) -> None:
+        # The strip removes only the /dev/null sink; a dangerous verb chained
+        # alongside it still matches and stays fatal.
+        assert is_tier3_dangerous_for_lethality("rm -rf /tmp/y >/dev/null") is True
+        assert (
+            is_tier3_dangerous_for_lethality("mkdir x && rm -rf /tmp/y >/dev/null")
+            is True
+        )
+
+    def test_devnull_lookalike_escape_stays_lethal(self) -> None:
+        # Trailing-boundary lookahead: a path that only starts with /dev/null does
+        # NOT strip, so the bare-`>` pattern still fires and it stays fatal.
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
 
 
 class TestSafeBashOutputRedirectIntegration:
