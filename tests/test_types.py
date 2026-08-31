@@ -26,6 +26,8 @@ def test_guardrail_defaults() -> None:
     assert GUARDRAIL_DEFAULTS.emptyResponseThreshold == 5
     assert GUARDRAIL_DEFAULTS.idleTimeoutMs == 300_000
     assert GUARDRAIL_DEFAULTS.minTurnsBeforeDetection == 10
+    # cpp#133: throttled-backoff ceiling (30 min).
+    assert GUARDRAIL_DEFAULTS.rateLimitCeilingMs == 1_800_000
 
 
 def test_pilot_config_minimal() -> None:
@@ -64,6 +66,14 @@ def test_pilot_config_rejects_empty_command() -> None:
 def test_guardrail_config_idle_timeout_bounds() -> None:
     with pytest.raises(ValidationError):
         GuardrailConfig.model_validate({"idleTimeoutMs": 4_000_000})  # above 1h cap
+
+
+def test_guardrail_config_rate_limit_ceiling_bounds() -> None:
+    # cpp#133: accepts a valid ceiling and rejects one above the 6h zombie cap.
+    cfg = GuardrailConfig.model_validate({"rateLimitCeilingMs": 900_000})
+    assert cfg.rateLimitCeilingMs == 900_000
+    with pytest.raises(ValidationError):
+        GuardrailConfig.model_validate({"rateLimitCeilingMs": 21_600_001})
 
 
 def test_pilot_event_round_trip() -> None:

@@ -896,7 +896,7 @@ def _install_delayed_client(
     monkeypatch.setattr(agent_module, "ClaudeSDKClient", _factory)
 
 
-def _idle_config(idle_ms: int) -> ResolvedGuardrailConfig:
+def _idle_config(idle_ms: int, ceiling_ms: int = 1_800_000) -> ResolvedGuardrailConfig:
     return ResolvedGuardrailConfig(
         maxTurns=200,
         maxBudgetUsd=0.0,
@@ -904,6 +904,11 @@ def _idle_config(idle_ms: int) -> ResolvedGuardrailConfig:
         emptyResponseThreshold=0,
         idleTimeoutMs=idle_ms,
         minTurnsBeforeDetection=0,
+        # cpp#133: the throttled-backoff ceiling. Rate-limit end-to-end tests
+        # pass a short value so the abort path (which carries api_error_status
+        # into ResultJson) still fires; non-throttle idle tests never arm the
+        # flag, so the ceiling is irrelevant to them.
+        rateLimitCeilingMs=ceiling_ms,
     )
 
 
@@ -1120,7 +1125,10 @@ async def test_rate_limit_event_reclassifies_the_stall_through_the_loop(
         (2.0, _result()),
     ]
     _install_delayed_client(monkeypatch, script)
-    guardrails = SessionGuardrails(_idle_config(idle_ms=60))
+    # cpp#133: short ceiling so the now-bounded throttle wait terminates as
+    # `rate_limited` before the simulated retry (`_result` at 2.0s) lands,
+    # keeping this an end-to-end assertion on the abort path's api_error_status.
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60, ceiling_ms=30))
 
     exit_code = await run_agent(
         prompt="test",
@@ -1164,7 +1172,8 @@ async def test_assistant_rate_limit_error_reclassifies_the_stall_through_the_loo
         (2.0, _result()),
     ]
     _install_delayed_client(monkeypatch, script)
-    guardrails = SessionGuardrails(_idle_config(idle_ms=60))
+    # cpp#133: short ceiling — same reason as the RateLimitEvent test above.
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60, ceiling_ms=30))
 
     exit_code = await run_agent(
         prompt="test",
@@ -1181,6 +1190,46 @@ async def test_assistant_rate_limit_error_reclassifies_the_stall_through_the_loo
     assert payload["subtype"] == "rate_limited", payload
     assert payload["api_error_status"] == 429, payload
     assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_throttled_session_survives_backoff_and_completes_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#133 end-to-end (the founding-incident win): a throttle signal arrives,
+    the session goes silent past the idle budget while the SDK backs off, and the
+    retry then succeeds. With the ceiling generous relative to the backoff, the
+    watchdog must NOT kill the session at the idle deadline — run_agent completes
+    `success`. Before #133 this exact path terminated as a stall and lost the
+    in-flight work."""
+    import json
+
+    # Throttle at 0.0; the retry's result lands at 0.3s — ~5x the 60ms idle
+    # budget, well inside the 10s ceiling. The old behaviour aborted at 60ms.
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _rejected_rate_limit_event()),
+        (0.3, _result()),
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=60, ceiling_ms=10_000))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+    assert guardrails.aborted is False
+    assert exit_code == 0
 
 
 @pytest.mark.asyncio

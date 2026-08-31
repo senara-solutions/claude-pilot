@@ -158,6 +158,9 @@ def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
         parts.append(f"emptyResponseThreshold={config.emptyResponseThreshold}")
     if config.idleTimeoutMs > 0:
         parts.append(f"idleTimeout={config.idleTimeoutMs / 1000}s")
+        # cpp#133: the ceiling only matters while idle detection is armed.
+        if config.rateLimitCeilingMs > 0:
+            parts.append(f"rateLimitCeiling={config.rateLimitCeilingMs / 1000}s")
     if config.maxBudgetUsd > 0:
         parts.append(f"maxBudget=${config.maxBudgetUsd}")
     _log(f"{DIM}[guardrails]{RESET} {' '.join(parts)}")

@@ -300,9 +300,14 @@ async def test_pr_created_substring_match(guardrails: SessionGuardrails) -> None
 # ── Rate-limited stall classification (cpp#119) ──────────────────────────────
 
 
-def _idle_config(idle_ms: int = 40) -> ResolvedGuardrailConfig:
+def _idle_config(idle_ms: int = 40, ceiling_ms: int = 1) -> ResolvedGuardrailConfig:
     """Config with a very short idle timeout so the watchdog fires promptly in
-    tests, and stall/empty detection effectively disabled."""
+    tests, and stall/empty detection effectively disabled.
+
+    cpp#133: `ceiling_ms` bounds the throttled-backoff wait. It defaults to 1ms
+    so a rate-limited stall still terminates promptly (as `rate_limited`) in the
+    cpp#119 classification tests; the cpp#133 tests that assert a session
+    *survives* the backoff window pass a generous ceiling explicitly."""
     return ResolvedGuardrailConfig(
         maxTurns=200,
         maxBudgetUsd=0.0,
@@ -310,6 +315,7 @@ def _idle_config(idle_ms: int = 40) -> ResolvedGuardrailConfig:
         emptyResponseThreshold=0,
         idleTimeoutMs=idle_ms,
         minTurnsBeforeDetection=0,
+        rateLimitCeilingMs=ceiling_ms,
     )
 
 
@@ -374,6 +380,84 @@ async def test_recovered_rate_limit_signal_clears_flag() -> None:
     assert guardrails.rate_limited is True
     guardrails.note_rate_limit(rejected=False)
     assert guardrails.rate_limited is False
+    guardrails.dispose()
+
+
+# ── Throttled backoff is non-fatal, bounded by a ceiling (cpp#133) ───────────
+#
+# cpp#119 gave a throttled stall its own NAME (`rate_limited`); the session
+# still died. cpp#133 changes the BEHAVIOUR: while the rate-limit flag is armed
+# the idle watchdog defers to the SDK's own backoff instead of killing the
+# session at the idle deadline, up to `rateLimitCeilingMs`. Genuine no-progress
+# stalls (no signal) must still die at `idleTimeoutMs`, and a throttle that
+# outlasts the ceiling must still terminate — as `rate_limited`, not idle.
+
+
+@pytest.mark.asyncio
+async def test_throttled_session_not_killed_during_backoff_window() -> None:
+    """cpp#133 (AE1): a session with an armed rate-limit signal must NOT be
+    aborted when the idle budget elapses — the SDK is backing off between
+    throttled retries, not idle. The session stays alive across several idle
+    windows and then continues once a retry produces content."""
+    # Idle budget 40ms, ceiling far larger than the test span.
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, ceiling_ms=10_000))
+    guardrails.note_rate_limit(
+        rejected=True, detail="Anthropic rate limit rejected (429)"
+    )
+
+    # Wait ~6x the idle budget: the old behaviour would have aborted at 1x. That
+    # this session is still alive proves the flag was armed and honoured — with
+    # no signal, a 40ms-idle session would already have tripped idle_timeout.
+    await asyncio.sleep(0.25)
+    assert guardrails.aborted is False, (
+        "a session under classified throttling must not be killed by idle_timeout "
+        "during the SDK's backoff window"
+    )
+
+    # A retry succeeds — content on the wire clears the throttle and rearms the
+    # idle timer. The session survives to continue.
+    guardrails.note_stream_activity()
+    assert guardrails.rate_limited is False
+    await asyncio.sleep(0.02)
+    assert guardrails.aborted is False, "session must continue after throttle clears"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_genuine_stall_without_signal_still_dies_at_idle_timeout() -> None:
+    """cpp#133 back-compat guard: with NO rate-limit signal, a real no-progress
+    stall must STILL trip `idle_timeout` promptly — the deferral applies only
+    while the throttle flag is armed, never to genuine silence."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, ceiling_ms=10_000))
+    # No note_rate_limit call — this is genuine silence, not a backoff.
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_throttle_beyond_ceiling_terminates_as_rate_limited() -> None:
+    """cpp#133 (AE3): the ceiling bounds the wait. A throttle that outlasts
+    `rateLimitCeilingMs` with no progress terminates the session — but with the
+    distinct `rate_limited` reason and the 429 status, never a misattributed
+    `idle_timeout`, so dispatch-lib can tell a quota wall from a dead model."""
+    # Idle 40ms, ceiling 20ms: the throttle wait crosses the ceiling on the
+    # first idle deadline.
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, ceiling_ms=20))
+    guardrails.note_rate_limit(
+        rejected=True, detail="Anthropic rate limit rejected (429)"
+    )
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "rate_limited"
+    assert reason.api_error_status == 429
+    assert "ceiling" in reason.detail.lower(), (
+        "the ceiling abort must be self-describing, distinct from a plain stall"
+    )
     guardrails.dispose()
 
 
