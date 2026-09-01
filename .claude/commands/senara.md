@@ -1,5 +1,5 @@
 ---
-name: claude-pilot
+name: senara
 description: claude-pilot (Python) development workflow with quality gates
 argument-hint: "[feature description]"
 disable-model-invocation: true
