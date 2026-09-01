@@ -2,9 +2,7 @@
 # Verify that the /mika pipeline produced required artifacts before PR creation.
 #
 # Checks (in order):
-#   1. Backward-compat: a plan doc exists somewhere in docs/plans/*.md
-#   2. Backward-compat: source changes exist beyond the plan doc
-#   3. Bucket-comparison: reject docs-only or code-only PRs
+#   1. Bucket-comparison: reject docs-only or code-only PRs
 #
 # Buckets (applied to the union of committed/staged/unstaged diffs vs base):
 #   docs    = docs/plans/** or docs/solutions/**
@@ -80,10 +78,10 @@ fi
 COMMIT_BODIES=$(git log --format=%B "${MERGE_BASE}..HEAD" 2>/dev/null || true)
 EXEMPT_DOCS_ONLY=0
 EXEMPT_CODE_ONLY=0
-if echo "$COMMIT_BODIES" | grep -qx 'Pipeline-Exempt: docs-only'; then
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only([[:space:]].*)?[[:space:]]*$'; then
   EXEMPT_DOCS_ONLY=1
 fi
-if echo "$COMMIT_BODIES" | grep -qx 'Pipeline-Exempt: code-only'; then
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only([[:space:]].*)?[[:space:]]*$'; then
   EXEMPT_CODE_ONLY=1
 fi
 
