@@ -19,3 +19,9 @@ lefthook-local.yml
 
 .env*
 !.env.example
+
+# Compound Engineering: machine-local config override (team defaults in
+# .compound-engineering/config.yaml are tracked; *.local.yaml is not) and the
+# skills' local scratch space.
+.compound-engineering/*.local.yaml
+.context/compound-engineering/
