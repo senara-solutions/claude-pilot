@@ -167,6 +167,18 @@ class ResultJson(BaseModel):
           premature-EndTurn family — model emits `[done] Success` after
           Edit/Compound phases without reaching git push + gh pr create.
           Work may be stranded in the worktree.
+        - "blocked_on_operator_input" (cpp#144) — an `AskUserQuestion` call
+          was refused by policy (headless pilot, no operator present) and the
+          session then ended "successfully" without a `gh pr create` Bash
+          call. The model bypassed the refusal by rendering the same question
+          as plain text and ending its turn, which the SDK reports as a clean
+          `success` ResultMessage even though nothing was delivered.
+          `termination_reason` carries the denied question. NOT gated behind
+          CLAUDE_PILOT_REQUIRE_PR — unlike "pipeline_incomplete", this
+          condition is structural, not a dev-pilot-only opt-in contract. Ungated
+          negative control (cpp#144 AC2): a session that takes the same denial,
+          adapts, and goes on to a `gh pr create` still reports "success" —
+          the marker only weighs at exit, never mid-session.
         - Guardrail aborts, from `GuardrailAbortReason.guardrail` below:
           "stall_detected", "empty_response", "idle_timeout" (cpp#54-era),
           "rate_limited" (cpp#119), and "awaiting_tool" / "awaiting_model"

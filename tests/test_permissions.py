@@ -17,8 +17,10 @@ from claude_agent_sdk import PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot import permissions as permissions_module
+from claude_pilot.guardrails import SessionGuardrails
 from claude_pilot.permissions import create_permission_handler, try_tier_1_5_auto_answer
 from claude_pilot.types import (
+    GUARDRAIL_DEFAULTS,
     PilotConfig,
     PilotEvent,
     PilotResponseAllow,
@@ -275,6 +277,82 @@ def test_handler_returns_interrupt_true_on_escalate_decision(tmp_path: Path) -> 
     )
     # Notify fired exactly once on this path.
     assert len(fired) == 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#144: absent-operator AskUserQuestion marks the session on policy:deny
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_denied_ask_user_question_marks_the_session(tmp_path: Path) -> None:
+    """The headless-pilot shape from cpp#144: a fail-closed default deny (no
+    policy rule matches AskUserQuestion, so it falls to the policy default)
+    refuses the call — non-terminally, since AskUserQuestion is not Bash — and
+    records it on the guardrail so agent.py can reclassify a later "success"
+    that never delivered."""
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=guardrails,
+        policy_path=tmp_path / "nonexistent.yaml",  # missing -> fail-closed deny
+    )
+    result = asyncio.run(
+        handler(
+            "AskUserQuestion",
+            {"questions": [{"question": "Which branch should I use?"}]},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False, (
+        "AskUserQuestion is not Bash — cpp#128's non-lethal-denial contract "
+        "must leave the run alive so it can bypass or adapt"
+    )
+    assert guardrails.operator_question_denied is True
+    assert guardrails.operator_question_summary is not None
+    assert "Which branch should I use?" in guardrails.operator_question_summary
+
+
+def test_denied_bash_command_does_not_mark_operator_question(tmp_path: Path) -> None:
+    """Name-guard coverage (mirrors mika#940's pr_created tool-name guard): a
+    denied Bash command must NOT flip operator_question_denied, even though
+    it goes through the same deny branch."""
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=guardrails,
+        policy_path=tmp_path / "nonexistent.yaml",
+    )
+    result = asyncio.run(handler("Bash", {"command": "curl https://example.com"}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert guardrails.operator_question_denied is False
+    assert guardrails.operator_question_summary is None
+
+
+def test_denied_ask_user_question_without_guardrails_does_not_crash(
+    tmp_path: Path,
+) -> None:
+    """`guardrails=None` (e.g. a caller that doesn't wire session tracking)
+    must not raise — the cpp#144 marker call is guarded the same way as the
+    existing `pause_idle_timer` / `resume_idle_timer` calls in this module."""
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=None,
+        policy_path=tmp_path / "nonexistent.yaml",
+    )
+    result = asyncio.run(
+        handler("AskUserQuestion", {"questions": [{"question": "ok?"}]}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
 
 
 # ────────────────────────────────────────────────────────────────────────────

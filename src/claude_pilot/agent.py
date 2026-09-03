@@ -362,6 +362,57 @@ async def _run_agent_inner(
                     termination_reason: str | None = (
                         f"SDK limit reached: {subtype}" if is_sdk_termination else None
                     )
+
+                    # cpp#144: absent-operator question contract. A headless
+                    # pilot has nobody to answer `AskUserQuestion`, so the
+                    # policy layer (permissions.py) correctly refuses it — and
+                    # correctly does NOT abort the run over an ordinary,
+                    # non-Bash refusal (cpp#128). The gap this closes is what
+                    # happens next: the model can bypass the refusal by
+                    # rendering the same question as plain text and ending its
+                    # turn there. The SDK sees a clean `ResultMessage`
+                    # (subtype "success") — it has no notion that the text WAS
+                    # the blocked question. Four of thirty sampled dispatches
+                    # did exactly this and rendered `[done] Success` with
+                    # nothing delivered (cpp#144 body).
+                    #
+                    # `guardrails.operator_question_denied` is the structural
+                    # signal: it is set only when the SDK itself denied an
+                    # AskUserQuestion call (permissions.py, cpp#128's
+                    # `[policy:deny]` path) — never a guess about the text of
+                    # the model's final turn. Reusing `pr_created` (mika#940)
+                    # as the "delivered" check is what makes this additive
+                    # rather than punitive: AC2's negative control — a session
+                    # that takes the same denial, adapts, and goes on to open
+                    # a PR — keeps `status=success` unchanged, because a
+                    # refusal only weighs at exit, exactly like mika#940's
+                    # existing `pipeline_incomplete` contract below.
+                    #
+                    # KNOWN LIMITATION (flagged, not fixed, by this change):
+                    # two of the four sampled sessions never call
+                    # `AskUserQuestion` at all — they emit the question as
+                    # text from the start. That shape has no structural signal
+                    # on the wire today; catching it would mean pattern-
+                    # matching the model's final utterance, which is a
+                    # heuristic this change deliberately does not ship
+                    # unmeasured (see the accompanying plan doc, "Hors
+                    # périmètre"). This branch fires only for the tool-call
+                    # half of the ticket's evidence.
+                    if (
+                        status == "success"
+                        and guardrails.operator_question_denied
+                        and not guardrails.pr_created
+                    ):
+                        subtype = "blocked_on_operator_input"
+                        status = "error"
+                        question = guardrails.operator_question_summary or "(unrecorded)"
+                        termination_reason = (
+                            "Session ended after an AskUserQuestion call was denied "
+                            "by policy (headless pilot, no operator present) and no "
+                            "'gh pr create' Bash call followed. Denied question: "
+                            f"{question}"
+                        )
+
                     require_pr = os.environ.get("CLAUDE_PILOT_REQUIRE_PR", "").lower() in (
                         "1",
                         "true",
