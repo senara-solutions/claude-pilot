@@ -353,6 +353,43 @@ que le contrôle négatif contrôlait déjà quelque chose avant qu'on y touche.
 plan qui prétendrait faire échouer 5.1 sur `main` se tromperait sur ce qu'il
 répare.
 
+### Ancrages vérifiés (contrôle de confiance, 2026-09-03)
+
+Relevé sur la branche à `2b57f5f`. Les citations du plan se vérifient toutes —
+`types.py:60` (`idleTimeoutMs=300_000`), `guardrails.py:171` / `:203`
+(`note_stream_activity` / `note_activity`), `agent.py:222` / `:247` (leur
+câblage), `guardrails.py:304` (`has_tool_use`), la boucle `while` de
+`_idle_watchdog` et `_abort_rate_limit_ceiling`. Trois précisions que la lecture
+du code ajoute, et qu'un implémenteur paierait cher à redécouvrir :
+
+**A. Le site d'armement d'`AWAITING_TOOL` existe déjà.** Phase 2.1 dit « depuis
+`agent.py` » pour écarter `permissions.py` — la raison est juste, la coordonnée
+est à affiner. `agent.py` ne parcourt pas les blocs : il passe l'`AssistantMessage`
+à `SessionGuardrails.on_assistant_message`, qui calcule `has_tool_use` à
+`guardrails.py:304`. **Armer là**, sur le booléen déjà calculé, plutôt que
+d'ajouter un second parcours de blocs dans `agent.py`. L'exclusion de
+`permissions.py` (`:1112`/`:1177`, aller-retour du relais seulement) reste
+intégralement valable — c'est elle qui porte l'intention.
+
+**B. Deux `Literal` à étendre, sinon `mypy` casse la porte qualité.** Les motifs
+d'arrêt sont typés en deux endroits, et `awaiting_tool` / `awaiting_model`
+doivent apparaître dans les deux :
+- `types.py:178-180` — `GuardrailAbortReason.guardrail`
+- `guardrails.py:547-549` — le paramètre `guardrail` d'`_abort`
+
+L'ajout est **additif**, exactement comme `rate_limited` l'a été en cpp#119 : le
+commentaire de `types.py:172-177` documente déjà que les consommateurs qui ne
+connaissent que les valeurs d'origine continuent de parser la forme JSON. C'est
+la garantie sur laquelle s'appuie la dernière ligne de la table des risques.
+
+**C. `_reset_idle_timer` annule et recrée la tâche.** `on_assistant_message`
+l'appelle à `guardrails.py:381` — ce n'est pas un `_bump_idle_deadline`, la
+tâche watchdog est détruite puis reconstruite. La transition d'état doit donc
+être posée de manière à ce que la **tâche neuve** la lise : l'état vit sur
+l'instance, pas dans la closure de la tâche. Poser l'état avant que la tâche ne
+reparte, et ne jamais supposer qu'une tâche en vol observera un changement
+décidé après son armement.
+
 ## Commandes de vérification
 
 ```bash
