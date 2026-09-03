@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from claude_pilot.types import (
     GUARDRAIL_DEFAULTS,
+    GuardrailAbortReason,
     GuardrailConfig,
     PilotConfig,
     PilotEvent,
@@ -28,6 +29,11 @@ def test_guardrail_defaults() -> None:
     assert GUARDRAIL_DEFAULTS.minTurnsBeforeDetection == 10
     # cpp#133: throttled-backoff ceiling (30 min).
     assert GUARDRAIL_DEFAULTS.rateLimitCeilingMs == 1_800_000
+    # cpp#145: the two wait ceilings. Pinned because they are the ONLY thing
+    # standing between a waiting session and immortality — a silent default
+    # change would remove the bound without any test noticing.
+    assert GUARDRAIL_DEFAULTS.toolWaitCeilingMs == 1_800_000
+    assert GUARDRAIL_DEFAULTS.modelWaitCeilingMs == 900_000
 
 
 def test_pilot_config_minimal() -> None:
@@ -74,6 +80,35 @@ def test_guardrail_config_rate_limit_ceiling_bounds() -> None:
     assert cfg.rateLimitCeilingMs == 900_000
     with pytest.raises(ValidationError):
         GuardrailConfig.model_validate({"rateLimitCeilingMs": 21_600_001})
+
+
+def test_guardrail_config_wait_ceiling_bounds() -> None:
+    # cpp#145: same shape and same 6h zombie cap as the cpp#133 ceiling above.
+    cfg = GuardrailConfig.model_validate(
+        {"toolWaitCeilingMs": 900_000, "modelWaitCeilingMs": 600_000}
+    )
+    assert cfg.toolWaitCeilingMs == 900_000
+    assert cfg.modelWaitCeilingMs == 600_000
+    with pytest.raises(ValidationError):
+        GuardrailConfig.model_validate({"toolWaitCeilingMs": 21_600_001})
+    with pytest.raises(ValidationError):
+        GuardrailConfig.model_validate({"modelWaitCeilingMs": 21_600_001})
+
+
+def test_guardrail_abort_reason_accepts_the_wait_vocabulary() -> None:
+    """cpp#145: `awaiting_tool` / `awaiting_model` are part of the wire
+    vocabulary that reaches `ResultJson.subtype`. Pinned so the two Literal
+    unions (here and in `SessionGuardrails._abort`) cannot drift apart."""
+    for reason in ("awaiting_tool", "awaiting_model"):
+        parsed = GuardrailAbortReason.model_validate(
+            {"guardrail": reason, "turns": 3, "detail": "d"}
+        )
+        assert parsed.guardrail == reason
+        assert parsed.api_error_status is None
+    with pytest.raises(ValidationError):
+        GuardrailAbortReason.model_validate(
+            {"guardrail": "awaiting_something_else", "turns": 3, "detail": "d"}
+        )
 
 
 def test_pilot_event_round_trip() -> None:

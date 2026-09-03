@@ -150,6 +150,17 @@ def log_env(env_path: str, loaded: bool, count: int) -> None:
         _log(f"{DIM}[env]{RESET} path={env_path} [NOT FOUND]")
 
 
+def _ceiling_label(ms: int) -> str:
+    """cpp#145: render a wait ceiling, naming the unbounded case out loud.
+
+    `0` is a documented mode inherited from `rateLimitCeilingMs` — defer
+    indefinitely. It is also the only setting under which a waiting session
+    can never be terminated, so it is spelled out rather than rendered as a
+    plausible-looking `0.0s`.
+    """
+    return "off(unbounded)" if ms <= 0 else f"{ms / 1000}s"
+
+
 def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
     parts: list[str] = [f"maxTurns={config.maxTurns}"]
     if config.stallThreshold > 0:
@@ -161,6 +172,15 @@ def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
         # cpp#133: the ceiling only matters while idle detection is armed.
         if config.rateLimitCeilingMs > 0:
             parts.append(f"rateLimitCeiling={config.rateLimitCeilingMs / 1000}s")
+        # cpp#145: the two wait ceilings only bound states the idle watchdog
+        # reaches, hence the same enclosing condition. But unlike the line
+        # above they are ALWAYS printed, including at 0 — because 0 means
+        # "wait indefinitely", and that is the one configuration in which the
+        # watchdog cannot terminate a waiting session at all. A guardrail that
+        # cannot kill must not be the quietest line in the header; omitting it
+        # would hide exactly the state an operator most needs to see.
+        parts.append(f"toolWaitCeiling={_ceiling_label(config.toolWaitCeilingMs)}")
+        parts.append(f"modelWaitCeiling={_ceiling_label(config.modelWaitCeilingMs)}")
     if config.maxBudgetUsd > 0:
         parts.append(f"maxBudget=${config.maxBudgetUsd}")
     _log(f"{DIM}[guardrails]{RESET} {' '.join(parts)}")

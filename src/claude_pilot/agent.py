@@ -222,7 +222,15 @@ async def _run_agent_inner(
                 if isinstance(message, StreamEvent):
                     is_progress = _stream_event_is_progress(message)
                     if is_progress:
-                        guardrails.note_stream_activity()
+                        # cpp#145: pass the raw SSE name. The guardrail needs to
+                        # tell production from the turn-closing trailers
+                        # (`message_delta`/`message_stop`) — both are progress
+                        # for rearming the deadline, but only production proves
+                        # the model resumed. In three of the six sessions the
+                        # ticket is about, those trailers arrive AFTER the tool
+                        # result, and counting them as production is what kept
+                        # killing them.
+                        guardrails.note_stream_activity(_stream_event_type(message))
                     # cpp#125: a StreamEvent no longer falls through the loop
                     # silently. Progress rearms the idle timer above; here we
                     # also leave a debug trace so the highest-volume message on
@@ -244,7 +252,11 @@ async def _run_agent_inner(
                     # counter, since a tool result is not model production) and
                     # leave a debug trace, so it no longer falls through
                     # silently the way StreamEvent once did.
-                    guardrails.note_activity()
+                    # cpp#145: report HOW MANY tool results this message carried
+                    # so a batch of parallel tools is retired together. Counting
+                    # one when several returned would leave phantom tools
+                    # outstanding and hold the session to the tool ceiling.
+                    guardrails.note_activity(_tool_result_count(message))
                     if verbose:
                         log_verbose("user message (tool result) received")
                     continue
@@ -476,6 +488,32 @@ def _stream_event_is_progress(message: StreamEvent) -> bool:
     if not isinstance(event, dict):
         return False
     return event.get("type") in _PROGRESS_STREAM_EVENT_TYPES
+
+
+def _tool_result_count(message: UserMessage) -> int:
+    """cpp#145: how many tool_result blocks a `UserMessage` carries.
+
+    Guarded the same way as `_stream_event_is_progress`: an unexpected shape
+    degrades to 1 rather than raising inside the message loop. 1 is the
+    conservative floor — under-counting leaves a tool outstanding and holds the
+    session to the (generous) tool ceiling, while over-counting would retire a
+    tool that never returned and hand the wait back to the 300s idle budget.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return 1
+    count = sum(1 for block in content if _tool_result_block(block))
+    return count if count > 0 else 1
+
+
+def _tool_result_block(block: Any) -> bool:
+    """True for a ToolResultBlock, dict-shaped or dataclass (cpp#145)."""
+    block_type = getattr(block, "type", None)
+    if isinstance(block, dict):
+        block_type = block.get("type")
+    if isinstance(block_type, str):
+        return block_type == "tool_result"
+    return type(block).__name__ == "ToolResultBlock"
 
 
 def _stream_event_type(message: StreamEvent) -> str:

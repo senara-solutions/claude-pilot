@@ -896,7 +896,12 @@ def _install_delayed_client(
     monkeypatch.setattr(agent_module, "ClaudeSDKClient", _factory)
 
 
-def _idle_config(idle_ms: int, ceiling_ms: int = 1_800_000) -> ResolvedGuardrailConfig:
+def _idle_config(
+    idle_ms: int,
+    ceiling_ms: int = 1_800_000,
+    tool_ceiling_ms: int = 1_800_000,
+    model_ceiling_ms: int = 900_000,
+) -> ResolvedGuardrailConfig:
     return ResolvedGuardrailConfig(
         maxTurns=200,
         maxBudgetUsd=0.0,
@@ -909,6 +914,11 @@ def _idle_config(idle_ms: int, ceiling_ms: int = 1_800_000) -> ResolvedGuardrail
         # into ResultJson) still fires; non-throttle idle tests never arm the
         # flag, so the ceiling is irrelevant to them.
         rateLimitCeilingMs=ceiling_ms,
+        # cpp#145: the two wait ceilings, defaulted to production values so
+        # every pre-existing test in this file keeps the behaviour it asserted.
+        # The cpp#145 end-to-end tests pass short values explicitly.
+        toolWaitCeilingMs=tool_ceiling_ms,
+        modelWaitCeilingMs=model_ceiling_ms,
     )
 
 
@@ -975,8 +985,14 @@ async def test_user_message_branch_rearms_idle_and_logs_debug(
     rather than sitting silently in the ignore set."""
     calls: list[str] = []
     guardrails = SessionGuardrails(_config())
+    # cpp#145: `note_activity` now takes the tool-result count, so the stub
+    # accepts it and records it — the assertion below pins BOTH that the branch
+    # fires and that it reports a count, which is what retires outstanding
+    # tools.
     monkeypatch.setattr(
-        guardrails, "note_activity", lambda: calls.append("note_activity")
+        guardrails,
+        "note_activity",
+        lambda n=1: calls.append(f"note_activity({n})"),
     )
 
     messages: list[Any] = [
@@ -996,7 +1012,9 @@ async def test_user_message_branch_rearms_idle_and_logs_debug(
     )
 
     err = capsys.readouterr().err
-    assert calls == ["note_activity"], "UserMessage must rearm the idle deadline"
+    assert calls == ["note_activity(1)"], (
+        "UserMessage must rearm the idle deadline AND report its tool-result count"
+    )
     assert "user message (tool result) received" in err
     assert "[unhandled]" not in err
 
@@ -1266,3 +1284,123 @@ async def test_genuine_idle_stall_carries_no_api_error_status_through_the_loop(
     assert payload["subtype"] == "idle_timeout", payload
     assert "api_error_status" not in payload, payload
     assert exit_code == 1
+
+
+# ── Waiting is not idling, end to end through run_agent (cpp#145) ────────────
+#
+# The guardrail UNIT is covered in tests/test_guardrails.py. These close the
+# seam that unit tests structurally cannot: the guardrail only sees what
+# agent.py chooses to tell it, and the whole fix turns on agent.py passing the
+# raw SSE event name and the tool-result count. A unit test that hand-orders
+# those calls cannot falsify the wiring.
+
+
+@pytest.mark.asyncio
+async def test_model_wait_reaches_result_json_as_awaiting_model(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#145 end-to-end: a session that delivers a tool result and then never
+    resumes terminates as `awaiting_model` in the emitted ResultJson — not as
+    `idle_timeout`. This is the value dispatch-lib renders to the operator, so
+    it is the one that has to be right."""
+    import json
+
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _assistant([ToolUseBlock(id="t1", name="Edit", input={})], "msg_1")),
+        (0.0, UserMessage(content="tool result")),
+        (2.0, _result()),  # never actually reached
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=60))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(next(ln for ln in out.splitlines() if ln.startswith("{")))
+    assert payload["status"] == "terminated"
+    assert payload["subtype"] == "awaiting_model", payload
+    assert "api_error_status" not in payload, payload
+    assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_trailers_after_a_tool_result_do_not_kill_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#145 knob-breaking test at the agent seam, replaying the tail of
+    `3d5fe1ec`: tool_use -> tool result -> message_delta -> message_stop, then
+    silence past the idle budget.
+
+    Those trailers are `progress=True` in agent.py's classifier, so before this
+    fix they told the guardrail the model had resumed at the exact moment it
+    had not. The session must survive — and it can only do so if agent.py
+    actually passes the SSE event NAME through, which no unit test can check.
+    """
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _assistant([ToolUseBlock(id="t1", name="Edit", input={})], "msg_1")),
+        (0.0, UserMessage(content="tool result")),
+        (0.0, _stream("message_delta")),
+        (0.0, _stream("message_stop")),
+        (0.3, _result()),  # ~7x the 40ms idle budget later
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=10_000))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    assert guardrails.aborted is False, (
+        "turn-closing trailers after a tool result are not proof the model resumed"
+    )
+    assert "idle_timeout" not in out
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_a_long_running_tool_is_not_killed_through_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#145 end-to-end for AC3: a tool that runs well past the idle budget
+    before returning must not be killed. Proves agent.py's tool-result count
+    reaches the guardrail and retires the outstanding tool."""
+    script: list[tuple[float, Any]] = [
+        (0.0, _init()),
+        (0.0, _assistant([ToolUseBlock(id="t1", name="Bash", input={})], "msg_1")),
+        (0.3, UserMessage(content="tool result")),  # ~7x the idle budget
+        (0.0, _result()),
+    ]
+    _install_delayed_client(monkeypatch, script)
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=10_000))
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    out = capsys.readouterr().out
+    assert guardrails.aborted is False, "a slow tool is a wait, not an idle"
+    assert "idle_timeout" not in out
+    assert exit_code == 0

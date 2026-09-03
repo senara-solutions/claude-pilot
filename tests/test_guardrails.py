@@ -15,7 +15,7 @@ import asyncio
 import pytest
 from claude_agent_sdk.types import TextBlock, ThinkingBlock, ToolUseBlock
 
-from claude_pilot.guardrails import SessionGuardrails, TurnBoundaryEvent
+from claude_pilot.guardrails import SessionGuardrails, TurnBoundaryEvent, _WaitState
 from claude_pilot.types import ResolvedGuardrailConfig
 
 
@@ -300,14 +300,25 @@ async def test_pr_created_substring_match(guardrails: SessionGuardrails) -> None
 # ── Rate-limited stall classification (cpp#119) ──────────────────────────────
 
 
-def _idle_config(idle_ms: int = 40, ceiling_ms: int = 1) -> ResolvedGuardrailConfig:
+def _idle_config(
+    idle_ms: int = 40,
+    ceiling_ms: int = 1,
+    tool_ceiling_ms: int = 10_000,
+    model_ceiling_ms: int = 10_000,
+) -> ResolvedGuardrailConfig:
     """Config with a very short idle timeout so the watchdog fires promptly in
     tests, and stall/empty detection effectively disabled.
 
     cpp#133: `ceiling_ms` bounds the throttled-backoff wait. It defaults to 1ms
     so a rate-limited stall still terminates promptly (as `rate_limited`) in the
     cpp#119 classification tests; the cpp#133 tests that assert a session
-    *survives* the backoff window pass a generous ceiling explicitly."""
+    *survives* the backoff window pass a generous ceiling explicitly.
+
+    cpp#145: `tool_ceiling_ms` / `model_ceiling_ms` bound the two waiting
+    states. They default GENEROUSLY (10s against millisecond idle budgets) so a
+    test that means to exercise a wait is never cut short by its own ceiling;
+    the tests that assert a wait finally DIES pass a tight ceiling explicitly.
+    """
     return ResolvedGuardrailConfig(
         maxTurns=200,
         maxBudgetUsd=0.0,
@@ -316,6 +327,8 @@ def _idle_config(idle_ms: int = 40, ceiling_ms: int = 1) -> ResolvedGuardrailCon
         idleTimeoutMs=idle_ms,
         minTurnsBeforeDetection=0,
         rateLimitCeilingMs=ceiling_ms,
+        toolWaitCeilingMs=tool_ceiling_ms,
+        modelWaitCeilingMs=model_ceiling_ms,
     )
 
 
@@ -622,15 +635,25 @@ async def test_note_activity_rearms_idle_without_counting_as_stream() -> None:
 
 @pytest.mark.asyncio
 async def test_note_activity_does_not_disarm_the_watchdog() -> None:
-    """cpp#125 anti-vacuity: `note_activity` extends the deadline, it does not
-    disarm the watchdog. After a single tool result, genuine silence still
-    fires `idle_timeout`."""
-    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    """cpp#125 anti-vacuity, updated by cpp#145: `note_activity` extends the
+    deadline, it does not disarm the watchdog — a session that never resumes
+    after a tool result is STILL killed.
+
+    What cpp#145 changes is the reason and the budget, not the fact. A tool
+    result opens the model-wait window, so the abort is `awaiting_model` at
+    `modelWaitCeilingMs` instead of `idle_timeout` at `idleTimeoutMs`. Asserted
+    with a tight model ceiling so the death is observable in test time; the
+    negative control of AC7 (a session that never resumes must remain killable)
+    lives in `test_model_wait_that_never_resumes_dies_at_the_ceiling` below.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=20))
     guardrails.note_activity()
 
     reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
 
-    assert reason.guardrail == "idle_timeout"
+    assert reason.guardrail == "awaiting_model", (
+        "a tool result opens the model-wait window; the abort must name it"
+    )
     guardrails.dispose()
 
 
@@ -649,4 +672,619 @@ async def test_note_activity_does_not_clear_rate_limit_flag() -> None:
 
     reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
     assert reason.guardrail == "rate_limited"
+    guardrails.dispose()
+
+
+# ── Waiting is not idling (cpp#145) ──────────────────────────────────────────
+#
+# The watchdog owned ONE counter — "nothing seen for N seconds" — and three
+# very different things fed it: the model is mute, a tool is running, the model
+# has not yet produced the first token of the next turn. The third killed six
+# productive sessions on the night of 2026-08-31 to 09-01.
+#
+# The fix does not relax anything. `idleTimeoutMs` is unchanged at 300s for
+# genuine silence. The two waiting states are told apart, given their own named
+# budgets, and given their own abort reasons — each of which must still be able
+# to kill, or the guardrail was removed rather than repaired.
+#
+# TWO MEASURED FACTS shape these tests, and both falsified an earlier design:
+#
+#   1. In three of the six killed sessions (`3d5fe1ec`, `f26add11`, `e2f0ef97`)
+#      the turn-closing trailers `message_delta` / `message_stop` arrive AFTER
+#      the tool result. They are members of agent.py's progress set, so a rule
+#      of "any progress event means the model resumed" closes the model-wait
+#      window at the instant it should open — and those three still die.
+#   2. Across 177 real dispatch-to-result pairs in /var/log/claude-pilot, 67
+#      genuine production events arrive while a tool is still outstanding. A
+#      tool wait held as a scalar state is therefore cleared mid-flight by
+#      ordinary generation, and its ceiling becomes dead configuration.
+#
+# Hence: trailers never claim the model resumed, and outstanding tools are
+# COUNTED rather than stated.
+
+
+def _assert_deadline_advanced(
+    guardrails: SessionGuardrails, before: float, signal: str
+) -> None:
+    """Assert the idle deadline actually moved (cpp#125 lock, restored).
+
+    Mutation testing found that asserting only "the session is still alive"
+    stopped proving the rearm once the wait states existed: deleting
+    `_bump_idle_deadline()` from `note_activity` left the session alive anyway,
+    on the model-wait ceiling, and the whole suite stayed green. The rearm is a
+    separate contract from the wait, so it gets a separate, direct assertion.
+    The file already asserts on internals for the same reason (see the
+    watchdog-task identity check in the cpp#123 block).
+    """
+    assert guardrails._last_activity_at > before, (
+        f"{signal} must move the idle deadline, not merely leave the session alive"
+    )
+
+
+# --- AC1: the cpp#123/#125 rearm signals still work, one test per signal -----
+#
+# No new production line satisfies AC1: `note_stream_activity` (cpp#123) and
+# `note_activity` (cpp#125) already rearm the deadline. What IS new is that
+# both now also drive a state machine, so these two tests are the regression
+# lock on the rearm surviving that — asserted directly, because the wait states
+# would otherwise mask its removal.
+
+
+@pytest.mark.asyncio
+async def test_ac1_stream_event_still_rearms_the_deadline_under_the_state_machine() -> None:
+    """AC1, signal 1 of 2 (content stream). Deltas across ~1.7x the idle budget
+    keep the session alive, and the deadline demonstrably moves each time."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+
+    for _ in range(100):
+        before = guardrails._last_activity_at
+        await asyncio.sleep(0.005)
+        guardrails.note_stream_activity("content_block_delta")
+        _assert_deadline_advanced(guardrails, before, "a content stream event")
+
+    assert guardrails.aborted is False
+    assert guardrails.stream_activity_count == 100
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac1_tool_result_still_rearms_the_deadline_under_the_state_machine() -> None:
+    """AC1, signal 2 of 2 (turn advance / tool result). Repeated tool results
+    across ~1.7x the idle budget move the deadline every time, without
+    inflating the content-stream counter — a tool result is liveness, not model
+    production."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+
+    for _ in range(100):
+        before = guardrails._last_activity_at
+        await asyncio.sleep(0.005)
+        guardrails.note_activity()
+        _assert_deadline_advanced(guardrails, before, "a tool result")
+
+    assert guardrails.aborted is False
+    assert guardrails.stream_activity_count == 0
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac1_turn_boundary_still_rearms_the_deadline() -> None:
+    """AC1 names 'turn advancement' as a progress signal. A bare turn boundary
+    with no tool call rearms via `_reset_idle_timer` — covered nowhere else."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+    guardrails.on_assistant_message([_text("first")], message_id="msg_1")
+    await asyncio.sleep(0.01)
+
+    before = guardrails._last_activity_at
+    guardrails.on_assistant_message([_text("second")], message_id="msg_2")
+
+    _assert_deadline_advanced(guardrails, before, "a turn boundary")
+    guardrails.dispose()
+
+
+# --- AC2: the mandatory negative control ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ac2_a_truly_idle_session_is_still_killed_at_the_threshold() -> None:
+    """AC2 (negative control, no exception offered). A session with NO stream,
+    NO turn, NO tool — nobody outstanding — must still die at `idleTimeoutMs`,
+    as `idle_timeout`.
+
+    HOW TO SEE THIS TEST GO RED, as AC2 requires: neutralise the threshold.
+    Set `idleTimeoutMs=0` in the config below (`_reset_idle_timer` returns
+    early and never arms the watchdog) or make `_idle_watchdog` treat
+    `_WaitState.IDLE` like the waiting states instead of breaking out of the
+    loop. Either change makes `wait_aborted()` hang and this test fail on the
+    2s timeout. Both manipulations were run during review and both are red.
+    A guardrail that can no longer kill has been removed, not repaired, and no
+    allowlist is offered here.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()
+
+
+# --- AC3: time inside a tool is not idle time -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ac3_a_running_tool_does_not_feed_the_idle_counter() -> None:
+    """AC3: a turn that dispatches a tool is waiting for that tool. Silence for
+    2x the idle budget while it runs must NOT kill the session — a six-minute
+    `cargo build` is not an idle session."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=10_000))
+    guardrails.on_assistant_message([_tool(name="Bash")], message_id="msg_1")
+
+    await asyncio.sleep(0.08)  # 2x the idle budget, with no event of any kind
+
+    assert guardrails.aborted is False, (
+        "a session waiting on a running tool must not trip idle_timeout"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_production_during_the_tool_window_does_not_retire_the_tool() -> None:
+    """AC3, the case a scalar wait state gets wrong — and the one the logs
+    forced. Across 177 real dispatch-to-result pairs, 67 production events
+    arrive while a tool is still outstanding, so generation and tool execution
+    demonstrably overlap on the wire.
+
+    If a delta could clear the tool wait, the tool's remaining runtime would
+    fall back to the 300s idle budget and `toolWaitCeilingMs` would be dead
+    configuration. Only the tool's own result ends its wait.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=10_000))
+    guardrails.on_assistant_message([_tool(name="Bash")], message_id="msg_1")
+    # Ordinary generation continues while the tool runs.
+    for _ in range(5):
+        guardrails.note_stream_activity("content_block_delta")
+
+    await asyncio.sleep(0.08)
+
+    assert guardrails.aborted is False
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL, (
+        "a stream event must never retire a tool that has not returned"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_negative_a_tool_that_never_returns_dies_at_the_ceiling() -> None:
+    """AC3 negative control: the tool wait is a budget, never an exemption. A
+    tool that never returns its result must still terminate the session — as
+    `awaiting_tool`, so the reader knows what was waited on, and never as a
+    misattributed `idle_timeout`."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=20))
+    guardrails.on_assistant_message([_tool(name="Bash")], message_id="msg_1")
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_tool"
+    assert "ceiling" in reason.detail.lower()
+    assert "Bash" in reason.detail, "the message must name the tool it waited on"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_a_parallel_tool_batch_is_retired_together() -> None:
+    """One turn, three tools, one `UserMessage` carrying three results. The
+    batch must retire as a batch: counting one would leave two phantom tools
+    outstanding and hold a finished session to the 30-minute tool ceiling."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=10_000))
+    guardrails.on_assistant_message(
+        [_tool(name="Bash"), _tool(name="Read"), _tool(name="Edit")],
+        message_id="msg_1",
+    )
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL
+
+    guardrails.note_activity(tool_results=3)
+
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL, (
+        "all three results arrived; nothing is outstanding but the next turn"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_a_partial_batch_keeps_the_remaining_tools_outstanding() -> None:
+    """The other half of the batch control. If results trickle back one message
+    at a time, a fast tool must not declare a slow sibling finished — that
+    would charge the slow one to the model ceiling and mislabel its abort."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=10_000))
+    guardrails.on_assistant_message(
+        [_tool(name="Bash"), _tool(name="Read")], message_id="msg_1"
+    )
+
+    guardrails.note_activity(tool_results=1)
+
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL
+    guardrails.note_activity(tool_results=1)
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL
+    guardrails.dispose()
+
+
+# --- AC7: the lethal window — tool result → first token of the next turn -----
+
+
+@pytest.mark.asyncio
+async def test_ac7_the_aae80d84_trace_no_longer_kills_the_session() -> None:
+    """AC7, replaying the trace of `aae80d84` verbatim from the ticket:
+
+        [debug] stream event: message_stop (progress=True)
+        [tool:request] Edit: .../send_message.rs
+        [tool] Edit: ... -> AUTO
+        [debug] user message (tool result) received
+        [guardrail] idle_timeout: No meaningful progress for 300s (3844 ...)
+
+    The `Edit` is instantaneous. What took 300s was the FIRST TOKEN OF THE NEXT
+    TURN.
+
+    `tool_ceiling_ms` is deliberately TIGHT here. Mutation testing caught the
+    earlier version of this test passing with the model-wait window removed
+    entirely — the preceding `tool_use` left the session on a generous tool
+    ceiling, so survival proved nothing about AC7. With the tool ceiling at
+    20ms, survival past the idle budget can only come from AWAITING_MODEL.
+    """
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=20, model_ceiling_ms=10_000)
+    )
+    guardrails.note_stream_activity("message_stop")
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()  # user message (tool result) received
+
+    await asyncio.sleep(0.08)  # 2x the idle budget of pure silence
+
+    assert guardrails.aborted is False, (
+        "the window between a tool result and the next turn's first token is a "
+        "wait on the model, not idleness — this is the exact 2026-08-31 mechanism"
+    )
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL
+
+    # And the wait closes on the proof that the model resumed.
+    guardrails.note_stream_activity("content_block_delta")
+    assert guardrails._wait_state is _WaitState.IDLE
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac7_trailers_arriving_after_the_tool_result_do_not_close_the_wait() -> None:
+    """The half of AC7 the first implementation got wrong, and the reason three
+    of the six sessions would still have died.
+
+    In `3d5fe1ec`, `f26add11` and `e2f0ef97` the SDK delivers the old turn's
+    `message_delta` / `message_stop` AFTER the tool result. Both are progress
+    events for the purpose of rearming the deadline (cpp#123, unchanged), but
+    neither is evidence that the NEXT turn started. `message_stop` means the
+    turn ended; reading it as "the model is producing" states the opposite of
+    what it says.
+    """
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=20, model_ceiling_ms=10_000)
+    )
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()  # tool result
+    # The exact tail of 3d5fe1ec, in order.
+    guardrails.note_stream_activity("message_delta")
+    guardrails.note_stream_activity("message_stop")
+
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL, (
+        "turn-closing trailers must not claim the next turn began"
+    )
+
+    await asyncio.sleep(0.08)
+
+    assert guardrails.aborted is False
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_model_wait_that_never_resumes_dies_at_the_ceiling() -> None:
+    """AC7 negative control: a session whose last event is a tool result and
+    which NEVER resumes must remain killable. It dies at `modelWaitCeilingMs`,
+    with the reason `awaiting_model` — so dispatch-lib and the operator read
+    "the model never came back", not "the session went quiet"."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=20))
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_model"
+    assert "ceiling" in reason.detail.lower()
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_returning_to_idle_restores_the_tighter_idle_budget() -> None:
+    """A session that leaves a wait must go back onto the 300s budget, not stay
+    on the generous ceiling. Without this, a session stuck in AWAITING_MODEL
+    would look identical to a healthy one for fifteen minutes."""
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=10_000, model_ceiling_ms=10_000)
+    )
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL
+
+    guardrails.note_stream_activity("content_block_start")  # the next turn begins
+    assert guardrails._wait_state is _WaitState.IDLE
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout", (
+        "back in IDLE, silence is silence again and the 300s budget applies"
+    )
+    guardrails.dispose()
+
+
+# --- AC4: replay of the five named sessions, fixtures frozen in this file ----
+#
+# Sequences are reconstructed from `/var/log/claude-pilot/*.stderr` and FROZEN
+# HERE — never re-read at run time, because the logs rotate. Each entry is
+# (session, tool calls, content stream events, trailing trailers after the last
+# tool result), the first three taken from the counts in the ticket body and
+# the fourth from the sessions' actual tails.
+
+_KILLED_SESSIONS: list[tuple[str, int, int, tuple[str, ...]]] = [
+    # message_delta + message_stop arrive AFTER the tool result.
+    ("3d5fe1ec", 33, 1722, ("message_delta", "message_stop")),
+    ("f26add11", 24, 1422, ("message_stop",)),
+    ("e2f0ef97", 16, 651, ("message_delta", "message_stop")),
+    # These three end ON the tool result, as the ticket body describes.
+    ("c56a973e", 15, 1031, ()),
+    # c5201301 is the boundary case AC4 asks to settle explicitly. Its 72
+    # stream events and 2 tool calls make it look inert next to the others —
+    # but inertness is not what killed it. It died in the same model-wait
+    # window. A barely-productive session that is waiting on the model is still
+    # waiting on the model. It is SAVED, for the same reason they are.
+    ("c5201301", 2, 72, ()),
+]
+
+
+@pytest.mark.parametrize(
+    ("session", "tool_calls", "stream_events", "trailers"), _KILLED_SESSIONS
+)
+@pytest.mark.asyncio
+async def test_ac4_the_five_killed_sessions_survive_the_revised_heuristic(
+    session: str, tool_calls: int, stream_events: int, trailers: tuple[str, ...]
+) -> None:
+    """AC4: replay each killed session's real shape — N tool cycles carrying M
+    content stream events, ending on a tool result and that session's actual
+    trailers — then hold silence for 2x the idle budget. None may be killed.
+
+    Two deliberate anti-vacuity measures, both added after mutation testing
+    showed the first version passing with the fix removed:
+      * the tool ceiling is TIGHT, so survival cannot come from a lingering
+        tool wait;
+      * real idle windows elapse DURING the replay, so the watchdog actually
+        wakes into the wait branch instead of the whole history collapsing into
+        one event-loop tick.
+    """
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=20, tool_ceiling_ms=40, model_ceiling_ms=10_000)
+    )
+
+    per_cycle = max(1, stream_events // tool_calls)
+    emitted = 0
+    # Cycles are capped so the test stays under a second; the REAL counts are
+    # still emitted in full below, they simply do not each get their own sleep.
+    sleeping_cycles = min(tool_calls, 8)
+    for i in range(tool_calls):
+        for _ in range(per_cycle):
+            if emitted < stream_events:
+                guardrails.note_stream_activity("content_block_delta")
+                emitted += 1
+        guardrails.on_assistant_message([_tool(name="Bash")], message_id=f"msg_{i}")
+        guardrails.note_activity()
+        if i < sleeping_cycles:
+            # Let a full idle window expire so the watchdog wakes, finds a wait
+            # state, and defers — the behaviour under test.
+            await asyncio.sleep(0.03)
+    for _ in range(stream_events - emitted):
+        guardrails.note_stream_activity("content_block_delta")
+    # The session's real final state: a delivered tool result, then whatever
+    # trailers the SDK still had queued for the turn that is ending.
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_final")
+    guardrails.note_activity()
+    for trailer in trailers:
+        guardrails.note_stream_activity(trailer)
+
+    await asyncio.sleep(0.06)
+
+    assert guardrails.aborted is False, (
+        f"session {session} made {tool_calls} tool calls and produced "
+        f"{stream_events} stream events — it was working, not idling"
+    )
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL
+    assert guardrails.stream_activity_count == stream_events + len(trailers)
+    guardrails.dispose()
+
+
+# --- AC5: the message says what it measured AND what it did not see ---------
+
+
+@pytest.mark.asyncio
+async def test_ac5_the_idle_message_still_names_the_session_stream_count() -> None:
+    """AC5: the cumulative counter stays — it is useful. What changes is that
+    it stops being the only thing quoted next to the word "no"."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert "0 content stream events this session" in reason.detail
+    assert "No meaningful progress" in reason.detail, (
+        "with nothing ever observed, 'no meaningful progress' is the honest line"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_the_message_names_reason_elapsed_last_signal_and_window() -> None:
+    """AC5, the four positive elements plus the negative one.
+
+    The budget is a full second, not milliseconds, so the elapsed figure is a
+    non-degenerate "1s": at millisecond budgets every elapsed value rendered
+    "0s" and the assertion passed on a literal that would survive any bug.
+    The last-signal assertion quotes the whole phrase for the same reason — a
+    bare "stream event" is also a substring of "content stream events this
+    session", so it could never fail.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=1_000))
+    guardrails.on_assistant_message([_text("producing")], message_id="msg_1")
+    for _ in range(7):
+        guardrails.note_stream_activity("content_block_delta")
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=5.0)
+
+    # 1. the reason
+    assert reason.guardrail == "idle_timeout"
+    # 2. the time since the last signal
+    assert "Silent for 1s" in reason.detail
+    # 3. the NATURE of that last signal
+    assert "since the last stream event" in reason.detail
+    # 4. the window count alongside the session cumulative
+    assert "7 content stream events in this window" in reason.detail
+    assert "7 content stream events this session" in reason.detail
+    # 5. the negative assertion: a session that produced must not be told it
+    #    made "no meaningful progress" — that is the self-contradicting line
+    #    that announced "no progress" while quoting 1722 progress events.
+    assert "No meaningful progress" not in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_a_wait_abort_names_what_it_waited_for() -> None:
+    """AC5 for the two new reasons: a ceiling abort must say who was waited on
+    and that they never came, not merely that time passed."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=20))
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_model"
+    assert "first token" in reason.detail
+    # The whole phrase, not the bare words: "tool result" alone also appears in
+    # the template's own fallback literal, so the loose form could not fail.
+    assert "last signal was a tool result" in reason.detail
+    assert "content stream events this session" in reason.detail
+    assert "No meaningful progress" not in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_a_tool_ceiling_abort_names_how_many_are_outstanding() -> None:
+    """An operator reading `awaiting_tool` needs to know whether one tool hung
+    or a batch did — the difference between a slow build and a lost batch."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=20))
+    guardrails.on_assistant_message(
+        [_tool(name="Bash"), _tool(name="Read")], message_id="msg_1"
+    )
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_tool"
+    assert "2 tool call(s) still outstanding" in reason.detail
+    assert "Bash" in reason.detail, "anchored on the first tool of the turn"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_an_unnamed_tool_falls_back_without_breaking_the_message() -> None:
+    """A tool_use block the walker cannot name must degrade to "a tool", never
+    to a crash inside the guardrail that exists to bound the session."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, tool_ceiling_ms=20))
+    guardrails.on_assistant_message([{"type": "tool_use"}], message_id="msg_1")
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_tool"
+    assert "a tool" in reason.detail
+    guardrails.dispose()
+
+
+# --- Precedence and anchoring ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_still_outranks_the_model_wait() -> None:
+    """cpp#133 must keep its diagnosis. When a session is BOTH throttled and
+    waiting on the model, the reason it produces nothing is the quota wall —
+    `rate_limited` (with its 429) is the more useful classification, and the
+    cpp#133 branch is therefore checked first in the watchdog."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, ceiling_ms=20))
+    guardrails.note_rate_limit(rejected=True, detail="Anthropic rate limit rejected (429)")
+    guardrails.note_activity()  # also opens the model-wait window
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "rate_limited"
+    assert reason.api_error_status == 429
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_second_tool_in_the_same_wait_does_not_push_the_ceiling_out() -> None:
+    """The window is anchored on the first outstanding tool and stays there —
+    the same discipline cpp#133 applied to `_rate_limit_started_at`. Otherwise
+    a turn dispatching tools in a loop would keep its own ceiling permanently
+    out of reach and recreate the zombie.
+
+    Margins follow this file's convention (see the cpp#123 block): the elapsed
+    span before the second dispatch is a small fraction of the ceiling, so a
+    loaded runner cannot make the test pass for the wrong reason, while the
+    ceiling is still crossed well within the timeout.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=20, tool_ceiling_ms=600))
+    guardrails.on_assistant_message([_tool(name="Bash")], message_id="msg_1")
+    await asyncio.sleep(0.01)
+    # Same turn, another tool_use block: must NOT re-anchor the wait.
+    guardrails.on_assistant_message([_tool(name="Read")], message_id="msg_1")
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=3.0)
+
+    assert reason.guardrail == "awaiting_tool"
+    assert "Bash" in reason.detail, (
+        "the wait is still the one opened by the first tool_use of the turn"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_relay_window_is_not_charged_to_an_open_wait() -> None:
+    """The relay round-trip is time the guardrail explicitly does not measure —
+    that is what `pause_idle_timer` is for. Charging it against a wait ceiling
+    would contradict the contract the pause exists to honour."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=20, tool_ceiling_ms=200))
+    guardrails.on_assistant_message([_tool(name="Bash")], message_id="msg_1")
+
+    guardrails.pause_idle_timer()
+    await asyncio.sleep(0.15)  # a slow relay, most of the tool ceiling
+    guardrails.resume_idle_timer()
+
+    await asyncio.sleep(0.1)
+    assert guardrails.aborted is False, (
+        "the paused relay window must not have consumed the tool's budget"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_ceiling_is_documented_as_unbounded_and_behaves_that_way() -> None:
+    """`0` means "no ceiling", inherited from `rateLimitCeilingMs`. It is the
+    ONE configuration in which the watchdog cannot terminate a waiting session,
+    so it is pinned by a test and named explicitly in the session header rather
+    than left to be discovered in production."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=20, model_ceiling_ms=0))
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()
+
+    await asyncio.sleep(0.15)  # many idle windows
+
+    assert guardrails.aborted is False, "0 means wait indefinitely, by contract"
     guardrails.dispose()
