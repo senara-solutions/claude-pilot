@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal
 
 from .types import (
@@ -18,6 +19,31 @@ from .types import (
     GuardrailConfig,
     ResolvedGuardrailConfig,
 )
+
+
+class _WaitState(Enum):
+    """What the session is waiting for during a silence (cpp#145).
+
+    The watchdog does not measure inactivity: it measures the ABSENCE OF A
+    SIGNAL IT EXPECTS. Three different causes produce that silence, and only
+    one of them justifies aborting at `idleTimeoutMs`:
+
+    | state           | who is being waited on | abort at idleTimeoutMs? |
+    |-----------------|------------------------|-------------------------|
+    | IDLE            | nobody                 | yes — the original case |
+    | AWAITING_TOOL   | a running tool         | no — its own ceiling    |
+    | AWAITING_MODEL  | the next turn's first token | no — its own ceiling |
+
+    Collapsing the three killed six productive sessions on the night of
+    2026-08-31 to 09-01. All six share the same last line before the guardrail
+    fired — `user message (tool result) received` — i.e. the tool had already
+    returned and the session was waiting on the model. `3d5fe1ec` had made
+    thirty-three tool calls; it was not stuck, it was killed.
+    """
+
+    IDLE = "idle"
+    AWAITING_TOOL = "awaiting_tool"
+    AWAITING_MODEL = "awaiting_model"
 
 
 @dataclass(frozen=True)
@@ -48,6 +74,8 @@ def resolve_guardrail_defaults(config: GuardrailConfig | None) -> ResolvedGuardr
         idleTimeoutMs=config.idleTimeoutMs if config.idleTimeoutMs is not None else GUARDRAIL_DEFAULTS.idleTimeoutMs,
         minTurnsBeforeDetection=config.minTurnsBeforeDetection if config.minTurnsBeforeDetection is not None else GUARDRAIL_DEFAULTS.minTurnsBeforeDetection,
         rateLimitCeilingMs=config.rateLimitCeilingMs if config.rateLimitCeilingMs is not None else GUARDRAIL_DEFAULTS.rateLimitCeilingMs,
+        toolWaitCeilingMs=config.toolWaitCeilingMs if config.toolWaitCeilingMs is not None else GUARDRAIL_DEFAULTS.toolWaitCeilingMs,
+        modelWaitCeilingMs=config.modelWaitCeilingMs if config.modelWaitCeilingMs is not None else GUARDRAIL_DEFAULTS.modelWaitCeilingMs,
     )
 
 
@@ -124,6 +152,22 @@ class SessionGuardrails:
         # producing one straight from the log.
         self._last_activity_at: float = 0.0
         self._stream_activity_count: int = 0
+        # cpp#145: what the session is waiting for during the current silence,
+        # and since when. The state lives on the INSTANCE, never in the
+        # watchdog task's closure: `_reset_idle_timer` cancels and recreates
+        # that task on every turn boundary, so a fresh task must be able to
+        # read a transition decided before it was created.
+        self._wait_state: _WaitState = _WaitState.IDLE
+        self._wait_started_at: float | None = None
+        self._wait_detail: str | None = None
+        # cpp#145: what the last observed signal WAS, and how many content
+        # stream events arrived since the current wait window opened. Both are
+        # reported in the abort detail (AC5): a message that says "no
+        # meaningful progress" while citing 1722 progress events contradicts
+        # itself inside its own sentence, and that message is what made
+        # mika#2029 take six rounds to read.
+        self._last_signal: str | None = None
+        self._window_stream_count: int = 0
         self._reset_idle_timer()
 
     @property
@@ -198,6 +242,14 @@ class SessionGuardrails:
         """
         self._stream_activity_count += 1
         self._clear_rate_limit()
+        # cpp#145: content on the wire is the proof that closes BOTH waiting
+        # states. A model producing tokens is not waiting on its own first
+        # token (`AWAITING_MODEL`), and the SDK does not resume generation
+        # while a tool result is still outstanding, so a delta also retires
+        # `AWAITING_TOOL`. Nobody is being waited on → back to plain IDLE, and
+        # the 300s budget applies again from here.
+        self._enter_wait(_WaitState.IDLE, signal="stream event")
+        self._window_stream_count += 1
         self._bump_idle_deadline()
 
     def note_activity(self) -> None:
@@ -211,8 +263,40 @@ class SessionGuardrails:
         rate-limit flag: a tool result is no evidence that a throttled
         generation retry has succeeded. Deliberately cheap — it only moves a
         deadline and never touches the watchdog task.
+
+        cpp#145: it also OPENS the model-wait window. This exact line is the
+        last one in all six sessions killed on the night of 2026-08-31 — the
+        tool result was delivered, the deadline was pushed, and then 300s of
+        nothing while the session waited for the first token of the next turn.
+        That silence is a wait, not an idle, and from here it is measured
+        against `modelWaitCeilingMs` instead.
         """
+        self._enter_wait(_WaitState.AWAITING_MODEL, signal="tool result")
         self._bump_idle_deadline()
+
+    def _enter_wait(
+        self, state: _WaitState, *, signal: str, detail: str | None = None
+    ) -> None:
+        """Record what the session is now waiting for, and on what evidence
+        (cpp#145).
+
+        Re-entering the SAME state does not restart its window: a turn that
+        emits several tool_use blocks is one wait, and re-anchoring on each
+        would push the ceiling out indefinitely — the mistake cpp#133 already
+        avoided for the throttle window (`_rate_limit_started_at` is stamped
+        only on the transition INTO the state).
+
+        `_window_stream_count` resets on every genuine transition so the abort
+        detail can report what arrived in THIS window, distinctly from the
+        session cumulative count.
+        """
+        self._last_signal = signal
+        if state is self._wait_state:
+            return
+        self._wait_state = state
+        self._window_stream_count = 0
+        self._wait_detail = detail
+        self._wait_started_at = None if state is _WaitState.IDLE else self._now()
 
     def _bump_idle_deadline(self) -> None:
         """Push the idle deadline to now, at O(1) cost (cpp#123/#125).
@@ -313,6 +397,23 @@ class SessionGuardrails:
         # tool_use) leaves the flag intact.
         if has_tool_use or text_len > 0:
             self._clear_rate_limit()
+
+        # cpp#145: a turn that ends on a tool_use is waiting for that tool to
+        # return; a turn that ends without one is waiting for nobody. Armed
+        # HERE rather than in permissions.py on purpose: the relay callback
+        # (`pause_idle_timer` / `resume_idle_timer`, permissions.py:1112/:1177)
+        # brackets only the relay round-trip, so it sees neither auto-approved
+        # tools nor the tool's own execution time — the very window AC3 is
+        # about. `has_tool_use` is already computed just above, so this costs
+        # one branch and no second walk of the content blocks.
+        if has_tool_use:
+            self._enter_wait(
+                _WaitState.AWAITING_TOOL,
+                signal="turn boundary",
+                detail=_first_tool_use_name(blocks),
+            )
+        else:
+            self._enter_wait(_WaitState.IDLE, signal="turn boundary")
 
         # mika#940: PR-creation detection. Scan tool_use blocks for Bash
         # invocations whose command substring includes `gh pr create`. Set
@@ -487,6 +588,15 @@ class SessionGuardrails:
         # Only if the throttle wait exceeds `rateLimitCeilingMs` does it finally
         # terminate — as `rate_limited`, never as a misattributed idle_timeout —
         # so a permanently-throttled loop cannot leave a zombie alive forever.
+        #
+        # cpp#145: the same shape extends to the two WAITING states. When the
+        # idle budget is exhausted while the session is waiting on a tool that
+        # has not returned, or on the first token of the next turn, that
+        # silence is not idleness — it is a wait, and it gets its own, more
+        # generous ceiling and its own abort reason. The rate-limit branch is
+        # checked FIRST and keeps its behaviour unchanged: a throttled session
+        # is better described as `rate_limited` than as waiting on the model,
+        # since the reason it produces nothing is the quota wall, not the turn.
         timeout = self._config.idleTimeoutMs / 1000.0
         ceiling = self._config.rateLimitCeilingMs / 1000.0
         try:
@@ -496,21 +606,42 @@ class SessionGuardrails:
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                     continue
-                if not self._rate_limited:
+                if self._rate_limited:
+                    # cpp#133: throttled backoff. Defer to the SDK unless the
+                    # wait has run past the ceiling, then terminate distinctly.
+                    started = self._rate_limit_started_at
+                    if started is None:
+                        # Armed outside a running loop (defensive); anchor now.
+                        started = loop.time()
+                        self._rate_limit_started_at = started
+                    if ceiling > 0 and loop.time() - started >= ceiling:
+                        self._abort_rate_limit_ceiling(started, loop.time())
+                        return
+                    # Re-check after one idle window: cheap, and bounds how long
+                    # a resumed-then-stalled session waits before genuine idle
+                    # detection resumes (the flag having cleared on the resumed
+                    # activity).
+                    await asyncio.sleep(timeout)
+                    continue
+                state = self._wait_state
+                if state is _WaitState.IDLE:
                     break  # genuine idle silence → abort below
-                # cpp#133: throttled backoff. Defer to the SDK unless the wait
-                # has run past the ceiling, then terminate distinctly.
-                started = self._rate_limit_started_at
-                if started is None:
-                    # Armed outside a running loop (defensive); anchor now.
-                    started = loop.time()
-                    self._rate_limit_started_at = started
-                if ceiling > 0 and loop.time() - started >= ceiling:
-                    self._abort_rate_limit_ceiling(started, loop.time())
+                # cpp#145: someone is being waited on. Same deferral shape as
+                # the throttle branch — keep the session alive, re-check each
+                # idle window, and terminate only at this state's own ceiling,
+                # with its own reason. Without the ceiling the wait would be an
+                # exemption, and a model that never resumes would leave a
+                # session immortal; that is the zombie cpp#133 established we
+                # must not create.
+                wait_ceiling = self._wait_ceiling_secs(state)
+                wait_started = self._wait_started_at
+                if wait_started is None:
+                    # Entered outside a running loop (defensive); anchor now.
+                    wait_started = loop.time()
+                    self._wait_started_at = wait_started
+                if wait_ceiling > 0 and loop.time() - wait_started >= wait_ceiling:
+                    self._abort_wait_ceiling(state, wait_started, loop.time())
                     return
-                # Re-check after one idle window: cheap, and bounds how long a
-                # resumed-then-stalled session waits before genuine idle detection
-                # resumes (the flag having cleared on the resumed activity).
                 await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
@@ -518,11 +649,69 @@ class SessionGuardrails:
         # cpp#123: name the observed stream-event count. A session that produced
         # nothing and one that streamed for hours used to render the same line,
         # which is what made mika#2029 take six rounds to diagnose.
-        self._abort(
-            "idle_timeout",
-            f"No meaningful progress for {secs}s "
-            f"({self._stream_activity_count} content stream events this session)",
+        #
+        # cpp#145 (AC5): and say what was NOT seen. The old line announced "No
+        # meaningful progress" while quoting 1722 progress events — a sentence
+        # that contradicts itself. That phrasing is now reserved for the case it
+        # actually describes: nothing observed at all since the session started.
+        session_total = (
+            f"{self._stream_activity_count} content stream events this session"
         )
+        if self._last_signal is None:
+            detail = f"No meaningful progress for {secs}s: nothing observed since the session started ({session_total})"
+        else:
+            detail = (
+                f"Silent for {secs}s since the last {self._last_signal}; "
+                f"nobody outstanding (waiting: none) — "
+                f"{self._window_stream_count} content stream events in this window, "
+                f"{session_total}"
+            )
+        self._abort("idle_timeout", detail)
+
+    def _wait_ceiling_secs(self, state: _WaitState) -> float:
+        """Ceiling, in seconds, for a waiting state (cpp#145)."""
+        if state is _WaitState.AWAITING_TOOL:
+            return self._config.toolWaitCeilingMs / 1000.0
+        return self._config.modelWaitCeilingMs / 1000.0
+
+    def _abort_wait_ceiling(
+        self, state: _WaitState, started: float, now: float
+    ) -> None:
+        """Terminate a session whose wait outlasted its ceiling (cpp#145).
+
+        The negative control of AC2 and AC7 lands here: a guardrail that can no
+        longer kill has been removed, not repaired. A tool that never returns
+        and a model that never produces its first token both still die — but as
+        `awaiting_tool` / `awaiting_model`, so the operator and dispatch-lib
+        read "we waited for X and X never came" instead of the false "the
+        session went silent".
+        """
+        waited = round(now - started)
+        ceiling_secs = round(self._wait_ceiling_secs(state))
+        session_total = (
+            f"{self._stream_activity_count} content stream events this session"
+        )
+        reason: Literal["awaiting_tool", "awaiting_model"]
+        if state is _WaitState.AWAITING_TOOL:
+            reason = "awaiting_tool"
+            who = f"tool `{self._wait_detail}`" if self._wait_detail else "a tool"
+            detail = (
+                f"Tool wait exceeded ceiling: no result from {who} for ~{waited}s "
+                f"(ceiling {ceiling_secs}s); last signal was a "
+                f"{self._last_signal or 'turn boundary'} and nothing has arrived since "
+                f"({self._window_stream_count} content stream events in this window, "
+                f"{session_total})"
+            )
+        else:
+            reason = "awaiting_model"
+            detail = (
+                f"Model wait exceeded ceiling: no first token of the next turn for "
+                f"~{waited}s (ceiling {ceiling_secs}s); last signal was a "
+                f"{self._last_signal or 'tool result'} and the turn never resumed "
+                f"({self._window_stream_count} content stream events in this window, "
+                f"{session_total})"
+            )
+        self._abort(reason, detail)
 
     def _abort_rate_limit_ceiling(self, started: float, now: float) -> None:
         """Terminate a session that has stayed throttled past the ceiling (cpp#133).
@@ -546,7 +735,13 @@ class SessionGuardrails:
     def _abort(
         self,
         guardrail: Literal[
-            "stall_detected", "empty_response", "idle_timeout", "rate_limited"
+            "stall_detected",
+            "empty_response",
+            "idle_timeout",
+            "rate_limited",
+            # cpp#145: the two waiting states, reached only at their ceilings.
+            "awaiting_tool",
+            "awaiting_model",
         ],
         detail: str,
     ) -> None:
@@ -565,6 +760,19 @@ class SessionGuardrails:
         )
         self.dispose()
         self._abort_event.set()
+
+
+def _first_tool_use_name(blocks: list[Any]) -> str | None:
+    """Name of the first tool_use block in a turn, for the wait detail (cpp#145).
+
+    Best-effort: an unnamed block yields None and the abort message simply says
+    "a tool" instead. Never raises — a malformed block must not be able to take
+    down the guardrail that exists to bound the session.
+    """
+    for block in blocks:
+        if _block_type(block) == "tool_use":
+            return _tool_use_name(block)
+    return None
 
 
 _SDK_BLOCK_CLASS_TO_TYPE: dict[str, str] = {

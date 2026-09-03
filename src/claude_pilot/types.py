@@ -34,6 +34,20 @@ class GuardrailConfig(BaseModel):
     # keep a zombie session alive forever (maxTurns does not bound a waiting
     # pilot — it burns no turn while it waits).
     rateLimitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
+    # cpp#145: ceilings on the two WAITING states the idle watchdog now tells
+    # apart from genuine silence. `idleTimeoutMs` measures "nothing observed";
+    # these two measure "waiting on someone" — a tool that has not returned its
+    # result (`awaiting_tool`), and a model that has not produced the first
+    # token of the next turn (`awaiting_model`). Waiting is not idling: the six
+    # sessions killed on the night of 2026-08-31 were each silent for 300s
+    # immediately AFTER a tool result, waiting for the model to resume.
+    #
+    # Same shape as `rateLimitCeilingMs` above, deliberately: a wait gets a more
+    # generous budget and its own abort reason, but it still gets a bound — an
+    # exemption would make a session that never resumes immortal, which is the
+    # zombie cpp#133 exists to prevent. 0 = no ceiling (wait indefinitely).
+    toolWaitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
+    modelWaitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
 
 
 class ResolvedGuardrailConfig(BaseModel):
@@ -50,6 +64,11 @@ class ResolvedGuardrailConfig(BaseModel):
     # cpp#133: bound on the throttled-backoff wait. Defaulted so existing
     # all-fields constructors (and downstream callers) keep working unchanged.
     rateLimitCeilingMs: int = 1_800_000
+    # cpp#145: bounds on the two waiting states. Defaulted for the same reason
+    # as `rateLimitCeilingMs` — every existing all-fields construction (and
+    # every test fixture) keeps working without naming them.
+    toolWaitCeilingMs: int = 1_800_000
+    modelWaitCeilingMs: int = 900_000
 
 
 GUARDRAIL_DEFAULTS = ResolvedGuardrailConfig(
@@ -63,6 +82,13 @@ GUARDRAIL_DEFAULTS = ResolvedGuardrailConfig(
     # 2026-08-06 founding incident) and several retry cycles, while bounding a
     # session that would otherwise wait forever under continuous throttling.
     rateLimitCeilingMs=1_800_000,
+    # cpp#145: a tool may legitimately run long — a full `cargo build` or test
+    # suite in the repos this pilot drives is minutes, not seconds — so the tool
+    # wait matches the throttle ceiling at 30 min. The model wait is tighter:
+    # 15 min without a first token means the turn is not coming back, and it is
+    # still 3x the 300s that killed six productive sessions.
+    toolWaitCeilingMs=1_800_000,
+    modelWaitCeilingMs=900_000,
 )
 
 
@@ -175,8 +201,19 @@ class GuardrailAbortReason(BaseModel):
     # three cpp#54-era values — consumers that only recognize the original
     # three still parse the JSON shape; they just do not special-case the new
     # value. See GuardrailAbortReason.api_error_status below.
+    # cpp#145: `awaiting_tool` and `awaiting_model` split the two WAITING states
+    # out of `idle_timeout`. They are reached only at their own ceilings, so a
+    # session reported `idle_timeout` still means what it always meant — the
+    # session went silent with nobody outstanding. Additive in the same sense
+    # as `rate_limited` above: consumers that know only the earlier values keep
+    # parsing the JSON shape and simply do not special-case the new ones.
     guardrail: Literal[
-        "stall_detected", "empty_response", "idle_timeout", "rate_limited"
+        "stall_detected",
+        "empty_response",
+        "idle_timeout",
+        "rate_limited",
+        "awaiting_tool",
+        "awaiting_model",
     ]
     turns: int
     detail: str

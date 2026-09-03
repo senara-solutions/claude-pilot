@@ -161,6 +161,13 @@ def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
         # cpp#133: the ceiling only matters while idle detection is armed.
         if config.rateLimitCeilingMs > 0:
             parts.append(f"rateLimitCeiling={config.rateLimitCeilingMs / 1000}s")
+        # cpp#145: same condition, same reason — the two wait ceilings only
+        # bound states the idle watchdog reaches. Logged so an operator reading
+        # a session header can tell which budget an `awaiting_*` abort hit.
+        if config.toolWaitCeilingMs > 0:
+            parts.append(f"toolWaitCeiling={config.toolWaitCeilingMs / 1000}s")
+        if config.modelWaitCeilingMs > 0:
+            parts.append(f"modelWaitCeiling={config.modelWaitCeilingMs / 1000}s")
     if config.maxBudgetUsd > 0:
         parts.append(f"maxBudget=${config.maxBudgetUsd}")
     _log(f"{DIM}[guardrails]{RESET} {' '.join(parts)}")
