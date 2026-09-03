@@ -267,8 +267,12 @@ Reprise fidèle des AC du corps, avec leur rattachement de phase.
 - **AC4** — Non-régression : une commande composée dont **un seul** membre est
   destructeur reste refusée. → tests de non-régression obligatoires sur A1 :
   `cd x && for t in a; do rm -rf $t; done`, `cd /etc && for f in passwd; do cat
-  $f; done`, `cd .. && for …`, `cd ~ && for …`, `cd $(evil) && for …` — tous
-  refusés. Aucun de ces cas ne doit passer par l'exemption `rule_id`.
+  $f; done`, `cd .. && for …`, `cd ~ && for …`, `cd $(evil) && for …`,
+  `cd $FOO && for …` (expansion de variable dans la cible), `cd 'a b' && for …`
+  (espace dans le chemin) — tous refusés. Les deux derniers sont nommés par
+  l'architecte en première passe (Q5) : le charset restreint les exclut déjà,
+  et un test qui le PROUVE vaut mieux qu'un charset dont on suppose qu'il tient.
+  Aucun de ces cas ne doit passer par l'exemption `rule_id`.
 - **AC5** — Mesure rejouable, seuil écrit : sur les 40 dernières sessions, la
   proportion de sessions mortes en `error_during_execution` parmi celles ayant
   subi un refus tombe à **0**. → mesurable seulement **après** B0, sur une
