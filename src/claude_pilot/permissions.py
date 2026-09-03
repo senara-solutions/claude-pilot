@@ -1044,6 +1044,16 @@ def create_permission_handler(
                         ctx=ctx,
                     )
                 log_policy_deny(tool_name, detail, pd.rule_id)
+                # cpp#144: an AskUserQuestion refused here is the ordinary
+                # headless-pilot shape — the policy default-denies it (nobody
+                # is present to answer) and, being non-Bash, the refusal is
+                # non-terminal (`_denial_is_terminal` below): the run
+                # continues. Mark the session so agent.py can tell a genuine
+                # success apart from one that only continued because the
+                # model rendered the same question as text instead of
+                # accepting the refusal (cpp#144 body).
+                if tool_name == "AskUserQuestion" and guardrails is not None:
+                    guardrails.note_operator_question_denied(detail)
                 return _record_decision(
                     PermissionResultDeny(
                         message=pd.reason,

@@ -641,6 +641,122 @@ async def test_api_error_status_absent_omits_field(
     assert "api_error_status" not in payload, payload
 
 
+# ── cpp#144: absent-operator question reclassifies a hollow "success" ────────
+#
+# The SDK's own `receive_response()` stream never carries the fact that an
+# AskUserQuestion call was denied — that happens on the `can_use_tool` side
+# channel (permissions.py), which these fake-stream tests do not drive
+# (`_noop_permission` asserts it is never called). So these tests pre-arm the
+# guardrail exactly the way permissions.py does in production
+# (`note_operator_question_denied`, proven by
+# `tests/test_permissions.py::test_denied_ask_user_question_marks_the_session`)
+# and exercise only the ResultMessage-handling half: does agent.py correctly
+# read the marker and reclassify.
+
+
+@pytest.mark.asyncio
+async def test_operator_question_denied_with_no_deliverable_yields_blocked_status(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#144 AC1: a session whose AskUserQuestion was denied by policy and
+    which then ends on a genuine SDK `success` ResultMessage without ever
+    invoking `gh pr create` must NOT report `status=success` — it reports the
+    distinct `blocked_on_operator_input` subtype, with the denied question
+    reproduced in `termination_reason`."""
+    import json
+
+    _install_fake_client(monkeypatch, [_init(), _result()])
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_operator_question_denied("AskUserQuestion: which option?")
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_blocked",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    payload = json.loads(json_lines[0])
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == "blocked_on_operator_input", payload
+    assert "AskUserQuestion: which option?" in payload["termination_reason"], payload
+    assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_question_denied_but_pr_created_still_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#144 AC2 — mandatory negative control. A session that takes the
+    SAME AskUserQuestion denial, adapts, and goes on to invoke
+    `gh pr create` must still report `status=success`. The marker only
+    weighs at exit; it must never turn a real delivery into a false failure."""
+    import json
+
+    _install_fake_client(
+        monkeypatch,
+        [
+            _init(),
+            _assistant(
+                [ToolUseBlock(id="t1", name="Bash", input={"command": "gh pr create --fill"})],
+                message_id="msg_1",
+            ),
+            _result(),
+        ],
+    )
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_operator_question_denied("AskUserQuestion: which option?")
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_delivered",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    payload = json.loads(json_lines[0])
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+
+
+@pytest.mark.asyncio
+async def test_genuine_success_without_operator_question_stays_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Negative control on the marker itself: a session that never had an
+    AskUserQuestion denied reports `success` exactly as before cpp#144 —
+    the new branch is additive, not a new default."""
+    import json
+
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_plain_success",
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    payload = json.loads(json_lines[0])
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+
+
 # ── StreamEvent wiring and the silent-branch closure (cpp#123) ───────────────
 #
 # `include_partial_messages=True` makes the SDK deliver StreamEvents, but the

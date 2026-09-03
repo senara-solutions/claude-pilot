@@ -206,6 +206,50 @@ async def test_pr_created_is_sticky(guardrails: SessionGuardrails) -> None:
     assert guardrails.pr_created is True
 
 
+# ── cpp#144: absent-operator AskUserQuestion marker ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_operator_question_denied_starts_false(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A fresh SessionGuardrails has operator_question_denied == False
+    (cpp#144), mirroring the mika#940 pr_created contract."""
+    assert guardrails.operator_question_denied is False
+    assert guardrails.operator_question_summary is None
+
+
+@pytest.mark.asyncio
+async def test_note_operator_question_denied_flips_the_flag(
+    guardrails: SessionGuardrails,
+) -> None:
+    """permissions.py calls note_operator_question_denied() on every
+    AskUserQuestion policy:deny (cpp#144); the flag and summary must both
+    reflect it."""
+    guardrails.note_operator_question_denied("AskUserQuestion: which option?")
+    assert guardrails.operator_question_denied is True
+    assert guardrails.operator_question_summary == "AskUserQuestion: which option?"
+
+
+@pytest.mark.asyncio
+async def test_operator_question_denied_is_sticky(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Once armed, the flag stays armed for the rest of the session (cpp#144)
+    — a second denied question does not undo the first, and the summary
+    tracks the MOST RECENT denied question."""
+    guardrails.note_operator_question_denied("first question")
+    assert guardrails.operator_question_denied is True
+    guardrails.on_assistant_message(
+        [_tool(name="Bash", input_data={"command": "echo still working"})],
+        message_id="msg_1",
+    )
+    assert guardrails.operator_question_denied is True
+    guardrails.note_operator_question_denied("second question")
+    assert guardrails.operator_question_denied is True
+    assert guardrails.operator_question_summary == "second question"
+
+
 # ── cpp#10: TurnBoundaryEvent return-value contract ─────────────────────────
 
 

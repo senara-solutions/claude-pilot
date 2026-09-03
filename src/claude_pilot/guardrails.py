@@ -160,6 +160,24 @@ class SessionGuardrails:
         # Detection: any ToolUseBlock where name=="Bash" and command contains
         # "gh pr create" (substring match, false-positives accepted per plan).
         self._pr_created: bool = False
+        # cpp#144: sticky "an AskUserQuestion aimed at an absent operator was
+        # refused" flag. Set by permissions.py whenever the policy layer
+        # denies an AskUserQuestion call (the pilot is headless — there is
+        # nobody to answer, so the refusal is correct; see cpp#144 body). Read
+        # by agent.py at the ResultMessage boundary: a session that later
+        # completes "successfully" with this flag armed and no `gh pr create`
+        # observed (the same `_pr_created` signal mika#940 already tracks) is
+        # reclassified from `success` to `blocked_on_operator_input` — the
+        # model bypassed the refusal by rendering the question as plain text
+        # and ending the turn, which the SDK sees as a clean completion.
+        # Sticky and never cleared: a session that asked once and was refused
+        # once still has no operator to answer it, no matter how many turns
+        # follow, unless it goes on to actually deliver (pr_created).
+        self._operator_question_denied: bool = False
+        # Summary of the (last) denied AskUserQuestion call, reproduced in the
+        # ResultJson.termination_reason so the exit message names the question
+        # nobody could answer (cpp#144 AC1), not just the fact of a denial.
+        self._operator_question_summary: str | None = None
         # cpp#119: sticky "currently rate-limited" flag. Set when a rate-limit
         # signal is observed on the stream (a CLI RateLimitEvent with
         # status=="rejected", or an AssistantMessage carrying error=="rate_limit")
@@ -235,6 +253,33 @@ class SessionGuardrails:
         this session. mika#940 pipeline-completion contract — read by agent.py
         post-ResultMessage when CLAUDE_PILOT_REQUIRE_PR=1."""
         return self._pr_created
+
+    @property
+    def operator_question_denied(self) -> bool:
+        """True if a policy denial of `AskUserQuestion` was observed this
+        session (cpp#144). Read by agent.py post-ResultMessage to decide
+        whether a "successful" completion actually ended on a question with
+        nobody present to answer it."""
+        return self._operator_question_denied
+
+    @property
+    def operator_question_summary(self) -> str | None:
+        """Human-readable summary of the (last) denied `AskUserQuestion` call,
+        or None if none was denied this session (cpp#144)."""
+        return self._operator_question_summary
+
+    def note_operator_question_denied(self, summary: str | None) -> None:
+        """Record that an `AskUserQuestion` call was refused by policy
+        (cpp#144). Called from permissions.py at every deny return site that
+        can carry `tool_name == "AskUserQuestion"`.
+
+        Sticky: once set, stays set for the rest of the session — refusing a
+        second question does not undo the first refusal. `summary` overwrites
+        on each call so the message names the MOST RECENT denied question,
+        which is the one closest to whatever the session did next.
+        """
+        self._operator_question_denied = True
+        self._operator_question_summary = summary
 
     @property
     def aborted(self) -> bool:
