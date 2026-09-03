@@ -57,12 +57,24 @@ Place `.claude/claude-pilot.json` in the target project:
     "stallThreshold": 5,
     "emptyResponseThreshold": 5,
     "idleTimeoutMs": 300000,
-    "minTurnsBeforeDetection": 10
+    "minTurnsBeforeDetection": 10,
+    "rateLimitCeilingMs": 1800000,
+    "toolWaitCeilingMs": 1800000,
+    "modelWaitCeilingMs": 900000
   }
 }
 ```
 
 Guardrail fields are optional — defaults apply when omitted. CLI flags override config file values. Set a threshold to `0` to disable that specific guardrail.
+
+`idleTimeoutMs` bounds genuine silence. The three ceilings bound the cases where
+the session is not silent but *waiting* — on Anthropic's backoff
+(`rateLimitCeilingMs`), on a tool that has not returned (`toolWaitCeilingMs`), or
+on the first token of the next turn (`modelWaitCeilingMs`). Waiting is not
+idling, so each gets a longer budget and its own abort reason. **`0` on a ceiling
+means wait indefinitely** — the one setting under which the watchdog cannot
+terminate that state, so it is printed as `off(unbounded)` in the session header
+rather than left to be discovered in production.
 
 ## Permission-policy mode
 

@@ -48,12 +48,38 @@ tool_calls_killed=0
 tool_calls_survived=0
 
 for log in "${LOGS[@]}"; do
-  # A session counts as TERMINATED once it has reached any end state: a
-  # guardrail abort, or the SDK's own [done]/result line. A session still
+  # A session counts as TERMINATED once it has reached an end state: a
+  # TERMINATING guardrail abort, or the SDK's own [done] line. A session still
   # running is excluded from both terms — including it would depress the rate
   # for a reason that has nothing to do with the fix.
-  guardrail_line=$(grep -m1 '\[guardrail\]' "$log" 2>/dev/null || true)
+  #
+  # `rate_limited` appears in BOTH roles, so it is terminal only when it names
+  # the ceiling (`_abort_rate_limit_ceiling` writes "beyond ceiling"; the
+  # transient notice writes "Anthropic rate limit rejected"). Every other
+  # guardrail reason only ever appears on the abort path.
+  # The TERMINAL guardrail line, not the first. agent.py:277 logs a
+  # `[guardrail] rate_limited` for a TRANSIENT throttle and the session keeps
+  # going; the abort at agent.py:209 is the last thing written before the loop
+  # returns. Reading the first match attributes a survivor's passing throttle
+  # as its cause of death — and the bias runs in the flattering direction,
+  # understating the very idle_timeout rate this script exists to judge. An
+  # instrument that errs in favour of the fix it measures is worse than none.
+  guardrail_line=$(grep '\[guardrail\]' "$log" 2>/dev/null | tail -n1 || true)
   done_line=$(grep -m1 '\[done\]' "$log" 2>/dev/null || true)
+
+  case "$guardrail_line" in
+    *rate_limited*)
+      # Terminal only when it names the ceiling; otherwise it is a passing
+      # throttle on a session that continued (or is still running).
+      case "$guardrail_line" in
+        *ceiling*) : ;;
+        *) guardrail_line="" ;;
+      esac
+      ;;
+    *idle_timeout*|*awaiting_tool*|*awaiting_model*|*stall_detected*|*empty_response*) : ;;
+    *) guardrail_line="" ;;
+  esac
+
   [ -z "$guardrail_line" ] && [ -z "$done_line" ] && continue
 
   terminated=$((terminated + 1))

@@ -35,15 +35,53 @@ class _WaitState(Enum):
     | AWAITING_MODEL  | the next turn's first token | no — its own ceiling |
 
     Collapsing the three killed six productive sessions on the night of
-    2026-08-31 to 09-01. All six share the same last line before the guardrail
-    fired — `user message (tool result) received` — i.e. the tool had already
-    returned and the session was waiting on the model. `3d5fe1ec` had made
-    thirty-three tool calls; it was not stuck, it was killed.
+    2026-08-31 to 09-01. `3d5fe1ec` had made thirty-three tool calls; it was
+    not stuck, it was killed.
+
+    **What the logs actually show, and why the first version of this fix was
+    only half a fix.** The ticket says all six sessions end on the same line,
+    `user message (tool result) received`. That is true for three of them
+    (`c56a973e`, `c5201301`, `aae80d84`). In the other three (`3d5fe1ec`,
+    `f26add11`, `e2f0ef97`) the SDK delivers the OLD turn's closing trailers —
+    `message_delta`, `message_stop` — AFTER the tool result. Both are members
+    of `_PROGRESS_STREAM_EVENT_TYPES`, so a naive "any stream event means the
+    model is producing" rule closes the model-wait window at the exact instant
+    it should open, and those three sessions still die at 300s.
+
+    A trailer is not production. `message_stop` means "the turn ENDED"; taken
+    as proof that nobody is being waited on, it says the opposite of the truth.
+    So the state machine keys on which SSE event arrived
+    (`_PRODUCTION_STREAM_EVENTS`), not on the coarse progress flag.
+
+    The tool wait needs more than that. Measured over 177 real
+    dispatch-to-result pairs in `/var/log/claude-pilot`, **67 genuine
+    production events arrive while a tool is still outstanding** — so a tool
+    wait held as a scalar state gets cleared mid-flight by ordinary generation,
+    and `toolWaitCeilingMs` becomes dead configuration. The outstanding tools
+    are therefore COUNTED (`_pending_tool_uses`), and no stream event of any
+    kind can retire a tool that has not returned.
     """
 
     IDLE = "idle"
     AWAITING_TOOL = "awaiting_tool"
     AWAITING_MODEL = "awaiting_model"
+
+
+# cpp#145: the SSE events that prove the model is PRODUCING, as opposed to the
+# turn-closing trailers `message_delta` / `message_stop`. agent.py's
+# `_PROGRESS_STREAM_EVENT_TYPES` (cpp#123) deliberately includes the trailers —
+# for rearming the idle deadline they are liveness, and that stays true. They
+# are excluded HERE, and only here, because "the deadline may move" and "nobody
+# is being waited on" are different claims, and the second one is false while a
+# turn is closing.
+_PRODUCTION_STREAM_EVENTS = frozenset(
+    {
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -153,12 +191,25 @@ class SessionGuardrails:
         self._last_activity_at: float = 0.0
         self._stream_activity_count: int = 0
         # cpp#145: what the session is waiting for during the current silence,
-        # and since when. The state lives on the INSTANCE, never in the
+        # and since when. All of it lives on the INSTANCE, never in the
         # watchdog task's closure: `_reset_idle_timer` cancels and recreates
         # that task on every turn boundary, so a fresh task must be able to
         # read a transition decided before it was created.
-        self._wait_state: _WaitState = _WaitState.IDLE
-        self._wait_started_at: float | None = None
+        #
+        # Outstanding tools are COUNTED rather than folded into a single state
+        # scalar. Two reasons, both measured: ordinary generation events arrive
+        # while a tool is in flight (67 of them across 177 real
+        # dispatch-to-result pairs), so a scalar gets cleared mid-flight; and a
+        # turn may dispatch several tools at once, where the first result must
+        # not declare the others finished.
+        self._pending_tool_uses: int = 0
+        self._tool_wait_started_at: float | None = None
+        # A tool result was delivered and the next turn has not produced its
+        # first token yet. This is the window that killed the six sessions.
+        self._awaiting_model: bool = False
+        self._model_wait_started_at: float | None = None
+        # Name of the tool the current tool wait is anchored on, for the abort
+        # message. Best-effort; None renders as "a tool".
         self._wait_detail: str | None = None
         # cpp#145: what the last observed signal WAS, and how many content
         # stream events arrived since the current wait window opened. Both are
@@ -212,7 +263,22 @@ class SessionGuardrails:
         (cpp#123). Reported in the `idle_timeout` abort detail."""
         return self._stream_activity_count
 
-    def note_stream_activity(self) -> None:
+    @property
+    def _wait_state(self) -> _WaitState:
+        """What the session is waiting for right now (cpp#145), derived.
+
+        Tool wait outranks model wait: if a tool has not returned, that is what
+        we are waiting on, whatever else is also true. Derived rather than
+        stored so no single write can leave the machine claiming a wait that
+        the outstanding-tool count contradicts.
+        """
+        if self._pending_tool_uses > 0:
+            return _WaitState.AWAITING_TOOL
+        if self._awaiting_model:
+            return _WaitState.AWAITING_MODEL
+        return _WaitState.IDLE
+
+    def note_stream_activity(self, event_type: str | None = None) -> None:
         """Record intra-turn progress from the SDK message stream (cpp#123).
 
         `agent.py` sets `include_partial_messages=True`, so the SDK delivers a
@@ -239,20 +305,33 @@ class SessionGuardrails:
 
         The counter is incremented unconditionally; only the deadline needs a
         running loop.
+
+        cpp#145: `event_type` is the raw SSE event name. Only the events in
+        `_PRODUCTION_STREAM_EVENTS` close the model-wait window; the
+        turn-closing trailers `message_delta` / `message_stop` rearm the
+        deadline and count, exactly as before, but they do NOT claim the model
+        has resumed — in three of the six killed sessions those trailers arrive
+        AFTER the tool result, and treating them as production is what would
+        leave those sessions dying at 300s. `None` (an older caller, or a test
+        that does not care) is treated as production, preserving the previous
+        signature's behaviour.
+
+        A stream event NEVER retires an outstanding tool. Generation and tool
+        execution overlap on the real wire; only the tool's result ends its
+        wait.
         """
         self._stream_activity_count += 1
         self._clear_rate_limit()
-        # cpp#145: content on the wire is the proof that closes BOTH waiting
-        # states. A model producing tokens is not waiting on its own first
-        # token (`AWAITING_MODEL`), and the SDK does not resume generation
-        # while a tool result is still outstanding, so a delta also retires
-        # `AWAITING_TOOL`. Nobody is being waited on → back to plain IDLE, and
-        # the 300s budget applies again from here.
-        self._enter_wait(_WaitState.IDLE, signal="stream event")
+        self._last_signal = "stream event"
         self._window_stream_count += 1
+        if event_type is None or event_type in _PRODUCTION_STREAM_EVENTS:
+            # The next turn is producing → the model is no longer being waited
+            # on. Outstanding tools are untouched: they are counted, not stated.
+            self._awaiting_model = False
+            self._model_wait_started_at = None
         self._bump_idle_deadline()
 
-    def note_activity(self) -> None:
+    def note_activity(self, tool_results: int = 1) -> None:
         """Record non-generation SDK liveness on the message stream (cpp#125).
 
         A `UserMessage` carries tool results — inbound traffic that proves the
@@ -264,39 +343,49 @@ class SessionGuardrails:
         generation retry has succeeded. Deliberately cheap — it only moves a
         deadline and never touches the watchdog task.
 
-        cpp#145: it also OPENS the model-wait window. This exact line is the
-        last one in all six sessions killed on the night of 2026-08-31 — the
-        tool result was delivered, the deadline was pushed, and then 300s of
-        nothing while the session waited for the first token of the next turn.
-        That silence is a wait, not an idle, and from here it is measured
-        against `modelWaitCeilingMs` instead.
+        cpp#145: it retires `tool_results` outstanding tools and, once none
+        remain, OPENS the model-wait window. This is the line that ends the
+        killed sessions — the tool result was delivered, the deadline was
+        pushed, and then 300s of nothing while the session waited for the first
+        token of the next turn. That silence is a wait, not an idle, and from
+        here it is measured against `modelWaitCeilingMs`.
+
+        `tool_results` is how many tool_result blocks the `UserMessage` carried,
+        so a batch of parallel tools retires all of them at once. It never goes
+        below zero: an unmatched result (a tool dispatched before this guardrail
+        existed, a shape the block walker did not recognise) must not leave a
+        phantom tool outstanding and hold the session to the tool ceiling.
         """
-        self._enter_wait(_WaitState.AWAITING_MODEL, signal="tool result")
+        self._last_signal = "tool result"
+        self._window_stream_count = 0
+        self._pending_tool_uses = max(0, self._pending_tool_uses - max(1, tool_results))
+        if self._pending_tool_uses == 0:
+            self._tool_wait_started_at = None
+            self._wait_detail = None
+            if not self._awaiting_model:
+                # Anchor on the TRANSITION only. Re-anchoring on every result
+                # would push the ceiling out indefinitely — the mistake cpp#133
+                # already avoided for `_rate_limit_started_at`.
+                self._awaiting_model = True
+                self._model_wait_started_at = self._now()
         self._bump_idle_deadline()
 
-    def _enter_wait(
-        self, state: _WaitState, *, signal: str, detail: str | None = None
-    ) -> None:
-        """Record what the session is now waiting for, and on what evidence
-        (cpp#145).
+    def _note_tool_uses(self, count: int, first_name: str | None) -> None:
+        """A turn dispatched `count` tools; they are now outstanding (cpp#145).
 
-        Re-entering the SAME state does not restart its window: a turn that
-        emits several tool_use blocks is one wait, and re-anchoring on each
-        would push the ceiling out indefinitely — the mistake cpp#133 already
-        avoided for the throttle window (`_rate_limit_started_at` is stamped
-        only on the transition INTO the state).
-
-        `_window_stream_count` resets on every genuine transition so the abort
-        detail can report what arrived in THIS window, distinctly from the
-        session cumulative count.
+        Anchors the tool wait on the first outstanding tool and leaves it there
+        while any remain, so a turn that keeps dispatching cannot push its own
+        ceiling out of reach. Dispatching a tool also ends any model wait: the
+        model demonstrably produced this turn.
         """
-        self._last_signal = signal
-        if state is self._wait_state:
+        if count <= 0:
             return
-        self._wait_state = state
-        self._window_stream_count = 0
-        self._wait_detail = detail
-        self._wait_started_at = None if state is _WaitState.IDLE else self._now()
+        if self._pending_tool_uses == 0:
+            self._tool_wait_started_at = self._now()
+            self._wait_detail = first_name
+        self._pending_tool_uses += count
+        self._awaiting_model = False
+        self._model_wait_started_at = None
 
     def _bump_idle_deadline(self) -> None:
         """Push the idle deadline to now, at O(1) cost (cpp#123/#125).
@@ -398,22 +487,25 @@ class SessionGuardrails:
         if has_tool_use or text_len > 0:
             self._clear_rate_limit()
 
-        # cpp#145: a turn that ends on a tool_use is waiting for that tool to
-        # return; a turn that ends without one is waiting for nobody. Armed
+        # cpp#145: tools dispatched by this turn are now outstanding. Recorded
         # HERE rather than in permissions.py on purpose: the relay callback
         # (`pause_idle_timer` / `resume_idle_timer`, permissions.py:1112/:1177)
         # brackets only the relay round-trip, so it sees neither auto-approved
         # tools nor the tool's own execution time — the very window AC3 is
-        # about. `has_tool_use` is already computed just above, so this costs
-        # one branch and no second walk of the content blocks.
+        # about. The blocks are already walked just above for `has_tool_use`.
+        self._last_signal = "turn boundary"
+        self._window_stream_count = 0
         if has_tool_use:
-            self._enter_wait(
-                _WaitState.AWAITING_TOOL,
-                signal="turn boundary",
-                detail=_first_tool_use_name(blocks),
+            self._note_tool_uses(
+                sum(1 for b in blocks if _block_type(b) == "tool_use"),
+                _first_tool_use_name(blocks),
             )
         else:
-            self._enter_wait(_WaitState.IDLE, signal="turn boundary")
+            # A turn that produced no tool call is waiting for nobody: the model
+            # spoke and stopped. If nothing follows, that is genuine silence and
+            # the original 300s budget is the right one.
+            self._awaiting_model = False
+            self._model_wait_started_at = None
 
         # mika#940: PR-creation detection. Scan tool_use blocks for Bash
         # invocations whose command substring includes `gh pr create`. Set
@@ -547,7 +639,20 @@ class SessionGuardrails:
             self._idle_task = None
 
     def resume_idle_timer(self) -> None:
-        """Start a fresh full-duration idle timer (called after relay)."""
+        """Start a fresh full-duration idle timer (called after relay).
+
+        cpp#145: an open wait window is re-anchored too. The relay round-trip
+        is time the guardrail explicitly does NOT measure — that is what the
+        pause is for — so charging it against a wait ceiling would contradict
+        the same contract this method exists to honour. Bounded by construction:
+        the relay fires once per tool permission decision, and each decision
+        belongs to a tool that is separately accounted for.
+        """
+        now = self._now()
+        if self._tool_wait_started_at is not None:
+            self._tool_wait_started_at = now
+        if self._model_wait_started_at is not None:
+            self._model_wait_started_at = now
         self._reset_idle_timer()
 
     def dispose(self) -> None:
@@ -614,7 +719,7 @@ class SessionGuardrails:
                         # Armed outside a running loop (defensive); anchor now.
                         started = loop.time()
                         self._rate_limit_started_at = started
-                    if ceiling > 0 and loop.time() - started >= ceiling:
+                    if self._deferral_expired(started, ceiling, loop.time()):
                         self._abort_rate_limit_ceiling(started, loop.time())
                         return
                     # Re-check after one idle window: cheap, and bounds how long
@@ -633,13 +738,14 @@ class SessionGuardrails:
                 # exemption, and a model that never resumes would leave a
                 # session immortal; that is the zombie cpp#133 established we
                 # must not create.
-                wait_ceiling = self._wait_ceiling_secs(state)
-                wait_started = self._wait_started_at
+                wait_started = self._wait_anchor(state)
                 if wait_started is None:
                     # Entered outside a running loop (defensive); anchor now.
                     wait_started = loop.time()
-                    self._wait_started_at = wait_started
-                if wait_ceiling > 0 and loop.time() - wait_started >= wait_ceiling:
+                    self._set_wait_anchor(state, wait_started)
+                if self._deferral_expired(
+                    wait_started, self._wait_ceiling_secs(state), loop.time()
+                ):
                     self._abort_wait_ceiling(state, wait_started, loop.time())
                     return
                 await asyncio.sleep(timeout)
@@ -668,11 +774,35 @@ class SessionGuardrails:
             )
         self._abort("idle_timeout", detail)
 
+    @staticmethod
+    def _deferral_expired(started: float, ceiling_secs: float, now: float) -> bool:
+        """Has a deferral outlived its ceiling? (cpp#133 shape, cpp#145 reuse.)
+
+        `ceiling_secs <= 0` means "no ceiling — defer indefinitely". That is a
+        deliberate, documented mode inherited from `rateLimitCeilingMs`, and it
+        is the one configuration in which the watchdog cannot terminate this
+        state at all — which is why `log_guardrail_config` names it explicitly
+        rather than omitting it.
+        """
+        return ceiling_secs > 0 and now - started >= ceiling_secs
+
     def _wait_ceiling_secs(self, state: _WaitState) -> float:
         """Ceiling, in seconds, for a waiting state (cpp#145)."""
         if state is _WaitState.AWAITING_TOOL:
             return self._config.toolWaitCeilingMs / 1000.0
         return self._config.modelWaitCeilingMs / 1000.0
+
+    def _wait_anchor(self, state: _WaitState) -> float | None:
+        """When the current wait window opened (cpp#145)."""
+        if state is _WaitState.AWAITING_TOOL:
+            return self._tool_wait_started_at
+        return self._model_wait_started_at
+
+    def _set_wait_anchor(self, state: _WaitState, at: float) -> None:
+        if state is _WaitState.AWAITING_TOOL:
+            self._tool_wait_started_at = at
+        else:
+            self._model_wait_started_at = at
 
     def _abort_wait_ceiling(
         self, state: _WaitState, started: float, now: float
@@ -695,10 +825,12 @@ class SessionGuardrails:
         if state is _WaitState.AWAITING_TOOL:
             reason = "awaiting_tool"
             who = f"tool `{self._wait_detail}`" if self._wait_detail else "a tool"
+            outstanding = self._pending_tool_uses
             detail = (
                 f"Tool wait exceeded ceiling: no result from {who} for ~{waited}s "
-                f"(ceiling {ceiling_secs}s); last signal was a "
-                f"{self._last_signal or 'turn boundary'} and nothing has arrived since "
+                f"(ceiling {ceiling_secs}s, {outstanding} tool call(s) still "
+                f"outstanding); last signal was a "
+                f"{self._last_signal or 'turn boundary'} "
                 f"({self._window_stream_count} content stream events in this window, "
                 f"{session_total})"
             )

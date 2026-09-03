@@ -1,8 +1,10 @@
 """Configuration, event, and result schemas.
 
 Port of src/types.ts (zod → pydantic v2). Field names match the TS wire format
-exactly so downstream consumers (mika-skills/claude-pilot/handlers/run.sh,
-mika-dev relay) keep parsing unchanged.
+exactly so downstream consumers keep parsing unchanged. The one structural
+consumer found in the workspace is `mika/skills/bundled/_shared/dispatch-lib.sh`
+(cpp#145 review); the long-cited `mika-skills/claude-pilot/handlers/run.sh` does
+not exist and has not for some time, so do not go looking for it.
 """
 
 from __future__ import annotations
@@ -146,8 +148,14 @@ PilotResponse = PilotResponseAllow | PilotResponseDeny | PilotResponseAnswer
 
 
 class ResultJson(BaseModel):
-    """Single-line JSON written to stdout on completion. Parsed by
-    mika-skills/claude-pilot/handlers/run.sh.
+    """Single-line JSON written to stdout on completion.
+
+    Read by `mika/skills/bundled/_shared/dispatch-lib.sh`, which takes
+    `subtype` OPAQUELY (`jq -r '.subtype // empty'`) and renders it into a
+    `Halt: <subtype>` line for the operator. No allow-list, no case statement:
+    routing branches on `status` alone. That is why adding a subtype is safely
+    additive — and also why an added subtype reaches a human as text and
+    nothing else until a companion change lands downstream.
 
     Subtype values:
         - "success" — SDK ResultMessage reported success.
@@ -159,6 +167,12 @@ class ResultJson(BaseModel):
           premature-EndTurn family — model emits `[done] Success` after
           Edit/Compound phases without reaching git push + gh pr create.
           Work may be stranded in the worktree.
+        - Guardrail aborts, from `GuardrailAbortReason.guardrail` below:
+          "stall_detected", "empty_response", "idle_timeout" (cpp#54-era),
+          "rate_limited" (cpp#119), and "awaiting_tool" / "awaiting_model"
+          (cpp#145 — the session was waiting on a tool or on the next turn's
+          first token, and the wait outlived its ceiling). This list was absent
+          before cpp#145 and had been silently stale since cpp#119.
         - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
           — see SDK_TERMINATION_SUBTYPES in agent.py.
     """

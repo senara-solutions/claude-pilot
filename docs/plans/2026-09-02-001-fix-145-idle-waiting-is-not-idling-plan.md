@@ -390,6 +390,44 @@ l'instance, pas dans la closure de la tâche. Poser l'état avant que la tâche 
 reparte, et ne jamais supposer qu'une tâche en vol observera un changement
 décidé après son armement.
 
+### Correction de la prémisse (revue du 2026-09-03)
+
+Le grooming et ce plan affirment : « **n=6, unanime. Jamais un `[tool:request]`
+resté sans réponse.** » La première moitié est fausse, et la revue multi-agents
+l'a attrapée avant le merge. Relevé sur les journaux :
+
+| session | trois dernières lignes |
+|---|---|
+| `c56a973e`, `c5201301`, `aae80d84` | trailers, **puis** le résultat d'outil |
+| `3d5fe1ec`, `f26add11`, `e2f0ef97` | résultat d'outil, **puis** `message_delta` / `message_stop` |
+
+Dans ces trois-là, le SDK délivre les trailers de fin du tour **après** le
+résultat d'outil. Ils appartiennent à `_PROGRESS_STREAM_EVENT_TYPES`, donc une
+règle « tout événement de progrès signifie que le modèle a repris » ferme la
+fenêtre d'attente à l'instant précis où elle doit s'ouvrir : **la moitié des
+sessions que ce ticket existe pour sauver seraient mortes quand même**, avec en
+prime un message affirmant « nobody outstanding ».
+
+Deuxième correction, sur l'axe 2. Le plan écrit que la fenêtre outil « n'est le
+mécanisme d'aucune des six ». C'est exact pour la mort de ces six sessions, mais
+la conclusion qu'on en tirait — tenir l'attente d'outil dans un état scalaire —
+ne l'est pas : sur **177 paires réelles dépêche→résultat**, **67 événements de
+production arrivent pendant qu'un outil est encore en vol**. Génération et
+exécution d'outil se chevauchent sur le fil. Un état scalaire est donc effacé en
+plein vol par de la génération ordinaire, et `toolWaitCeilingMs` devient une
+configuration morte — un bouton qui se lit comme une protection et n'en est pas
+une.
+
+**Ce que la livraison fait donc, et que le plan ne prescrivait pas :** les
+trailers ne prétendent jamais que le modèle a repris, et les outils en vol sont
+**comptés** (`_pending_tool_uses`) plutôt qu'énoncés. Les AC ne bougent pas ;
+c'est leur mécanisme qui est corrigé.
+
+**Leçon de méthode, gardée exprès.** La prémisse venait d'une trace unique citée
+dans le ticket, généralisée à six sans être vérifiée sur les six. Le plan a
+ensuite gravé cette généralisation en commentaire de code. La revue a coûté six
+agents ; la vérification aurait coûté un `grep`.
+
 ## Commandes de vérification
 
 ```bash
