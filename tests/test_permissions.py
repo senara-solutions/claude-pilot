@@ -13,7 +13,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import PermissionResultDeny
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot import permissions as permissions_module
@@ -535,6 +535,13 @@ def test_denial_is_terminal_predicate(tmp_path: Path) -> None:
     assert f("Bash", {"command": "mv a.txt /definitely/outside/b.txt"}, wt) is True
     # ...and an in-worktree write of the same shape is not.
     assert f("Bash", {"command": "mkdir -p docs/plans"}, wt) is False
+    # cpp#143 — the ONE exception to R3: a `mkdir` scratch directory under
+    # `/tmp` is outside the worktree but sanctioned (symmetric with the
+    # existing `cat > /tmp/x <<'EOF'` file exception), so it is NOT lethal.
+    # `cp`/`mv` into `/tmp` are untouched by this exception and stay lethal.
+    assert f("Bash", {"command": "mkdir -p /tmp/rt005-scratch"}, wt) is False
+    assert f("Bash", {"command": "cp a.txt /tmp/escaped.txt"}, wt) is True
+    assert f("Bash", {"command": "mv a.txt /tmp/escaped.txt"}, wt) is True
     # R4 — non-Bash tools have no tier3 or destination notion: non-lethal.
     assert f("Skill", {"skill": "test-target"}, wt) is False
     assert f("Write", {"file_path": "/etc/passwd", "content": "x"}, wt) is False
@@ -563,21 +570,28 @@ def test_containment_escape_is_lethal_on_the_default_deny_route(
 
     The paired control is the same command pointing INSIDE the worktree: it must
     stay non-terminal, or the fix would have made ordinary refusals fatal again.
+
+    ``outside`` is a FIXED literal, not a ``tmp_path``-derived directory (cpp#143):
+    pytest's ``tmp_path`` fixture itself lives under ``/tmp``, which is now a
+    sanctioned ``mkdir`` scratch destination (see
+    ``test_mkdir_tmp_scratch_is_permitted_but_other_outside_targets_stay_lethal``
+    below) -- a genuinely-outside-the-worktree probe must be tested with a
+    target that is unambiguously outside BOTH the worktree AND the scratch
+    exception, or this test would silently stop testing what it says it tests.
     """
     worktree = tmp_path / "wt"
     (worktree / ".git").mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    outside = "/definitely/outside/x"
     handler = _bundled_handler(cwd=str(worktree))
 
     allow_matched = asyncio.run(
-        handler("Bash", {"command": f"mkdir -p {outside}/x"}, _mock_ctx())
+        handler("Bash", {"command": f"mkdir -p {outside}"}, _mock_ctx())
     )
     assert isinstance(allow_matched, PermissionResultDeny)
     assert allow_matched.interrupt is True
 
     chain_vetoed = asyncio.run(
-        handler("Bash", {"command": f'echo "go"; mkdir -p {outside}/x'}, _mock_ctx())
+        handler("Bash", {"command": f'echo "go"; mkdir -p {outside}'}, _mock_ctx())
     )
     assert isinstance(chain_vetoed, PermissionResultDeny)
     assert chain_vetoed.interrupt is True, (
@@ -590,3 +604,84 @@ def test_containment_escape_is_lethal_on_the_default_deny_route(
     )
     assert isinstance(inside, PermissionResultDeny)
     assert inside.interrupt is False
+
+
+def test_mkdir_tmp_scratch_is_permitted_but_other_outside_targets_stay_lethal(
+    tmp_path: Path,
+) -> None:
+    """cpp#143: the incoherence the issue reports, fixed and negatively controlled.
+
+    Before this fix, ``mkdir -p /tmp/<scratch>`` was refused AND terminal --
+    the exact shape that killed session ``0160cce6`` (72 tool calls, 2h52) --
+    while ``cat > /tmp/x <<'EOF'`` was, and still is, routine. This test proves
+    the asymmetry is gone for ``mkdir`` specifically, and that nothing broader
+    was opened: a system path is still refused and still terminal (AC3), and a
+    `..`-mediated escape THROUGH `/tmp` does not sneak out under the exception.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    # Positive: a /tmp scratch directory -- the exact 0160cce6 shape -- is now
+    # ALLOWED (not merely non-terminal; it actually executes).
+    scratch = asyncio.run(
+        handler(
+            "Bash",
+            {"command": "mkdir -p /tmp/rt005-empty-nobatch /tmp/rt005-empty-runs/runs"},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(scratch, PermissionResultAllow), (
+        "a working directory under /tmp must be permitted, symmetric with the "
+        "existing cat-heredoc-to-/tmp file exception"
+    )
+
+    # AC3 negative control: a system path is unaffected -- refused, terminal.
+    system_path = asyncio.run(
+        handler("Bash", {"command": "mkdir -p /etc/cpp143-should-never-exist"}, _mock_ctx())
+    )
+    assert isinstance(system_path, PermissionResultDeny)
+    assert system_path.interrupt is True, (
+        "an out-of-scope mkdir (system path, not /tmp) must stay refused and "
+        "terminal -- the scratch exception must not widen containment itself"
+    )
+
+    # Negative control: a literal `..` in the operand is rejected by the
+    # exception's own pattern (mirrors the heredoc's `(?!.*\.\.)`) -- it never
+    # reaches a resolve step that could be fooled.
+    traversal = asyncio.run(
+        handler("Bash", {"command": "mkdir -p /tmp/../etc/cpp143-traversal"}, _mock_ctx())
+    )
+    assert isinstance(traversal, PermissionResultDeny)
+    assert traversal.interrupt is True, (
+        "a /tmp-prefixed operand containing .. must not be exempted -- the "
+        "exception's own pattern excludes it, no resolve required"
+    )
+
+    # Negative control: a symlink INSIDE the worktree that resolves into /tmp
+    # is still a cpp#38 containment escape, not a scratch write. The exception
+    # is lexical (the literal command text, not the resolved path), so a
+    # route that never spells `/tmp/...` in the command does not qualify --
+    # this is the one case an earlier (resolve-based) version of this fix got
+    # wrong, and it must stay caught.
+    (worktree / "esc").symlink_to("/tmp")
+    symlink_escape = asyncio.run(
+        handler("Bash", {"command": "mkdir -p esc/via-symlink"}, _mock_ctx())
+    )
+    assert isinstance(symlink_escape, PermissionResultDeny)
+    assert symlink_escape.interrupt is True, (
+        "a worktree symlink resolving into /tmp is a containment escape "
+        "(cpp#38), not the sanctioned /tmp scratch exception (cpp#143) -- "
+        "the exception only matches a command that itself spells /tmp/..."
+    )
+
+    # Unit-level pin on the helper itself, both arms, so a revert is caught
+    # even if the handler-level assertions above are ever loosened.
+    f = permissions_module._is_sanctioned_tmp_scratch
+    assert f("/tmp/rt005-x") is True
+    assert f("/tmp/rt005-x/nested/dir") is True
+    assert f("/tmp") is False, "no trailing segment -- conservative on ambiguity"
+    assert f("/tmp/../etc/passwd") is False
+    assert f("/etc/passwd") is False
+    assert f("esc/via-symlink") is False, "relative -- not a literal /tmp/ operand"
+    assert f("") is False

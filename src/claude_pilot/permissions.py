@@ -499,6 +499,11 @@ def _bash_allow_is_chain_safe(
 #     `git show >`. A write verb it does not classify (`touch`, `tee`, ...) is
 #     still REFUSED — nothing is written — but non-terminally. Closing that gap
 #     means teaching `_segment_write_kind` more verbs, which is its own change.
+#     `_destination_veto_reason` itself carries one narrow, named exception to
+#     its containment check — a `mkdir` under `/tmp` (cpp#143, see the block
+#     above that function) — so this bullet's "matches `bash-mkdir`, halts" is
+#     no longer true for `/tmp` specifically; it is unchanged for every other
+#     out-of-worktree target.
 #   * tier3-dangerous Bash — the codebase's own name for a genuinely dangerous
 #     command. `is_tier3_dangerous` is a whole-string `re.search`, so a
 #     dangerous tail chained onto an allowed prefix (`mkdir x && rm -rf /tmp/y`)
@@ -747,6 +752,69 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
     return any(pat.match(rel) for pat in _CONTROL_PLANE_PATTERNS)
 
 
+# ── Sanctioned /tmp scratch directory for `mkdir` (cpp#143) ────────────────────
+#
+# `_destination_veto_reason` (below) is otherwise blind to any distinction
+# between "outside the worktree" and "outside the worktree, AND outside every
+# other sanctioned location" — it has exactly one sanctioned exception already,
+# and this is the second. `_is_sanctioned_pure_heredoc` /
+# `bash-cat-heredoc-tmp` (`:322-348` above) already let a pilot write a FILE
+# under `/tmp` with no containment veto at all: `cat` is not a write-kind
+# `_segment_write_kind` classifies, so a heredoc's `/tmp` destination never
+# reaches this function in the first place. `mkdir` IS classified
+# (`_segment_write_kind` returns `"bash-mkdir"`), so before this fix the exact
+# same boundary — a scratch path under `/tmp`, outside the worktree by
+# construction — was vetoed AND terminal for a directory while being routine
+# for a file. cpp#143's session `0160cce6` died on `mkdir -p
+# /tmp/rt005-empty-nobatch /tmp/rt005-empty-runs/runs`: ordinary test-fixture
+# scaffolding for empty/missing-directory cases, exactly the shape a worktree
+# (visible to `git status`) is the wrong place to build.
+#
+# The fix restores the SAME symmetry the heredoc already has, using the SAME
+# MECHANISM the heredoc uses — not merely the same target. `_is_sanctioned_
+# pure_heredoc` never touches the filesystem: it is a pure LEXICAL check on
+# the command string (`_SANCTIONED_HEREDOC_OPENER_RE`, `/tmp/(?!.*\.\.)
+# [\w./-]+`) with no `Path.resolve()`, no symlink following. This function
+# mirrors that exactly, and that choice is load-bearing, not cosmetic: an
+# EARLIER version of this fix resolved the destination via `Path.resolve()`
+# (following symlinks, same as `is_within_project`) before checking `/tmp`
+# membership — and broke the cpp#38 symlink-escape tests, because a worktree
+# symlink crafted to resolve INTO `/tmp` (`esc -> ../../../tmp`, then `mkdir
+# esc/x`) would resolve to a `/tmp` path and get exempted, even though the
+# pilot never wrote `/tmp` anywhere in the command. Matching on the LITERAL
+# operand text closes that: `_extract_mkdir_destinations` already returns the
+# raw, un-resolved shlex token, so a symlinked or otherwise indirect route to
+# `/tmp` simply does not match this pattern and falls straight through to the
+# ordinary containment veto below (cpp#38 unchanged, still catches it).
+#
+#   * The operand must LITERALLY start with `/tmp/`, contain no `..`
+#     anywhere (mirrors the heredoc's own `(?!.*\.\.)`, so `mkdir -p
+#     /tmp/../etc/evil` is rejected by the pattern itself — no resolve needed
+#     to catch it), and use the same restricted charset (`[\w./-]+`, no
+#     shell metacharacters — moot here since the operand already passed
+#     `shlex`, but kept identical to the heredoc's for one mental model).
+#   * Scoped to `mkdir` ONLY (`_segment_write_kind == "bash-mkdir"`) — `cp`/
+#     `mv`/`git show >` into `/tmp` are unaffected and still vetoed exactly as
+#     before. Symmetric with the heredoc exception (a `cat`-only carve-out) in
+#     spirit, but not merged into it: two structurally different call sites,
+#     matched independently, so neither can be widened by editing the other.
+_TMP_SCRATCH_MKDIR_RE = re.compile(r"^/tmp/(?!.*\.\.)[\w./-]+$")
+
+
+def _is_sanctioned_tmp_scratch(dest: str) -> bool:
+    """Whether an (already `mkdir`-classified) raw destination operand is the
+    sanctioned ``/tmp`` scratch exception (cpp#143).
+
+    Purely lexical — no filesystem access, no symlink resolution — matching
+    ``_is_sanctioned_pure_heredoc``'s own mechanism exactly. ``dest`` must be
+    the LITERAL, un-resolved operand (what ``_extract_mkdir_destinations``
+    returns): only a command that itself spells ``/tmp/...`` qualifies, so a
+    symlink or relative path that merely *resolves into* ``/tmp`` does not —
+    it is still caught by the ordinary containment veto below (cpp#38).
+    """
+    return bool(dest) and _TMP_SCRATCH_MKDIR_RE.match(dest) is not None
+
+
 def _destination_veto_reason(command: str, cwd: str) -> str | None:
     """Veto reason if any write-capable segment's destination escapes the
     worktree (cpp#38) or lands on the agent control plane (cpp#42); else ``None``.
@@ -754,10 +822,12 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
     Per-segment so a compound like ``mkdir a && cp s esc/x`` validates each write
     target independently. Each segment is classified STRUCTURALLY by its leading
     command word (``_segment_write_kind``) — never by a shadowable policy rule_id.
-    Order is load-bearing: CONTAINMENT first (the safety boundary), CONTROL-PLANE
-    second (layered policy on an already-contained path). Unparseable destinations
-    fail closed (vetoed). The caller has already established the whole command as
-    allow + chain-safe, so this only decides where the write lands.
+    Order is load-bearing: SANCTIONED-SCRATCH first (cpp#143, `mkdir` under
+    `/tmp` only — see the block above), then CONTAINMENT (the safety boundary),
+    then CONTROL-PLANE (layered policy on an already-contained path).
+    Unparseable destinations fail closed (vetoed). The caller has already
+    established the whole command as allow + chain-safe, so this only decides
+    where the write lands.
     """
     if not isinstance(command, str) or not command:
         return None
@@ -772,6 +842,8 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
                 "parsed — denied fail-closed"
             )
         for dest in dests:
+            if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest):
+                continue
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "
