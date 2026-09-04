@@ -348,6 +348,149 @@ def _is_sanctioned_pure_heredoc(command: str) -> bool:
     return all(not lines[k].strip() for k in range(j + 1, len(lines)))
 
 
+# ── Sanctioned read-only `for`-loop pipeline (cpp#151 volet A) ────────────────
+#
+# FOUNDING EVIDENCE. The pilot dispatched on mika#2158 died 2026-09-04T07:35Z
+# after 48 minutes, 20 turns and $6.25 on this command, which is READ-ONLY end
+# to end and is the nominal shape of grooming — reading the callouts of a batch
+# of tickets:
+#
+#     for n in 2127 2140 2108 1772 2151 2117; do
+#       echo "===== $n ====="
+#       gh issue view $n --repo senara-solutions/mika --json body -q .body \
+#         | grep -n "Grooming history\|> - \*\*Branch\|> - \*\*Plan"
+#     done
+#
+# WHY `bash-for-loop-safe-body` (permissions.yaml) DOES NOT COVER IT. Three
+# cumulative reasons: (1) the body carries TWO statements where that pattern
+# admits a single command from its list; (2) `gh` is not in the enumerated list;
+# (3) the body contains a pipe `|`, excluded by its ``[^;|&`><\\]`` argument
+# class — as are the `>` and `\` that appear INSIDE the grep pattern's
+# double-quoted string, where bash treats them as literal text. That last point
+# is why widening the YAML charset cannot work: safety here needs
+# quote-awareness, not a bigger character class. The refusal therefore landed on
+# `bash-grep` (``\sgrep\s``, matching ` grep ` anywhere), a rule never designed
+# to arbitrate a loop, whose policy `allow` was then chain-vetoed when
+# `_split_compound_command` re-split `do`/`done`.
+#
+# WHY THIS LIVES IN PYTHON, NOT IN THE YAML PATTERN. Same reason as
+# `_is_sanctioned_pure_heredoc` above: the safe shape needs quote state, and a
+# quote-aware grammar written as one flat YAML string is ~3 kB of unreviewable
+# regex. The shape is still ONE fully-anchored pattern (`^…\Z`) — it is merely
+# COMPOSED from named parts so each invariant can be read — and it is a
+# whole-command exemption honored at the same point as `bash-git-show-redirect`
+# (cpp#35), `bash-for-loop-safe-body` (cpp#92) and `bash-explore-script-fallback`
+# (cpp#100). It is reached only AFTER the here-string / heredoc /
+# substitution-marker / bare-`&` vetoes.
+#
+# WHAT IT DOES NOT DO. It never turns a `deny` into an `allow`: the caller only
+# consults it on a policy `allow`, so `gh-issue-create-deny` and every other
+# explicit deny keep their verdict. And it grants no write capability — write
+# capability is classified STRUCTURALLY by each segment's leading command word
+# at the single chokepoint below (see the `_LEADING_CMD_RE` design note), never
+# by which rule matched, so widening a benign shape cannot smuggle a write past
+# the destination veto.
+
+# One horizontal blank: a space, a tab, or a backslash line-continuation. A BARE
+# newline is deliberately NOT a blank here — inside a command it would let
+# `echo x\nrm -rf ~` read as `echo` with the arguments `x rm -rf ~`. Newlines are
+# statement separators only (`_FOR_STMT_SEP`).
+_FOR_BLANK = r"(?:[ \t]|\\\r?\n)"
+
+# Statement separator inside the loop body: `;` or a newline, either padded.
+_FOR_STMT_SEP = r"(?:[ \t]*(?:;|\r?\n)[ \t]*)+"
+
+# One argument, quote-aware. A double-quoted region may hold `|`, `>`, `\` and
+# `$var` because bash treats them as text there — that is exactly the grep
+# pattern of the founding evidence. `$(`/backtick/`$'` cannot reach here (vetoed
+# by the caller AND by this helper's own guard), so an admitted `$` is a bare
+# parameter expansion. A single-quoted region is inert by bash semantics. A bare
+# token excludes every chain metacharacter, redirect, escape, quote, subshell
+# paren and brace.
+_FOR_ARG = (
+    r'(?:"[^"\\]*(?:\\[^\n][^"\\]*)*"'  # "…" with \X escape pairs
+    r"|'[^'\n]*'"  # '…' fully inert
+    r"|[^\s;|&`><\\'\"(){}]+)"  # bare token
+)
+
+# The closed-world set of body commands. Read-only, no `eval`/`sh`/`bash`, no
+# writer. The `(?![\w.\-/])` tail stops `cat` from claiming `catastrophe`.
+#   - `find` additionally rejects its ACTION flags: `-delete` and the `-exec`
+#     family execute arbitrary programs, `-fprint*`/`-fls` write files. The old
+#     YAML charset excluded `\;` but NOT `-exec … {} +`, so this closes a
+#     pre-existing hole rather than opening one. The lookahead scans to end of
+#     line, so an unrelated `-delete` later on the same line over-blocks — the
+#     safe direction.
+#   - `gh` is admitted only on the read verbs already sanctioned as standalone
+#     rules (`bash-gh-issue-read`, `bash-gh-pr-read`). `gh` as a bare word is
+#     NOT admitted: `gh pr merge` / `gh api -X POST` write to GitHub, and no
+#     filesystem-level guard would catch them — the structural write
+#     classification below sees files, not remote state.
+_FOR_CMD_WORD = (
+    rf"(?:gh{_FOR_BLANK}+(?:issue{_FOR_BLANK}+(?:view|list)"
+    rf"|pr{_FOR_BLANK}+(?:view|list|diff|checks))(?![\w.\-/])"
+    r"|find(?![\w.\-/])"
+    r"(?![^\n]*(?:-delete|-exec|-execdir|-ok|-okdir|-fprint|-fls|-fprintf)\b)"
+    r"|(?:echo|printf|grep|cat|head|tail|ls|wc|test|dirname|basename)(?![\w.\-/])"
+    r"|\[)"
+)
+
+_FOR_CMD = rf"{_FOR_CMD_WORD}(?:{_FOR_BLANK}+{_FOR_ARG})*{_FOR_BLANK}*"
+_FOR_PIPELINE = rf"{_FOR_CMD}(?:\|{_FOR_BLANK}*{_FOR_CMD})*"
+_FOR_BODY = rf"{_FOR_PIPELINE}(?:{_FOR_STMT_SEP}{_FOR_PIPELINE})*"
+
+# Iteration set: no chain metacharacter, redirect, escape, newline, paren or
+# brace. `$var` is permitted (substitution vetoed upstream), `*` globs are inert.
+_FOR_IN_LIST = r"[^\s;|&`><\\\n(){}][^;|&`><\\\n(){}]*"
+
+_FOR_HEAD = (
+    rf"for{_FOR_BLANK}+\w+{_FOR_BLANK}+in{_FOR_BLANK}+{_FOR_IN_LIST}"
+    rf"[ \t]*;[ \t]*do(?:{_FOR_BLANK}|\r?\n)+"
+)
+
+# Optional `cd <target> && ` prefix (AC3). The target must be WORKTREE-RELATIVE:
+# no leading `/`, no `~`, no `..` anywhere, no `$` (so `cd $FOO` is refused), no
+# quotes (so `cd 'a b'` is refused), no metacharacter. This constraint is not
+# optional: `_destination_veto_reason` covers WRITES only, so without it
+# `cd /etc && for f in passwd; do cat $f; done` would be a read outside the
+# worktree. The character class is NEGATIVE, not an ASCII allowlist — this
+# repository's own paths are French (`docs/décisions/…`) and an ASCII-only class
+# would refuse them while claiming to be about metacharacters.
+# RESIDUAL (accepted, same as `bash-git-show-redirect` / `bash-cp-mv` /
+# `bash-mkdir`): a static target check is blind to SYMLINK traversal — cpp#38.
+_FOR_CD_PREFIX = (
+    rf"(?:cd{_FOR_BLANK}+(?![-~/])(?:(?!\.\.)[^\s;|&`><\\'\"(){{}}$~])+/?"
+    rf"{_FOR_BLANK}*&&{_FOR_BLANK}*)?"
+)
+
+# `\Z` (end of string), not `$` (which also matches before a trailing newline)
+# — strictly stronger than the `^…$` anchoring the sibling YAML rules use.
+_SANCTIONED_READONLY_FOR_LOOP_RE = re.compile(
+    rf"^{_FOR_CD_PREFIX}{_FOR_HEAD}{_FOR_BODY}{_FOR_STMT_SEP}done\s*\Z"
+)
+
+
+def _is_sanctioned_readonly_for_loop(command: str) -> bool:
+    """True for a ``for`` loop whose body is a read-only pipeline (cpp#151 A).
+
+    Optionally prefixed by ``cd <worktree-relative-dir> && ``. The body may hold
+    several statements separated by ``;`` or newlines, and each statement may be
+    a pipeline of the enumerated read-only commands. Fully anchored, so nothing
+    rides before ``for`` or after ``done``. Conservative on any ambiguity →
+    False, and the caller then vetoes.
+
+    The substitution guard is repeated here rather than assumed. The caller
+    already vetoes ``$(`` / backtick / ``$'`` before reaching this point (and
+    rewrites allowlisted ``$(…)`` to an inert placeholder first), but a helper
+    whose safety depends on where it is called from is one refactor away from
+    being wrong. Standing on its own, an admitted ``$`` is a bare parameter
+    expansion.
+    """
+    if "`" in command or "$(" in command or "$'" in command:
+        return False
+    return bool(_SANCTIONED_READONLY_FOR_LOOP_RE.match(command))
+
+
 def _bash_allow_is_chain_safe(
     policy: Policy, tool_name: str, tool_input: dict[str, Any]
 ) -> bool:
@@ -450,6 +593,28 @@ def _bash_allow_is_chain_safe(
     # dropped, this never fires and dispatch reverts to the compound-split
     # veto (safe direction).
     if pd.decision == "allow" and pd.rule_id == "bash-explore-script-fallback":
+        return True
+
+    # Read-only `for`-loop pipeline (cpp#151 volet A) — sanctioned exception in
+    # the same family as the three above, but keyed on the COMMAND SHAPE rather
+    # than on a rule_id. The shape has no rule of its own to name: the refusal
+    # that founded it arrived under `bash-grep`, because ``\sgrep\s`` matches
+    # ` grep ` inside a loop body and claims the rule_id first (`policy.evaluate`
+    # is first-match-wins). Keying on `bash-grep` would be wrong twice over — it
+    # would fire for commands that merely mention grep, and it would miss the
+    # same loop written without grep. `_is_sanctioned_readonly_for_loop` proves
+    # the whole command instead, fully anchored.
+    #
+    # The `pd.decision == "allow"` guard is load-bearing, not decoration: it
+    # keeps an explicit `deny` rule (`gh-issue-create-deny`) authoritative. The
+    # shape check runs AFTER the substitution / heredoc / bare-`&` vetoes above
+    # (and after allowlisted `$(…)` redaction), which is what makes a `$` inside
+    # the loop provably a bare parameter expansion.
+    #
+    # Fails CLOSED: if the helper stops matching, the command routes to the
+    # segment split below, which vetoes on `do <body>` / `done` — the pre-cpp#151
+    # behaviour that killed three pilot sessions, but the safe direction.
+    if pd.decision == "allow" and _is_sanctioned_readonly_for_loop(command):
         return True
 
     segments = _split_compound_command(command)

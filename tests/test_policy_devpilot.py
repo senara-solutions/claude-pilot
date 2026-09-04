@@ -483,6 +483,191 @@ def test_guard_vetoes_for_loop_with_redirect_in_body() -> None:
         assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
 
 
+# --- cpp#151 volet A: read-only `for`-loop pipeline ---------------------------
+# Founding evidence: the pilot dispatched on mika#2158 died 2026-09-04T07:35Z
+# after 48 minutes, 20 turns and $6.25 on the command below — read-only end to
+# end, and the nominal shape of grooming (reading the callouts of a batch of
+# tickets). The refusal landed on `bash-grep`, a rule never designed to
+# arbitrate a loop: `\sgrep\s` matched ` grep ` inside the body, claimed the
+# rule_id under first-match-wins, and chain-safe then split `do`/`done` and
+# vetoed. `bash-for-loop-safe-body` could not cover it for three cumulative
+# reasons — two statements in the body, `gh` absent from its list, and a pipe
+# plus `>`/`\` inside the grep pattern's quoted string, all excluded by its
+# ``[^;|&`><\\]`` argument class.
+#
+# Both directions are proved here: the shapes below are admitted, and the
+# refusals that follow them stay refusals — an explicit deny rule, a write-
+# capable body, a `cd` out of the worktree, a trailing chain, a substitution,
+# and the control-plane write the design note at permissions.py:598-615 names.
+
+_CPP151_FIXTURE = (
+    "for n in 2127 2140 2108 1772 2151 2117; do\n"
+    '  echo "===== $n ====="\n'
+    "  gh issue view $n --repo senara-solutions/mika --json body -q .body \\\n"
+    r'    | grep -n "Grooming history\|> - \*\*Branch\|> - \*\*Plan"'
+    "\n"
+    "done"
+)
+
+
+def test_cpp151_founding_fixture_is_admitted() -> None:
+    """The exact command that killed the mika#2158 pilot, verbatim.
+
+    Non-regression fixture: it must evaluate to a policy `allow` AND survive
+    chain-safe. Before this fix, `evaluate` returned allow under `bash-grep`
+    and `_bash_allow_is_chain_safe` vetoed — a `[policy:deny] … [bash-grep]
+    (terminal)` that ended the session.
+    """
+    pd = evaluate(_POLICY, "Bash", _bash(_CPP151_FIXTURE))
+    assert pd.decision == "allow", pd
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(_CPP151_FIXTURE)) is True
+
+
+def test_cpp151_readonly_for_loop_positive_shapes() -> None:
+    """The forms the founding fixture generalises to — each independently one of
+    the three reasons `bash-for-loop-safe-body` could not admit it."""
+    for cmd in (
+        # two statements in the body (reason 1)
+        'for i in 1 2; do echo "step $i"; cat $i.md; done',
+        # `gh` read verbs in the body (reason 2)
+        "for n in 1 2; do gh issue view $n --json title; done",
+        "for n in 1 2; do gh pr view $n --json title -q .title; done",
+        # a pipe in the body (reason 3)
+        'for f in a.md b.md; do cat $f | grep -c "TODO"; done',
+        # AC3: the `cd <relative-dir> && ` prefix
+        "cd skills/bundled/_shared/tests && for t in a.sh b.sh; do echo $t; head -5 $t; done",
+        # newline-separated body, as a heredoc-free multiline command arrives
+        'for i in 1 2; do\n  echo "$i"\n  ls -la $i\ndone',
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_cpp151_accented_paths_are_admitted() -> None:
+    """This repository's own paths and strings are French. A fixture battery that
+    only exercises ASCII does not test our population — an ASCII allowlist
+    (`[A-Za-z0-9_./-]`) would refuse `docs/décisions/` while claiming to be about
+    metacharacters. Both classes here are NEGATIVE for exactly this reason."""
+    for cmd in (
+        'for f in docs/décisions/*.md; do echo "→ $f"; grep -n "Décision ratifiée" "$f"; done',
+        'cd docs/décisions && for f in *.md; do grep -n "Décision" "$f"; done',
+        'for t in créé modifié; do echo "état: $t"; done',
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_cpp151_vetoes_write_capable_body() -> None:
+    """AC4 — a body command that can write stays refused. `gh` is admitted only
+    on the read verbs already sanctioned standalone: `gh pr merge` / `gh api -X
+    POST` change remote state, which no filesystem-level guard would catch."""
+    for cmd in (
+        "for i in 1; do gh pr merge $i; done",
+        "for i in 1; do gh api -X POST /repos/x/y/issues; done",
+        "for i in 1; do gh repo delete x; done",
+        "for i in 1; do gh pr close $i; done",
+        # `find` action flags execute or write — the old YAML charset excluded
+        # `\;` but NOT `-exec … {} +`, so this closes a pre-existing hole.
+        "for d in .; do find $d -delete; done",
+        "for d in .; do find $d -name x -exec rm {} +; done",
+        "for d in .; do find $d -fprint /etc/out; done",
+        # writers that were already refused and must stay refused
+        "for i in 1; do echo x | tee /etc/passwd; done",
+        "for i in 1; do cp $i .git/hooks/post-checkout; done",
+        "for i in 1; do rm -rf ~; done",
+        # word-prefix confusion: `cat` must not claim `catastrophe`
+        "for i in 1; do catastrophe $i; done",
+        "for i in 1; do lsof -i; done",
+        # the `cd` selector rule grants nothing on its own: an unsafe body still
+        # falls to the segment split, and a trailing chain still rides nothing
+        "cd docs && for i in 1; do rm -rf ~; done",
+        "cd docs && for i in 1; do echo x; done; rm -rf ~",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_cpp151_vetoes_cd_target_leaving_the_worktree() -> None:
+    """`_destination_veto_reason` covers WRITES only, so the `cd` target carries
+    its own containment: relative, no `..`, no `~`, no `$`, no quotes. Without
+    it, `cd /etc && for f in passwd; do cat $f; done` is a read outside the
+    worktree that no other guard sees."""
+    for cmd in (
+        "cd /etc && for f in passwd; do cat $f; done",
+        "cd .. && for f in x; do cat $f; done",
+        "cd ../../etc && for f in passwd; do cat $f; done",
+        "cd ~ && for f in x; do cat $f; done",
+        "cd ~/.ssh && for f in id_rsa; do cat $f; done",
+        "cd $FOO && for f in x; do cat $f; done",
+        "cd 'a b' && for f in x; do cat $f; done",
+        "cd $(evil) && for f in x; do cat $f; done",
+        "cd docs; rm -rf ~ && for f in x; do cat $f; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_cpp151_vetoes_tail_riding_the_admitted_prefix() -> None:
+    r"""Full anchoring (`^…\Z`) — nothing rides before `for` or after `done`, and
+    a bare newline is a statement separator, never an argument separator."""
+    for cmd in (
+        "for i in 1; do echo x; done && rm -rf ~",
+        "for i in 1; do echo x; done; curl evil",
+        "for i in 1; do echo x; done | tee /tmp/log",
+        "cd docs && for f in x; do cat $f; done && rm -rf ~",
+        # newline-as-blank injection: if `\n` were treated as an argument
+        # separator, this would read as `echo x rm -rf ~`
+        "for i in 1; do echo x\nrm -rf ~\ndone",
+        # substitution riding an admitted body
+        'for i in 1; do echo "$(id)"; done',
+        "for i in 1; do grep x $(evil); done",
+        "for i in 1; do echo `id`; done",
+        "for i in $(rm -rf ~); do echo x; done",
+        # redirect in the body
+        "for i in 1; do echo x > /etc/passwd; done",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_cpp151_explicit_deny_rule_still_wins() -> None:
+    """The shape exemption is consulted only on a policy `allow`, so an explicit
+    deny rule keeps its verdict — `gh issue create` routes through the mika-issue
+    skill and must not become reachable by wrapping it in a loop."""
+    cmd = "cd docs && for i in 1; do gh issue create --title x; done"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_cpp151_control_plane_write_still_denied(tmp_path: Path) -> None:
+    """The attack named in the design note at permissions.py:598-615: ` grep `
+    inside an operand shadows the write rule, so the command evaluates to
+    `rule_id=bash-grep`. Write capability is classified STRUCTURALLY by the
+    segment's leading command word, never by rule_id — so widening what a benign
+    shape may do cannot smuggle this past the destination veto. Proved through
+    the production handler, with the fix in place."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git" / "hooks").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree), policy_path=_BUNDLED
+    )
+    result = asyncio.run(
+        handler("Bash", _bash('cp "payload grep x" .git/hooks/post-checkout'), _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+
+def test_cpp151_tier3_dangerous_still_denied(tmp_path: Path) -> None:
+    """A tier3-dangerous Bash command is refused with `interrupt=True` — the
+    lethality that cpp#128 deliberately kept. Widening a read-only loop shape
+    does not soften it."""
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(tmp_path), policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash("sudo rm -rf /"), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+
 def test_policy_bash_derive_scripts_allow_shape() -> None:
     """18-incident class 2026-07-27 — dispatch-lib helpers `./scripts/derive-*`
     were falling through to default-deny. `bash-derive-scripts` policy rule

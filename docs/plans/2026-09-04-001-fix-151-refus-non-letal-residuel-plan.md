@@ -563,3 +563,122 @@ pilote n'a été lancée pendant ce travail. C'est exactement ce que mesure AC5 
 la fenêtre fraîche, et c'est pourquoi le levier de retrait
 (`CLAUDE_PILOT_MAX_DENY_RESUMES=0`) est documenté et testé : il laisse B0+B1
 debout, qui ne dépendent d'aucune hypothèse.
+
+---
+
+## Journal d'exécution — volet (A), 2026-09-04
+
+GO opérateur reçu pour **(A)**. Vincent, verbatim : *« Go volet A »*, 2026-09-04
+10:10 CEST, consigné en commentaire du ticket à 10:12. Le bandeau HOLD est levé
+pour ce volet et pour lui seul.
+
+### Ce qui a été livré, et pourquoi c'est plus large qu'A1
+
+Le plan décrivait A1 comme *« le motif de `bash-for-loop-safe-body` étendu d'un
+préfixe optionnel `cd <chemin-relatif> && ` »*. La commande qui a déclenché le
+GO n'est pas de cette forme — elle n'a **pas** de préfixe `cd` :
+
+```
+for n in 2127 2140 2108 1772 2151 2117; do
+  echo "===== $n ====="
+  gh issue view $n --repo senara-solutions/mika --json body -q .body \
+    | grep -n "Grooming history\|> - **Branch\|> - **Plan"
+done
+```
+
+Trois raisons cumulatives l'excluent de `bash-for-loop-safe-body` : deux
+instructions dans le corps là où le motif n'en admet qu'une ; `gh` absent de la
+liste énumérée ; un tube `|` dans le corps, exclu par la classe d'arguments
+``[^;|&`><\\]``. Cette dernière raison est structurelle et pas seulement
+quantitative : le motif `grep` porte, **à l'intérieur d'une chaîne entre
+guillemets**, un `>` et des `\` que bash traite comme du texte. Élargir la
+classe de caractères ne peut donc pas suffire — il faut une reconnaissance qui
+sait où commencent et où finissent les guillemets.
+
+Livré : **A1 (le préfixe `cd`, AC3) et la forme du corps qui a déclenché le
+GO**, portées ensemble par une même reconnaissance ancrée.
+
+**A2/A3 restent non livrés et gardent leur GO distinct.** Ils portent
+l'exécution de scripts depuis une boucle (`bash <chemin>.sh`) ; aucune commande
+de cette nature n'est admise ici. La frontière est vérifiable : la liste fermée
+des commandes de corps ne contient ni `bash`, ni `sh`, ni `eval`, ni `./…`.
+
+### Où vit la sûreté, et pourquoi pas dans le motif YAML
+
+`_is_sanctioned_readonly_for_loop` (`src/claude_pilot/permissions.py`) porte la
+forme entière, ancrée `^…\Z`, composée de parties nommées. C'est le précédent
+`_is_sanctioned_pure_heredoc` : la forme sûre a besoin de l'état de citation, et
+une grammaire consciente des guillemets écrite en une seule chaîne YAML plate
+fait ~3 ko de regex non relisible. Un correctif de sécurité illisible est un
+mauvais correctif.
+
+L'exemption est honorée au **même point** que `bash-git-show-redirect` (cpp#35),
+`bash-for-loop-safe-body` (cpp#92) et `bash-explore-script-fallback` (cpp#100) —
+dans `_bash_allow_is_chain_safe`, après les vetos de sous-chaîne, de heredoc, de
+here-string et de `&` nu. C'est ce qui rend le `$` admis provablement une simple
+expansion de paramètre.
+
+Elle est clavetée sur la **forme de la commande**, pas sur un `rule_id`. Le
+refus fondateur est arrivé sous `bash-grep` parce que ``\sgrep\s`` matche
+` grep ` n'importe où et rafle le `rule_id` en premier-arrivé-premier-servi.
+S'accrocher à `bash-grep` serait faux deux fois : la règle se déclencherait pour
+des commandes qui ne font que mentionner `grep`, et elle manquerait la même
+boucle écrite sans `grep`. Le motif de `bash-grep` n'est donc pas touché.
+
+Une règle YAML de sélection, `bash-cd-for-loop-orientation`, est ajoutée pour la
+seule forme `cd <dir> && for …` : sans elle, la commande ne matche **aucune**
+règle et meurt sur le défaut de politique avant que chain-safe soit consulté.
+Elle n'accorde rien par elle-même — même contrat que `bash-for-loop-orientation`
+juste au-dessus.
+
+### Ce qui reste refusé, et qui le prouve
+
+Non-régression **dans les deux sens**, comme (B) l'a fait.
+
+| Ce qui doit rester refusé | Test |
+|---|---|
+| `cp "payload grep x" .git/hooks/post-checkout` (l'attaque du commentaire ligne 607) | `test_cpp151_control_plane_write_still_denied`, via le handler de production, `interrupt=True` |
+| Substitution en queue d'un préfixe autorisé | `test_cpp151_vetoes_tail_riding_the_admitted_prefix` |
+| Bash tier3-dangereux | `test_cpp151_tier3_dangerous_still_denied` |
+| Veto de destination | idem ligne 1, plus les 8 cas préexistants de `test_dest_validator_shadow_rule_and_quoted_dest_denied` |
+| Corps capable d'écrire (`gh pr merge`, `gh api -X POST`, `find -delete`, `tee`, `cp`, `rm`) | `test_cpp151_vetoes_write_capable_body` |
+| Cible de `cd` hors worktree (`/etc`, `..`, `~`, `$FOO`, `'a b'`, `$(evil)`) | `test_cpp151_vetoes_cd_target_leaving_the_worktree` |
+| Règle `deny` explicite (`gh issue create` enveloppé dans une boucle) | `test_cpp151_explicit_deny_rule_still_wins` |
+
+**Vacuité vérifiée par neutralisation**, méthode héritée de (B) :
+
+- correctif retiré → les **trois** tests positifs rougissent, dont le cas
+  accentué ; les six négatifs restent verts (ils ne dépendent pas de lui) ;
+- contrainte de confinement du `cd` relâchée → `test_cpp151_vetoes_cd_target_leaving_the_worktree`
+  rougit sur `cd /etc && …`. La garde n'est donc pas décorative.
+
+### Deux trous préexistants fermés au passage, et pourquoi ils l'ont été ici
+
+Écrire la batterie de non-régression contre la règle sœur — pas contre le
+ticket — en a montré deux, tous deux dans `bash-for-loop-safe-body` :
+
+1. **`find` sans garde d'action.** La classe d'arguments exclut `;`, donc
+   `-exec … \;` ne matchait pas ; mais `find . -name x -exec rm {} +` et
+   `find . -delete` passaient. Fermé par un lookahead négatif sur les drapeaux
+   d'action.
+2. **Confusion de préfixe de mot.** `cat` raflait `catastrophe`, `ls` raflait
+   `lsof` : un binaire arbitraire dont le nom commence par un mot de la liste
+   s'exécutait sous une liste blanche fermée. Fermé par `(?![\w.\-/])`.
+
+Ils sont corrigés plutôt que fichés parce que le commentaire de sécurité que ce
+travail ajoute affirme que la liste est fermée. La laisser ouverte aurait rendu
+ce commentaire faux — et un commentaire de sécurité faux est pire qu'absent.
+
+### Résidus nommés, non fermés ici
+
+- **Aveuglement aux liens symboliques (cpp#38).** La vérification statique de la
+  cible du `cd` rejette `..` littéral mais ne voit pas une traversée par lien
+  symbolique commité. Même résidu que `bash-git-show-redirect`, `bash-cp-mv` et
+  `bash-mkdir` ; nommé dans le plan avant l'implémentation, inchangé après.
+- **Sur-blocage assumé sur `2>/dev/null`.** Le `>` reste exclu du corps, donc
+  `for … do cmd 2>/dev/null; done` reste refusé. C'est le statu quo de la règle
+  sœur ; l'élargir demanderait de distinguer une redirection de fd d'une
+  redirection de fichier, ce que ce ticket ne demande pas.
+- **AC5 reste non mesuré**, et pour la même raison qu'en (B) : la fenêtre se
+  compte après déploiement du binaire. Ce volet n'y change rien — il retire une
+  cause de mort, il ne mesure pas le taux.
