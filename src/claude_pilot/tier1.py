@@ -240,9 +240,149 @@ def is_tier3_dangerous(command: str) -> bool:
 _STDOUT_DEVNULL_RE = re.compile(r"\d*>{1,2}\s*/dev/null(?![/\w.])")
 
 
+# ── Contained redirect targets are not on their own session-fatal (cpp#154) ───
+#
+# cpp#130 (just above) removed ONE redirect target from the lethality class: the
+# inert `/dev/null` sink. Its own docstring left the rest as debt — "widening the
+# exemption to in-worktree targets is left to the destination veto
+# (`permissions._destination_veto_reason`)". cpp#154 measured that the
+# destination veto CANNOT carry it: `_segment_write_kind` classifies only
+# `cp`/`mv`, `mkdir` and `git show >`, so a redirect is invisible to it —
+# `echo hi > /etc/passwd` returns `_destination_veto_reason = None`. The
+# widening therefore lands HERE, where cpp#130 left it.
+#
+# What it buys, measured: three claude-pilot sessions on mika#2158 died in one
+# day (2026-09-04) on a denial whose CAUSE was pure FORM — a chain
+# `_bash_allow_is_chain_safe` cannot honour — while the command only wrote a
+# working file. Callbacks `193e368c` (~47 min) and `ce63ad41` (~1 h) on
+# `mkdir -p … && for n in …; do gh issue view … > …/$n.md 2>…/$n.err …; done`;
+# `0c3ba346` on `cat > /tmp/probe_test.rs <<'EOF' … python3 - <<'PY' …` — 155
+# turns, 8 commits pushed, PR never opened. The refusal is CORRECT in all three
+# (the chain really is unsafe); only its lethality was not.
+#
+# The mechanism is LEXICAL, never resolved on disk — the same load-bearing
+# choice `_is_sanctioned_tmp_scratch` documents at `permissions.py:922-968`: an
+# earlier version of THAT fix called `Path.resolve()` and broke the cpp#38
+# symlink-escape tests, because a worktree symlink crafted to resolve into
+# `/tmp` got exempted although the pilot never spelled `/tmp`. Matching the
+# LITERAL operand text closes that. Nothing here touches the filesystem, and
+# `is_tier3_dangerous_for_lethality` keeps its `(command: str) -> bool`
+# signature — no `cwd` is threaded in.
+#
+# EXTRACTED forms (they name a file; the target is validated):
+#   `>`  `>>`  `N>`  `N>>`   — with or without a space before the target
+#   `&>` `&>>`               — combined stdout+stderr; these DO write a file
+# IGNORED forms (they name no file; leaving them in place keeps the generic `>`
+# pattern matching, so lethality holds — fail-closed by construction):
+#   `>&M` `N>&M`             — fd duplication (`2>&1`), operand is a descriptor
+#   `>&-`                    — fd close
+#   `>(` `<(`                — process substitution, already covered by its own
+#                              `>\(` / `<\(` entries in TIER3_PATTERNS
+#
+# `[ \t]*` and NOT `\s*` between the operator and the target is load-bearing: a
+# real redirect operand always sits on the same line, and `\s*` would let a
+# line-final `>` swallow the FIRST TOKEN OF THE NEXT LINE as its target — so
+# `"echo done >\nbash -c 'id'"` would strip to `"echo done   -c 'id'"` and lose
+# the `bash -c` match. Blanking a redirect must never blank a verb.
+_REDIRECT_RE = re.compile(
+    r"(?P<op>(?:&|\d*)>{1,2})"
+    r"(?:(?P<ignored>&[\d-]|\()|[ \t]*(?P<target>[^\s;&|<>()]*))"
+)
+
+# Same charset as cpp#143's `_TMP_SCRATCH_MKDIR_RE` (`[\w./-]`) PLUS `$`, `{`,
+# `}` for parameter expansion and `@` (ordinary in a filename). The `$` is not
+# decoration: the two `mkdir` deaths redirect to `/tmp/2158bodies/$n.md`, so a
+# charset that excluded `$` would let AC3 fail while claiming to fix the ticket.
+# The residue is named and bounded — a MID-PATH `$n` could expand at runtime to
+# `../../x` and the lexical test would not see it — but the command is NEVER
+# EXECUTED (we are deciding the lethality of an already-pronounced refusal, so
+# no byte is written), and no probing oracle opens, because this class is
+# refused by its FORM: no spelling of the destination flips a chain-unsafe
+# denial into an allow.
+#
+# A LEADING `$` is a different matter and is rejected outright below: `$HOME/x`,
+# `${HOME}/.bashrc` and `$OLDPWD/y` name the same destinations as `~/x`, and
+# admitting them would make the `~` disqualifier one respelling away from
+# useless. A `$` that is not the head of a parameter name — `$(whoami)`, a bare
+# or trailing `$` — is rejected for the same reason: the target text names
+# nothing this predicate can reason about, so it fails closed.
+_CONTAINED_REDIRECT_TARGET_RE = re.compile(r"^[\w./$@{}-]+$")
+_BARE_DOLLAR_RE = re.compile(r"\$(?![A-Za-z_{])")
+
+
+def _is_contained_redirect_target(dest: str) -> bool:
+    """Whether a LITERAL redirect target text is contained: in-worktree (relative)
+    or under ``/tmp`` (cpp#154).
+
+    Purely lexical on the text as written — no ``Path.resolve()``, no ``stat``,
+    no ``cwd``. ``/dev/null`` is covered upstream by ``_STDOUT_DEVNULL_RE`` and
+    is deliberately NOT duplicated here (an absolute path outside ``/tmp/``
+    returns False).
+    """
+    if not dest:
+        return False
+    if ".." in dest:
+        return False
+    if dest.startswith("~") or dest.startswith("$"):
+        return False
+    if _CONTAINED_REDIRECT_TARGET_RE.match(dest) is None:
+        return False
+    if _BARE_DOLLAR_RE.search(dest) is not None:
+        return False
+    if dest.startswith("/"):
+        return dest.startswith("/tmp/")
+    return True
+
+
+def _redirect_targets(command: str) -> list[str] | None:
+    """Every file target the command redirects to, in order; ``None`` if any
+    redirect's target cannot be extracted (cpp#154).
+
+    Fail-closed: ``None`` means the caller must treat the command as
+    un-contained — i.e. exactly ``main``'s behaviour, lethal. Descriptor
+    duplication (``2>&1``), fd close (``>&-``) and process substitution
+    (``>(``) name no file and are skipped, not failures.
+
+    NOT quote-aware, by construction. A quoted or escaped target
+    (``> "/tmp/a b.md"``, ``> a\\ b.txt``) is returned with its quote characters
+    attached; ``_is_contained_redirect_target``'s charset then rejects it, so
+    the redirect is not stripped and the command stays lethal. The two helpers
+    are coupled on purpose — the fail-closed direction is the charset's, not
+    this function's — and a test pins the coupling so a future charset widening
+    cannot silently exempt a quoted target.
+    """
+    targets: list[str] = []
+    for m in _REDIRECT_RE.finditer(command):
+        if m.group("ignored") is not None:
+            continue
+        target = m.group("target")
+        if not target:
+            return None
+        targets.append(target)
+    return targets
+
+
+def _strip_contained_redirects(command: str) -> str:
+    """Blank out each redirect whose target is contained; leave every other
+    redirect in place so the generic ``>`` pattern keeps matching (cpp#154)."""
+    if _redirect_targets(command) is None:
+        return command
+
+    def _replace(m: re.Match[str]) -> str:
+        if m.group("ignored") is not None:
+            return m.group(0)
+        target = m.group("target")
+        if target and _is_contained_redirect_target(target):
+            return " "
+        return m.group(0)
+
+    return _REDIRECT_RE.sub(_replace, command)
+
+
 def is_tier3_dangerous_for_lethality(command: str) -> bool:
-    """`is_tier3_dangerous`, but a redirect to the inert /dev/null sink is not on
-    its own session-fatal (cpp#130).
+    """`is_tier3_dangerous`, but a redirect whose target writes nowhere
+    (`/dev/null`, cpp#130) or writes a CONTAINED working file (under `/tmp` or
+    relative to the worktree, cpp#154) is not on its own session-fatal.
 
     Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
     decision cpp#129 split from the refusal. The refusal path keeps calling the
@@ -251,14 +391,29 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
     ``tool_result`` error it can adapt (reach for `2>&1 | tail` or a native tool)
     instead of having the run killed.
 
-    A genuinely dangerous command remains fatal even when it also redirects to
-    /dev/null: the strip removes only the /dev/null sink, so `rm -rf x >/dev/null`
-    still matches the `rm -rf` pattern, and `> /etc/passwd` (a real write target)
-    is never stripped. Widening the exemption to in-worktree targets is left to
-    the destination veto (`permissions._destination_veto_reason`), which cpp#130
-    deliberately does not touch.
+    A genuinely dangerous command remains fatal even when it also redirects to a
+    stripped target: the strips remove only the redirect, so `rm -rf x >/dev/null`
+    and `rm -rf x > /tmp/log` still match the `rm -rf` pattern. A target that is
+    NOT contained is never stripped, so `> /etc/passwd` (absolute, outside /tmp),
+    `> ../x` and `> /tmp/../etc/x` (`..`), and `> ~/x` (`~`) all stay fatal.
+
+    cpp#154 supersedes cpp#130's parting sentence, which left the in-worktree
+    widening "to the destination veto (`permissions._destination_veto_reason`)".
+    That veto CANNOT carry it: `_segment_write_kind` classifies only `cp`/`mv`,
+    `mkdir` and `git show >`, so a bare redirect never reaches it —
+    `echo hi > /etc/passwd` measures `_destination_veto_reason = None`. The
+    widening therefore lands here, in the same function, applied AFTER the
+    /dev/null strip so cpp#130's trailing-boundary edge cases (`/dev/null.txt`,
+    `/dev/nullified`, `/dev/null/../etc/passwd`) keep their own behaviour.
+
+    ORDER IS LOAD-BEARING: /dev/null first (cpp#130), contained targets second
+    (cpp#154). Both live in this one function, and `_denial_is_terminal` is the
+    single consumer — cpp#151 B0 collapsed three separate lethality computations
+    into one precisely so two notions of "fatal" could not drift apart.
     """
-    return is_tier3_dangerous(_STDOUT_DEVNULL_RE.sub(" ", command))
+    return is_tier3_dangerous(
+        _strip_contained_redirects(_STDOUT_DEVNULL_RE.sub(" ", command))
+    )
 
 
 # ── Model-facing prevention hint (mika#1409) ─────────────────────────────────
@@ -301,10 +456,14 @@ DENIED_BASH_PATTERNS_HINT: str = """\
 
 The permission policy DENIES the Bash patterns below. A denied call costs you a
 turn and comes back as an error you must work around. Some of them — `sed -i`,
-shell redirects (`>`, `>>`), `eval`, `bash -c`, `sh -c`, and anything writing
-outside this worktree — additionally END this session immediately, with no
-retry and no recovery. Never reach for any of them; use the auto-approved native
-tool, which accomplishes the same goal:
+`eval`, `bash -c`, `sh -c`, and anything writing outside this worktree —
+additionally END this session immediately, with no retry and no recovery. A
+shell redirect (`>`, `>>`) is DENIED but recoverable when its target is a
+working file inside this worktree or under `/tmp`; it still ENDS the session
+when the target is anywhere else, on the agent control plane (`.git/`,
+`.claude/`, `.github/workflows/`, `.mika/`, `skills/bundled/`), or escapes the
+worktree through a symlink (cpp#154). Never reach for any of them; use the
+auto-approved native tool, which accomplishes the same goal:
 
 - `find … -exec`/`-execdir`/`-ok`/`-okdir` with a NON-read-only inner command
   (e.g. `find … -exec rm`, `find … -exec sh -c …`, `find … -exec sudo …`), and

@@ -27,6 +27,8 @@ from .guardrails import SessionGuardrails
 from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
+    _is_contained_redirect_target,
+    _redirect_targets,
     _split_compound_command,
     is_safe_bash_command,
     is_tier1_auto_approve,
@@ -678,8 +680,14 @@ def _bash_allow_is_chain_safe(
 #     the pattern check. Such a command stays REFUSED (the tier1 path still calls
 #     the unnarrowed `is_tier3_dangerous`) but non-terminally — nothing is
 #     written, so it is the two-character life-or-death gap #130 describes, not a
-#     dangerous write. A real write target (`> /etc/passwd`) or a dangerous verb
-#     chained alongside the /dev/null redirect is untouched and stays terminal.
+#     dangerous write. cpp#154 widened the same exemption to a CONTAINED working
+#     file — a target under `/tmp/` or relative to the worktree — for the same
+#     reason and by the same lexical mechanism. A target outside `/tmp` and
+#     outside the worktree (`> /etc/passwd`, `> ../x`, `> ~/x`) or a dangerous
+#     verb chained alongside the redirect is untouched and stays terminal; so is
+#     a redirect onto the control plane or through a symlink out of the
+#     worktree, re-armed by `_redirect_destination_veto_reason` below because
+#     the lexical test is cwd-free and structurally cannot see either.
 #
 # Both are Bash-shaped notions. A denial for any other tool is non-terminal.
 #
@@ -724,7 +732,8 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     command that is neither tier3-dangerous nor a containment escape.
 
     ``True`` for a tier3-dangerous Bash command, for a Bash command whose write
-    destination escapes ``cwd`` or lands on the control plane, and for a Bash
+    destination — including a REDIRECT target (cpp#154) — escapes ``cwd`` or
+    lands on the control plane, and for a Bash
     request that carries no parseable ``command`` at all — a missing key and a
     non-string value are the same condition and must classify the same way, so
     both fail closed. An explicitly EMPTY string is a parseable command and is
@@ -739,12 +748,22 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     command = tool_input.get("command")
     if not isinstance(command, str):
         return True
-    # cpp#130: the LETHALITY gate uses the /dev/null-narrowed classifier. A
-    # command whose sole tier3 trigger is a redirect to the inert /dev/null sink
-    # (`grep … >/dev/null`) stays REFUSED via is_tier3_dangerous on the tier1
-    # path, but is not on its own fatal here — nothing is written. A genuinely
-    # dangerous command that also redirects to /dev/null stays fatal.
+    # cpp#130 + cpp#154: the LETHALITY gate uses the narrowed classifier, which
+    # drops a redirect whose target writes nowhere (`/dev/null`) or writes a
+    # lexically CONTAINED working file (`/tmp/…`, or relative). Such a command
+    # stays REFUSED via the unnarrowed is_tier3_dangerous on the tier1 path; it
+    # is simply not fatal on its own, because nothing is written and the model
+    # can adapt. A genuinely dangerous VERB alongside the redirect stays fatal —
+    # the strips remove the redirect, never the verb.
     if is_tier3_dangerous_for_lethality(command):
+        return True
+    # cpp#154: the narrowing above is deliberately cwd-free and lexical (plan
+    # D1), so it cannot tell `> notes.txt` from `> .git/hooks/pre-commit` or
+    # from `> esc/x` where `esc` is a symlink out of the worktree. Before
+    # cpp#154 the blanket `>` tier3 pattern covered all three by accident. This
+    # call restores the two checks AC2 names — control plane and cwd escape —
+    # for redirect targets specifically. Order mirrors `_destination_veto_reason`.
+    if _redirect_destination_veto_reason(command, cwd) is not None:
         return True
     return _destination_veto_reason(command, cwd) is not None
 
@@ -1019,6 +1038,71 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
                     f"destination {dest!r} is on the agent control plane "
                     "(cpp#42 denylist)"
                 )
+    return None
+
+
+def _redirect_destination_veto_reason(command: str, cwd: str) -> str | None:
+    """The containment (cpp#38) and control-plane (cpp#42) half of cpp#154's AC1,
+    for REDIRECT targets; ``None`` when every redirect target is a contained
+    working file.
+
+    Why this exists as a separate function rather than a `_segment_write_kind`
+    entry. `_segment_write_kind` classifies only `cp`/`mv`, `mkdir` and
+    `git show >`, so `_destination_veto_reason` has never seen a bare `>` target
+    — measured on `main`: `_destination_veto_reason("echo hi > /etc/passwd", …)`
+    returns ``None`` (cpp#154 plan, measurement M3). Until cpp#154 that gap was
+    covered BY ACCIDENT: the blanket `>` entry in `TIER3_PATTERNS` made every
+    redirect lethal, escape or not. cpp#154 removed the blanket for lexically
+    contained targets and therefore had to restore, on purpose, what the
+    accident was doing on purpose's behalf.
+
+    Teaching `_segment_write_kind` about redirects is the "clean" closure and is
+    deliberately NOT done here (plan D4, follow-up claude-pilot#155): that
+    function is ALSO consulted on the ALLOWED path (:1263), where a redirect
+    write-kind would veto `cat > /tmp/x <<'EOF'` — the `bash-cat-heredoc-tmp`
+    rule cpp#154's AC4 pins as reachable end to end. This function is reached
+    ONLY from `_denial_is_terminal`, so no allowed command can be affected by it.
+
+    RESOLUTION DIRECTION IS THE WHOLE POINT. cpp#143's hard-won lesson
+    (`:922-968`) is that resolving symlinks in order to GRANT an exemption is
+    unsafe — a worktree symlink crafted to resolve into `/tmp` got exempted
+    although the pilot never spelled `/tmp`. Resolving in order to WITHHOLD one
+    carries no such hazard: the worst case is that a command stays terminal.
+    So `is_tier3_dangerous_for_lethality` stays purely lexical and cwd-free
+    (plan D1's corollary — its signature is untouched), and the resolve happens
+    only here, only to make a refusal MORE terminal.
+
+    Reaching this function implies every redirect target already passed
+    `_is_contained_redirect_target`: a target that did not was never stripped,
+    so `is_tier3_dangerous_for_lethality` returned ``True`` and the caller
+    returned before getting here. The predicate is re-checked anyway rather than
+    assumed — the two call sites must not be able to drift into disagreement.
+    """
+    if not isinstance(command, str) or not command:
+        return None
+    targets = _redirect_targets(command)
+    if targets is None:
+        return None
+    for dest in targets:
+        if not _is_contained_redirect_target(dest):
+            # Not stripped upstream, so lethality was already decided by the
+            # tier3 pattern. Nothing for this function to add.
+            continue
+        if dest.startswith("/tmp/"):
+            # The sanctioned scratch destination, symmetric with cpp#143's
+            # `mkdir` exception and with `bash-cat-heredoc-tmp`. Outside the
+            # worktree by construction, and that is the point of it.
+            continue
+        if not is_within_project(dest, cwd):
+            return (
+                f"redirect destination {dest!r} resolves outside the worktree "
+                "(cpp#38 symlink-traversal containment)"
+            )
+        if _is_control_plane_path(dest, cwd):
+            return (
+                f"redirect destination {dest!r} is on the agent control plane "
+                "(cpp#42 denylist)"
+            )
     return None
 
 

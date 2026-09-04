@@ -19,6 +19,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 from claude_pilot.permissions import (
     _SUBSTITUTION_ALLOWLIST,
     _bash_allow_is_chain_safe,
+    _denial_is_terminal,
     _destination_veto_reason,
     create_permission_handler,
 )
@@ -1467,3 +1468,227 @@ def test_guard_still_vetoes_backtick_and_funsub_in_cpp100_matching_shape() -> No
         assert (
             _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
         ), cmd
+
+
+# ── cpp#154 — a FORM denial on a command that writes a contained file ─────────
+#
+# The three claude-pilot sessions that died on mika#2158 in a single day
+# (2026-09-04). In all three the REFUSAL is correct — the chain really does
+# break `_bash_allow_is_chain_safe`'s "sole-command + no-trailing" contract —
+# and in all three the command only wrote a working file. Before cpp#154 the
+# generic `>` pattern in `TIER3_PATTERNS` made every one of them session-fatal.
+#
+# Command texts come from `/var/log/claude-pilot/{193e368c,ce63ad41,0c3ba346}*.stderr`.
+# `193e368c` and `0c3ba346` are verbatim. The pilot logger truncates its
+# `[tool:request]` / `[policy:deny]` lines at 200 chars, and for `ce63ad41` that
+# cut falls INSIDE the first redirect target (`> crates/mika-agent/tests/fix`),
+# so the rest of that target, the whole `2>` redirect, and the `for`-loop tail
+# are reconstructed. The reconstruction is verdict-neutral, and that claim is
+# checkable rather than asserted: the captured prefix is already relative,
+# `..`-free and inside `_CONTAINED_REDIRECT_TARGET_RE`'s charset, so no
+# continuation of it that stays a path can change the containment verdict.
+# `193e368c`'s tail is reconstructed too, but every one of its redirects sits
+# inside the captured prefix.
+
+_DEATH_193E368C = (
+    "mkdir -p /tmp/2158bodies && "
+    "for n in 2127 2140 2108 1772 2151 2117; do "
+    "gh issue view $n --repo senara-solutions/mika --json body -q .body "
+    "> /tmp/2158bodies/$n.md 2>/tmp/2158bodies/$n.err "
+    '&& echo "OK $n" || echo "FAIL $n"; done'
+)
+
+_DEATH_CE63AD41 = (
+    "mkdir -p crates/mika-agent/tests/fixtures/grooming_bodies && "
+    "for n in 2127 2140 2108 1772 2151 2117; do "
+    "gh issue view $n --repo senara-solutions/mika --json body -q .body "
+    "> crates/mika-agent/tests/fixtures/grooming_bodies/$n.md "
+    "2>crates/mika-agent/tests/fixtures/grooming_bodies/$n.err "
+    '&& echo "OK $n" || echo "FAIL $n"; done'
+)
+
+_DEATH_0C3BA346 = """cat > /tmp/probe_test.rs <<'EOF'
+EOF
+python3 - <<'PY'
+import re
+p=open('crates/mika-agent/src/grooming_marker.rs').read()
+print('ok')
+PY"""
+
+
+@pytest.mark.parametrize(
+    ("callback", "command"),
+    [
+        ("193e368c", _DEATH_193E368C),
+        ("ce63ad41", _DEATH_CE63AD41),
+        ("0c3ba346", _DEATH_0C3BA346),
+    ],
+)
+def test_cpp154_the_three_mika2158_deaths_survive(
+    callback: str, command: str, tmp_path: Path
+) -> None:
+    """AC3 anti-vacuity replay: on `main` all three measure `True` (the red this
+    test was captured against); with the cpp#154 narrowing all three measure
+    `False`.
+
+    `193e368c` redirects under `/tmp`; `ce63ad41` redirects INTO the worktree
+    with a relative path (the shape D2's superset covers and option (a) would
+    have left lethal); `0c3ba346` is the double-heredoc that died in `/ce:work`
+    with 8 commits pushed and the PR one call away.
+
+    The denial itself is NOT under test and is NOT changed — only its lethality.
+    """
+    cwd = _make_worktree(tmp_path)
+    assert _denial_is_terminal("Bash", _bash(command), cwd) is False, callback
+
+
+def test_cpp154_genuine_danger_stays_terminal_beside_a_contained_redirect(
+    tmp_path: Path,
+) -> None:
+    """AC2 at the `_denial_is_terminal` level: the narrowing removes the REDIRECT,
+    never the dangerous verb. Each command below writes a perfectly contained
+    target and must still end the run."""
+    cwd = _make_worktree(tmp_path)
+    for cmd in (
+        "rm -rf /tmp/y > /tmp/log",
+        "git push --force origin main > /tmp/log",
+        "sed -i s/a/b/ f.rs > /tmp/log",
+        'bash -c "id" > notes.txt',
+    ):
+        assert _denial_is_terminal("Bash", _bash(cmd), cwd) is True, cmd
+
+    # ...and an UN-contained target is still lethal on its own.
+    for cmd in ("echo hi > /etc/passwd", "echo hi > ../x", "echo hi > ~/x"):
+        assert _denial_is_terminal("Bash", _bash(cmd), cwd) is True, cmd
+
+    # The `mkdir`/`cp` containment escapes route through
+    # `_destination_veto_reason`, which cpp#154 does not touch.
+    assert _denial_is_terminal("Bash", _bash("mkdir -p esc/x"), cwd) is True
+    assert _denial_is_terminal("Bash", _bash("cp a.txt esc/b.txt"), cwd) is True
+
+
+def test_cpp154_redirect_onto_the_control_plane_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    """AC2, the half the lexical test structurally cannot see.
+
+    `is_tier3_dangerous_for_lethality` is cwd-free by design (plan D1), so it
+    reads `> .git/hooks/pre-commit` and `> notes.txt` as the same thing: a
+    relative, `..`-free, contained target. Before cpp#154 the blanket `>` entry
+    in `TIER3_PATTERNS` made BOTH terminal by accident; the narrowing removes
+    that accident, and `_redirect_destination_veto_reason` restores the half AC2
+    requires — deliberately, and only on the lethality path.
+
+    Every pre-existing cpp#42 control-plane test uses `git show … > …`, which
+    `_segment_write_kind` classifies and which therefore structurally could not
+    detect this class. That is why it had no coverage until now.
+    """
+    cwd = _make_worktree(tmp_path)
+    for cmd in (
+        "echo x > .git/config",
+        "echo x > .git/hooks/pre-commit",
+        "echo x > .claude/settings.json",
+        "echo x > .github/workflows/ci.yml",
+        "echo x > skills/bundled/x.md",
+        "echo x > .mika/config.toml",
+    ):
+        assert _denial_is_terminal("Bash", _bash(cmd), cwd) is True, cmd
+
+    # Boundary control: `.gitignore` is NOT the control plane (the char after
+    # `.git` is `i`, not `/` or end) — it is an ordinary working file.
+    assert _denial_is_terminal("Bash", _bash("echo x > .gitignore"), cwd) is False
+
+
+def test_cpp154_redirect_escaping_the_worktree_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    """AC2's `évasion de cwd`, in the ONE escape shape this change can move.
+
+    `_make_worktree` commits `esc -> ../OUTSIDE`. A redirect through it is
+    lexically indistinguishable from an in-worktree write, so only a resolving
+    check catches it. Resolving to WITHHOLD lethality is safe; cpp#143's lesson
+    is about resolving to GRANT an exemption, which this does not do.
+    """
+    cwd = _make_worktree(tmp_path)
+    assert _denial_is_terminal("Bash", _bash("echo x > esc/passwd"), cwd) is True
+    assert (
+        _denial_is_terminal("Bash", _bash("cat > esc/out.txt <<'EOF'\nx\nEOF"), cwd)
+        is True
+    )
+    # Paired control: the same shape that does NOT traverse the symlink.
+    assert _denial_is_terminal("Bash", _bash("echo x > docs/plans/p.md"), cwd) is False
+
+
+def test_cpp154_home_expansion_target_stays_terminal(tmp_path: Path) -> None:
+    """A leading `$HOME`/`${HOME}` names the same destination as `~`, which the
+    predicate already rejects. Admitting it would make that rejection one
+    respelling away from useless. A `$` that is not the head of a parameter name
+    (`$(whoami)`, a bare `$`) fails closed for the same reason."""
+    cwd = _make_worktree(tmp_path)
+    for cmd in (
+        "echo hi > $HOME/.ssh/authorized_keys",
+        "echo hi > ${HOME}/.bashrc",
+        "echo hi > $OLDPWD/y",
+        "echo hi > $(whoami)",
+        "echo hi > $",
+    ):
+        assert _denial_is_terminal("Bash", _bash(cmd), cwd) is True, cmd
+
+    # Control: a MID-PATH expansion is still contained — the two `mkdir` deaths
+    # redirect to `/tmp/2158bodies/$n.md`, so rejecting every `$` would undo AC3.
+    assert (
+        _denial_is_terminal("Bash", _bash("gh issue view 1 > /tmp/b/$n.md"), cwd)
+        is False
+    )
+
+
+def test_cpp154_mixed_contained_and_uncontained_redirects_stay_terminal(
+    tmp_path: Path,
+) -> None:
+    """One un-contained target in a compound is enough: it is never stripped, so
+    the generic `>` pattern still matches and the whole command stays fatal."""
+    cwd = _make_worktree(tmp_path)
+    assert (
+        _denial_is_terminal(
+            "Bash", _bash("echo a > /tmp/ok.md && echo b > /etc/passwd"), cwd
+        )
+        is True
+    )
+    assert (
+        _denial_is_terminal(
+            "Bash", _bash("echo a > notes.txt && echo b > .git/config"), cwd
+        )
+        is True
+    )
+
+
+def test_cpp154_bash_cat_heredoc_tmp_is_reachable_end_to_end(tmp_path: Path) -> None:
+    """AC4, branch 1 (`reachable`): the `bash-cat-heredoc-tmp` allow rule
+    (`permissions.yaml:215`) is honoured by the WHOLE chain, not just by
+    `evaluate` — so it is a real promise, not a rule the decision chain can never
+    keep, and it is NOT withdrawn.
+
+    Measurement M4, pinned: a lone `/tmp` heredoc is `allow` + chain-safe + no
+    destination veto. `_denial_is_terminal` is never consulted on an ALLOWED
+    command, so whatever it would return for this string is VACANT — a future
+    reader must not read it as a contradiction. What killed `0c3ba346` was the
+    SECOND heredoc chained after this one breaking chain-safety, which is the
+    correct refusal; cpp#154 only removed its lethality (test above).
+    """
+    cwd = _make_worktree(tmp_path)
+    cmd = "cat > /tmp/cpp154_probe.rs <<'EOF'\nfn main() {}\nEOF"
+
+    decision = evaluate(_POLICY, "Bash", _bash(cmd))
+    assert decision.decision == "allow"
+    assert decision.rule_id == "bash-cat-heredoc-tmp"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+    assert _destination_veto_reason(cmd, cwd) is None
+
+    # The three assertions above are the components; `_dest_effective` is a
+    # test-local restatement of the production order. Neither is the machine.
+    # Drive the REAL handler so "reachable end to end" means what it says.
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow)
