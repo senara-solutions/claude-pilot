@@ -1332,3 +1332,53 @@ async def test_a_zero_ceiling_is_documented_as_unbounded_and_behaves_that_way() 
 
     assert guardrails.aborted is False, "0 means wait indefinitely, by contract"
     guardrails.dispose()
+
+
+# ── cpp#151: the non-terminal-refusal session marker ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_note_policy_deny_arms_only_on_a_survivable_refusal(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Both arms in one test, because the marker's whole job is the
+    distinction. permissions.py calls `note_policy_deny` at EVERY
+    `[policy:deny]` site; a terminal refusal (destination veto, tier3-dangerous
+    Bash) is recorded in the log and on the audit wire but must leave the flag
+    clear, or agent.py would offer a containment breach a free resume."""
+    assert guardrails.nonterminal_policy_deny is False
+    assert guardrails.nonterminal_policy_deny_summary is None
+
+    guardrails.note_policy_deny("Bash: mkdir -p /outside", terminal=True)
+    assert guardrails.nonterminal_policy_deny is False, (
+        "a refusal we asked to be fatal must not arm the resume marker"
+    )
+    assert guardrails.nonterminal_policy_deny_summary is None
+    assert guardrails.terminal_policy_deny is True, (
+        "it must arm the VETO marker instead — the signal is not discarded"
+    )
+
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+    assert guardrails.nonterminal_policy_deny is True
+    assert guardrails.nonterminal_policy_deny_summary == "Bash: env | grep -c MIKA"
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_policy_deny_is_sticky_and_tracks_the_latest(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Sticky like cpp#144's marker: a later terminal refusal does not clear an
+    earlier survivable one, and the summary names the refusal CLOSEST to
+    whatever the session did next."""
+    guardrails.note_policy_deny("first refusal", terminal=False)
+    guardrails.note_policy_deny("second refusal", terminal=False)
+    assert guardrails.nonterminal_policy_deny_summary == "second refusal"
+
+    guardrails.note_policy_deny("a lethal one", terminal=True)
+    assert guardrails.nonterminal_policy_deny is True, "terminal must not disarm"
+    assert guardrails.nonterminal_policy_deny_summary == "second refusal"
+    # ...and the veto marker latches, so this mixed session is NOT resumable.
+    # Both flags sticky is the point: a session that once tried to leave its
+    # worktree does not become trustworthy again because an earlier refusal
+    # happened to be harmless.
+    assert guardrails.terminal_policy_deny is True

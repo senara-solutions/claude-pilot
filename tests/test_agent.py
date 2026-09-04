@@ -92,6 +92,135 @@ class _FakeClient:
         return gen()
 
 
+class _ScriptedClient:
+    """One SDK client session: yields a scripted message list, records queries.
+
+    cpp#151's recovery opens a NEW client (the CLI exits after an
+    `error_during_execution`), so the fake models a *sequence of clients*, not a
+    client that can be re-read. `_FakeClient` above cannot express that.
+    """
+
+    def __init__(self, script: list[Any], *, fail_on_enter: bool = False) -> None:
+        self._script = list(script)
+        self._fail_on_enter = fail_on_enter
+        self.queries: list[str] = []
+        self.response_calls = 0
+
+    async def __aenter__(self) -> _ScriptedClient:
+        if self._fail_on_enter:
+            raise ConnectionResetError("resume refused by the CLI")
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        return None
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+
+    async def interrupt(self) -> None:
+        return None
+
+    def receive_response(self) -> Any:
+        self.response_calls += 1
+        script = self._script
+        self._script = []
+
+        async def gen() -> Any:
+            for m in script:
+                yield m
+
+        return gen()
+
+
+class _ClientSequence:
+    """Factory standing in for `ClaudeSDKClient`, one client per construction.
+
+    Records the `options` each session was built with, which is how the resume
+    is asserted: session 2 must carry `options.resume == <session id>`.
+    """
+
+    def __init__(self, scripts: list[list[Any]], *, fail_from: int | None = None) -> None:
+        self._scripts = [list(s) for s in scripts]
+        self._fail_from = fail_from
+        self.clients: list[_ScriptedClient] = []
+        self.options: list[Any] = []
+
+    def __call__(self, *_args: Any, **kwargs: Any) -> _ScriptedClient:
+        n = len(self.clients)
+        self.options.append(kwargs.get("options"))
+        script = self._scripts.pop(0) if self._scripts else []
+        client = _ScriptedClient(
+            script, fail_on_enter=self._fail_from is not None and n >= self._fail_from
+        )
+        self.clients.append(client)
+        return client
+
+
+def _install_client_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    scripts: list[list[Any]],
+    *,
+    fail_from: int | None = None,
+) -> _ClientSequence:
+    seq = _ClientSequence(scripts, fail_from=fail_from)
+    monkeypatch.setattr(agent_module, "ClaudeSDKClient", seq)
+    return seq
+
+
+def _ede(terminal_reason: str | None = None) -> ResultMessage:
+    """The terminal message from the ticket's trace: `error_during_execution`,
+    emitted by the SDK's own bundled `claude` binary after a refusal was handed
+    to the model as a tool result. `errors` reproduces the upstream
+    `[ede_diagnostic]` prose verbatim — claude-pilot cannot change that text
+    (it is not in this repo), which is why AC2 is answered by an ADDITIVE
+    subtype of our own rather than by editing the diagnostic.
+
+    `terminal_reason` is the SDK's own report of WHY the turn ended;
+    `aborted_tools` means it was cancelled by an interrupt control request —
+    i.e. by our own `PermissionResultDeny(interrupt=True)`."""
+    return ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=4_500_000,
+        duration_api_ms=100,
+        is_error=True,
+        num_turns=6,
+        session_id="sess_test",
+        total_cost_usd=0.0,
+        stop_reason="tool_use",
+        terminal_reason=terminal_reason,
+        errors=["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+    )
+
+
+def _tool_result_user_message() -> UserMessage:
+    """The `[debug] user message (tool result) received` line of the trace: the
+    refusal DID reach the model as a tool result before the loop died."""
+    return UserMessage(
+        content=[
+            {
+                "type": "tool_result",
+                "tool_use_id": "t_denied",
+                "is_error": True,
+                "content": "composed read-only command not allow-listed [bash-grep]",
+            }
+        ]
+    )
+
+
+def _terminal_payload(stdout: str) -> dict[str, Any]:
+    """The single ResultJson line a session writes, parsed.
+
+    Asserts there is exactly one: a run that emitted two terminal lines (the
+    failure mode the cpp#20 mutual-exclusion guard exists to prevent, and one a
+    resume could plausibly reintroduce) would otherwise pass every assertion
+    below on whichever line happened to come first."""
+    import json
+
+    lines = [line for line in stdout.splitlines() if line.startswith("{")]
+    assert len(lines) == 1, f"expected exactly one terminal result line: {lines}"
+    return dict(json.loads(lines[0]))
+
+
 def _install_fake_client(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> None:
     """Replace ClaudeSDKClient in agent.py with a constructor that returns a
     FakeClient yielding the scripted message sequence."""
@@ -1520,3 +1649,364 @@ async def test_a_long_running_tool_is_not_killed_through_the_loop(
     assert guardrails.aborted is False, "a slow tool is a wait, not an idle"
     assert "idle_timeout" not in out
     assert exit_code == 0
+
+
+# ── cpp#151: a refusal the run was meant to survive must not end it ─────────
+#
+# These replay the ticket's measured trace: a `[policy:deny]` that
+# `_denial_is_terminal` classified NON-terminal, the `user message (tool
+# result)` proving the refusal reached the model, and then an
+# `error_during_execution` with `stop_reason=tool_use` — 75 minutes, 6 tool
+# calls, 4 refusals, not one byte written.
+#
+# Like the cpp#144 tests above, they pre-arm the guardrail exactly the way
+# permissions.py does in production (`note_policy_deny`, proven by
+# `tests/test_permissions.py::test_151_nonterminal_rule_deny_says_so_and_marks_the_session`)
+# and exercise only the agent-loop half.
+
+
+@pytest.mark.asyncio
+async def test_151_nonterminal_denial_does_not_end_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1: the run continues past the EDE and emits a FOLLOWING tool call.
+
+    "Continues" is asserted on the strongest available evidence rather than on
+    the absence of a result line: a SECOND client was constructed carrying
+    `options.resume == <session id>` (the SDK's session-resume path — the CLI
+    exits after an error result, so re-querying the first client is not a
+    recovery), the nudge was its opening prompt, a tool call landed on the far
+    side of it, and the run's own terminal result is the success from that
+    second session."""
+    seq = _install_client_sequence(
+        monkeypatch,
+        [
+            [_init(), _tool_result_user_message(), _ede()],
+            [
+                _assistant(
+                    [ToolUseBlock(id="t2", name="Bash", input={"command": "gh pr create --fill"})],
+                    message_id="msg_after_resume",
+                ),
+                _result(),
+            ],
+        ],
+    )
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    payload = _terminal_payload(captured.out)
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+    assert exit_code == 0
+
+    assert len(seq.clients) == 2, "the recovery must open a NEW client"
+    assert seq.options[0].resume is None, "the first session never resumes"
+    assert seq.options[1].resume == "sess_test", seq.options[1]
+    assert seq.clients[0].queries == ["test"]
+    assert seq.clients[1].queries == [agent_module.DENY_RESUME_NUDGE]
+    assert guardrails.pr_created is True, (
+        "the tool call issued AFTER the resume must reach the guardrails"
+    )
+    assert "[resume]" in captured.err
+
+
+def test_151_resume_prompt_relaxes_nothing() -> None:
+    """The nudge is the one new piece of text this change puts in front of the
+    model, so its content is pinned in both directions.
+
+    It must restate that the refusal STANDS and forbid retrying the denied
+    command — and it must NOT name `Write`/`Edit`. Those are tier1-approved on
+    `is_within_project` alone, while a Bash write also passes the cpp#42
+    control-plane denylist; steering a model whose Bash write was just refused
+    toward the weaker surface would make this prompt a route around a
+    containment boundary."""
+    nudge = agent_module.DENY_RESUME_NUDGE.lower()
+    assert "stands" in nudge
+    assert "do not retry" in nudge
+    assert "do not ask for the permission to be widened" in nudge
+    assert "write" not in nudge, "must not steer to the write-side native tools"
+    assert "edit" not in nudge
+    assert "read, glob, grep" in nudge
+
+
+@pytest.mark.asyncio
+async def test_151_exhausted_budget_reports_the_named_subtype(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2 + the resume bound, in one test.
+
+    Budget 1, two consecutive EDEs: exactly ONE resume is spent, and the second
+    death is reported under claude-pilot's OWN subtype with the refusal named
+    in `termination_reason`. `status` stays `error` — the new information rides
+    on `subtype` alone, which is the cpp#144 shape and what keeps dispatch-lib
+    (`jq -r '.subtype // empty'`) unaffected."""
+    monkeypatch.setenv("CLAUDE_PILOT_MAX_DENY_RESUMES", "1")
+    seq = _install_client_sequence(
+        monkeypatch,
+        [
+            [_init(), _tool_result_user_message(), _ede()],
+            [_ede()],
+        ],
+    )
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_exhausted",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    payload = _terminal_payload(capsys.readouterr().out)
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == agent_module.EDE_AFTER_DENY_SUBTYPE, payload
+    assert "env | grep -c MIKA" in payload["termination_reason"], payload
+    assert "1/1" in payload["termination_reason"], payload
+    assert exit_code == 1
+    assert len(seq.clients) == 2, "budget 1 buys exactly one extra session"
+
+
+@pytest.mark.asyncio
+async def test_151_ede_without_a_denial_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """MANDATORY NEGATIVE CONTROL. A run that never took a non-terminal refusal
+    and dies in `error_during_execution` behaves exactly as before cpp#151:
+    bare subtype, no resume, one client.
+
+    This is the arm that makes the positive test non-vacuous — and it is the
+    same discriminating control the ticket's own measurement used, where the
+    fifteen sessions with no refusal produced zero deaths of this shape."""
+    seq = _install_client_sequence(monkeypatch, [[_init(), _ede()]])
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_control",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    payload = _terminal_payload(captured.out)
+    assert payload["subtype"] == "error_during_execution", payload
+    assert payload["status"] == "error", payload
+    assert exit_code == 1
+    assert len(seq.clients) == 1, "no resume without a non-terminal refusal"
+    assert "[resume]" not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_151_a_later_lethal_refusal_vetoes_the_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """NON-REGRESSION, the lethal direction — and the hole the first draft had.
+
+    Both markers are sticky, so a session that takes ONE harmless refusal early
+    (`echo probe; ls`) would have stayed "resume-eligible" forever. If only the
+    survivable marker gated the resume, a LATER containment kill — a write
+    escaping the worktree — would then have been handed another turn, which is
+    precisely the containment boundary this whole subsystem exists to hold.
+
+    The mixed sequence is the test: survivable refusal FIRST, lethal refusal
+    SECOND, then the EDE. No resume, one client, and the death reports under the
+    unclassified subtype because the run is no longer the cpp#151 shape."""
+    seq = _install_client_sequence(monkeypatch, [[_init(), _ede()]])
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: echo probe; ls", terminal=False)
+    guardrails.note_policy_deny("Bash: cp payload .git/hooks/post-checkout", terminal=True)
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_mixed",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    assert len(seq.clients) == 1, (
+        "a containment breach must not buy a resume, whatever happened earlier"
+    )
+    assert "[resume]" not in captured.err
+    assert exit_code == 1
+    assert _terminal_payload(captured.out)["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_151_an_interrupt_abort_is_not_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """NON-REGRESSION, second and independent arm.
+
+    If the CLI reports the abort caused by our own
+    `PermissionResultDeny(interrupt=True)` as an `error_during_execution`
+    carrying `terminal_reason="aborted_tools"`, that is a kill we requested and
+    must not be resumed — even in a run whose session markers say only
+    survivable refusals happened. This check is sourced from the SDK's own
+    field rather than from our bookkeeping, so the two guards would have to
+    fail together for a deliberate kill to be resumed."""
+    seq = _install_client_sequence(
+        monkeypatch, [[_init(), _ede(terminal_reason="aborted_tools")]]
+    )
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_aborted",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    assert len(seq.clients) == 1, "an interrupt-abort is not a resume candidate"
+    assert "[resume]" not in captured.err
+    # The classification still fires — the run DID take a survivable refusal —
+    # so the death is named even though it is not recovered.
+    assert _terminal_payload(captured.out)["subtype"] == agent_module.EDE_AFTER_DENY_SUBTYPE
+
+
+@pytest.mark.asyncio
+async def test_151_a_terminal_refusal_still_ends_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other lethal shape, at the agent-loop seam: a deliberately lethal
+    refusal closes the CLI's stdio without a ResultMessage at all, and the run
+    must reach the cpp#20 synthetic terminal emit unchanged."""
+    seq = _install_client_sequence(monkeypatch, [[_init()]])
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: mkdir -p /definitely/outside/x", terminal=True)
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_lethal",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    payload = _terminal_payload(capsys.readouterr().out)
+    assert payload["subtype"] == "stream_ended_without_result", payload
+    assert payload["status"] == "error", payload
+    assert exit_code == 1
+    assert len(seq.clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_151_resume_can_be_disabled_and_still_classifies(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The documented rollback: `CLAUDE_PILOT_MAX_DENY_RESUMES=0` turns B2 off
+    and leaves B0+B1 standing. An operator who distrusts the resume still gets
+    the death NAMED, which is the half that costs nothing."""
+    monkeypatch.setenv("CLAUDE_PILOT_MAX_DENY_RESUMES", "0")
+    seq = _install_client_sequence(monkeypatch, [[_init(), _ede()]])
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_disabled",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    payload = _terminal_payload(capsys.readouterr().out)
+    assert payload["subtype"] == agent_module.EDE_AFTER_DENY_SUBTYPE, payload
+    assert len(seq.clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_151_a_resumed_session_that_never_comes_up_still_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The recovery's own failure must not cost the diagnosis.
+
+    A resume can be refused by the CLI (unknown session, transport gone). Before
+    this guard the exception escaped `run_agent` and `cli.py` wrote a bare
+    `subtype="fatal"` line with no task_id and no session_id — trading the death
+    we had just classified for a strictly less legible one. The deferred result
+    is emitted instead, exactly once."""
+    seq = _install_client_sequence(
+        monkeypatch, [[_init(), _tool_result_user_message(), _ede()], []], fail_from=1
+    )
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_151_undeliverable",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    payload = _terminal_payload(captured.out)
+    assert payload["subtype"] == agent_module.EDE_AFTER_DENY_SUBTYPE, payload
+    assert payload["task_id"] == "task_151_undeliverable", payload
+    assert payload["session_id"] == "sess_test", payload
+    assert "no terminal message" in payload["termination_reason"], payload
+    assert exit_code == 1
+    assert "[resume:failed]" in captured.err
+    assert len(seq.clients) == 2
+
+
+def test_151_resume_budget_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budget knob fails SAFE in both directions.
+
+    Unparseable does NOT fall back to the default: this variable is documented
+    as the rollback lever, so `0.0` or `false` — what an operator actually types
+    to turn something off — must disable the resume, not silently re-enable it
+    at full budget. And the ceiling is enforced in code, not only in a comment:
+    each resume starts a fresh CLI query loop with its own `maxTurns`, so an
+    unclamped value would multiply the one guardrail that bounds a busy refusal
+    loop."""
+    for raw, expected in (
+        (None, agent_module.DEFAULT_MAX_DENY_RESUMES),
+        ("", agent_module.DEFAULT_MAX_DENY_RESUMES),
+        ("  ", agent_module.DEFAULT_MAX_DENY_RESUMES),
+        ("0", 0),
+        ("1", 1),
+        ("-3", 0),
+        ("not-a-number", 0),
+        ("0.0", 0),
+        ("false", 0),
+        ("1000", agent_module.MAX_DENY_RESUMES_CEILING),
+    ):
+        if raw is None:
+            monkeypatch.delenv("CLAUDE_PILOT_MAX_DENY_RESUMES", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_PILOT_MAX_DENY_RESUMES", raw)
+        assert agent_module._resolve_max_deny_resumes() == expected, raw

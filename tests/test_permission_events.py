@@ -60,11 +60,23 @@ def test_is_event_log_enabled(raw: str | None, expected: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _build_body — EXPLICIT 6-field allowlist; nothing extra can ride
+# _build_body — EXPLICIT 7-field allowlist; nothing extra can ride
 # ---------------------------------------------------------------------------
 
+#: The wire contract, in one place, so the two tests that pin it cannot drift
+#: apart. cpp#151 B0 added `terminal` as the seventh field.
+WIRE_FIELDS = {
+    "tool_name",
+    "decision",
+    "rule_id",
+    "cwd",
+    "tool_use_id",
+    "agent_id",
+    "terminal",
+}
 
-def test_build_body_produces_exactly_six_fields() -> None:
+
+def test_build_body_produces_exactly_the_allowlisted_fields() -> None:
     body = _build_body(
         tool_name="Bash",
         decision="allow",
@@ -73,15 +85,39 @@ def test_build_body_produces_exactly_six_fields() -> None:
         tool_use_id="tu_1",
         agent_id="agent_x",
     )
-    assert set(body.keys()) == {
-        "tool_name",
-        "decision",
-        "rule_id",
-        "cwd",
-        "tool_use_id",
-        "agent_id",
-    }
+    assert set(body.keys()) == WIRE_FIELDS
     assert body["decision"] == "allow"
+    # cpp#151 B0: an ALLOW has no lethality — the field is present on the wire
+    # and null, never absent, so cm sees a stable schema across decisions.
+    assert body["terminal"] is None
+
+
+def test_build_body_carries_terminal_for_a_lethal_denial() -> None:
+    """cpp#151 B0: the audit wire records WHICH refusals also killed the run.
+
+    Both values are asserted in one test because the whole point of the field
+    is the distinction — a `terminal` that is always True (or always False)
+    carries exactly as little information as the absent field it replaces."""
+    lethal = _build_body(
+        tool_name="Bash",
+        decision="deny",
+        rule_id="bash-rm:destination-veto",
+        cwd="/tmp",
+        tool_use_id="tu_1",
+        agent_id=None,
+        terminal=True,
+    )
+    survivable = _build_body(
+        tool_name="Bash",
+        decision="deny",
+        rule_id="bash-grep",
+        cwd="/tmp",
+        tool_use_id="tu_2",
+        agent_id=None,
+        terminal=False,
+    )
+    assert lethal["terminal"] is True
+    assert survivable["terminal"] is False
 
 
 def test_build_body_carries_none_agent_id() -> None:
@@ -264,14 +300,7 @@ def test_worker_posts_event_with_wire_contract(monkeypatch: pytest.MonkeyPatch) 
     assert captured["timeout"] > 0
 
     body = json.loads(captured["body"])
-    assert set(body.keys()) == {
-        "tool_name",
-        "decision",
-        "rule_id",
-        "cwd",
-        "tool_use_id",
-        "agent_id",
-    }
+    assert set(body.keys()) == WIRE_FIELDS
     assert body["decision"] == "allow"
     assert body["rule_id"] == "tier1-auto-approve"
     assert body["cwd"] == "/tmp/work"

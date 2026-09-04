@@ -178,6 +178,32 @@ class SessionGuardrails:
         # ResultJson.termination_reason so the exit message names the question
         # nobody could answer (cpp#144 AC1), not just the fact of a denial.
         self._operator_question_summary: str | None = None
+        # cpp#151: sticky "a NON-TERMINAL policy refusal happened this session"
+        # flag. Set by permissions.py at every `[policy:deny]` site whose
+        # `_denial_is_terminal` verdict was False — i.e. exactly the refusals
+        # cpp#128 made survivable, and exactly the population the cpp#151
+        # measurement is about. Read by agent.py at the ResultMessage boundary
+        # for two things: (1) classify a terminal `error_during_execution` as
+        # `error_during_execution:after_deny` (AC2), and (2) decide whether that
+        # EDE is worth one bounded resume instead of a burial (AC1).
+        #
+        # DELIBERATELY NOT set for a terminal refusal. A destination veto or a
+        # tier3-dangerous Bash command is a kill claude-pilot ASKED for; folding
+        # it in here would re-merge the two populations B0 exists to separate,
+        # and would hand a containment breach a free resume.
+        self._nonterminal_policy_deny: bool = False
+        # Summary of the (last) non-terminal refusal, reproduced in
+        # ResultJson.termination_reason so the exit line names the command that
+        # preceded the death rather than only the fact of a refusal.
+        self._nonterminal_policy_deny_summary: str | None = None
+        # cpp#151: the mirror flag, and the one that VETOES a resume. Set when a
+        # refusal claude-pilot ASKED to be fatal happens — destination veto,
+        # tier3-dangerous Bash, deny-with-notify. Sticky for the same reason the
+        # other one is: a session that once tried to write outside its worktree
+        # does not become trustworthy again three turns later, and the marker
+        # above being sticky too means that WITHOUT this flag one harmless early
+        # refusal would have made every later containment kill resumable.
+        self._terminal_policy_deny: bool = False
         # cpp#119: sticky "currently rate-limited" flag. Set when a rate-limit
         # signal is observed on the stream (a CLI RateLimitEvent with
         # status=="rejected", or an AssistantMessage carrying error=="rate_limit")
@@ -267,6 +293,50 @@ class SessionGuardrails:
         """Human-readable summary of the (last) denied `AskUserQuestion` call,
         or None if none was denied this session (cpp#144)."""
         return self._operator_question_summary
+
+    @property
+    def nonterminal_policy_deny(self) -> bool:
+        """True if a NON-TERMINAL policy refusal was observed this session
+        (cpp#151). See `note_policy_deny` for why terminal refusals are
+        excluded."""
+        return self._nonterminal_policy_deny
+
+    @property
+    def nonterminal_policy_deny_summary(self) -> str | None:
+        """Summary of the (last) non-terminal policy refusal, or None."""
+        return self._nonterminal_policy_deny_summary
+
+    @property
+    def terminal_policy_deny(self) -> bool:
+        """True if a DELIBERATELY lethal policy refusal was observed this
+        session (cpp#151). Read by agent.py to veto the resume outright."""
+        return self._terminal_policy_deny
+
+    def note_policy_deny(self, summary: str | None, *, terminal: bool) -> None:
+        """Record a policy refusal and its lethality (cpp#151 B0/B1).
+
+        Called from permissions.py at every `[policy:deny]` return site, with
+        the SAME `terminal` value that was handed to
+        `PermissionResultDeny(interrupt=…)` and to `ui.log_policy_deny` — one
+        computation, three consumers, so the log line, the audit event and the
+        session marker can never disagree about a given refusal.
+
+        The two flags are separate and BOTH sticky. `terminal=True` arms
+        `terminal_policy_deny`, which vetoes the resume for the rest of the
+        session; `terminal=False` arms `nonterminal_policy_deny`, which is what
+        makes a resume eligible in the first place. A session that took both
+        ends up ineligible — the conservative resolution, and the one that
+        closes the "one harmless refusal early on makes every later kill
+        resumable" hole.
+
+        `summary` overwrites on each survivable refusal so the message names the
+        one CLOSEST to whatever the session did next.
+        """
+        if terminal:
+            self._terminal_policy_deny = True
+            return
+        self._nonterminal_policy_deny = True
+        self._nonterminal_policy_deny_summary = summary
 
     def note_operator_question_denied(self, summary: str | None) -> None:
         """Record that an `AskUserQuestion` call was refused by policy

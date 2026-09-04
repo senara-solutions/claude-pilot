@@ -109,14 +109,69 @@ def log_guardrail(type_: str, detail: str) -> None:
     _log(f"\n{ORANGE}[guardrail]{RESET} {BOLD}{type_}{RESET}: {detail}")
 
 
+def log_deny_resume(attempt: int, budget: int, subtype: str) -> None:
+    """cpp#151 B2 — a session that ended on `error_during_execution` after a
+    NON-TERMINAL refusal is being handed a fresh turn instead of being buried.
+
+    Never silent (plan phase 11): a resume that leaves no line would make the
+    turn count, the cost and the duration of a session unexplainable from the
+    log alone. `attempt`/`budget` are rendered together so an operator reading
+    the tail can see how much of the recovery budget is left.
+    """
+    _log(
+        f"\n{ORANGE}[resume]{RESET} {BOLD}{subtype}{RESET} followed a "
+        f"non-terminal policy denial — continuing the session "
+        f"(attempt {attempt}/{budget})"
+    )
+
+
+def log_deny_resume_failed(detail: str) -> None:
+    """cpp#151 B2 — the resume nudge could not be delivered.
+
+    The session then falls through to the ordinary terminal emit, so the
+    failure is visible next to the result line rather than swallowed.
+    """
+    _log(f"{RED}[resume:failed]{RESET} {detail}")
+
+
 def log_policy_allow(tool_name: str, detail: str, rule_id: str | None) -> None:
     tag = f" [{rule_id}]" if rule_id else ""
     _log(f"{GREEN}[policy:allow]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
 
 
-def log_policy_deny(tool_name: str, detail: str, rule_id: str | None) -> None:
+#: cpp#151 B0 — the lethality suffix rendered on every ``[policy:deny]`` line.
+#: These two literals are the load-bearing artifact of B0: they are what makes
+#: the AC5 population ("sessions that took a NON-TERMINAL refusal") readable
+#: from `/var/log/claude-pilot/*.stderr` after the fact, instead of being a
+#: retrospective judgement about which of two superposed classes a dead session
+#: belonged to. Kept as module constants so the measurement command and the
+#: renderer cannot drift apart.
+TERMINAL_SUFFIX = " (terminal)"
+NON_TERMINAL_SUFFIX = " (non-terminal)"
+
+
+def _lethality_suffix(terminal: bool) -> str:
+    return TERMINAL_SUFFIX if terminal else NON_TERMINAL_SUFFIX
+
+
+def log_policy_deny(
+    tool_name: str, detail: str, rule_id: str | None, *, terminal: bool
+) -> None:
+    """Render a policy refusal, naming whether it also ends the run (cpp#151).
+
+    ``terminal`` is REQUIRED and keyword-only on purpose. cpp#128 split the
+    decision (refuse) from the lethality (``interrupt=True``) but left the
+    second half unlogged, so the eight dead sessions in the cpp#151 body could
+    not be separated into "claude-pilot asked for this kill" (destination veto,
+    tier3-dangerous Bash — correct behaviour) and "died despite
+    ``interrupt=False``" (the actual residue). A default value here would let a
+    future call site silently rejoin the two populations.
+    """
     tag = f" [{rule_id}]" if rule_id else ""
-    _log(f"{RED}[policy:deny]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+    _log(
+        f"{RED}[policy:deny]{RESET} {BOLD}{tool_name}{RESET}: "
+        f"{detail}{tag}{_lethality_suffix(terminal)}"
+    )
 
 
 def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None) -> None:
@@ -129,7 +184,14 @@ def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None
     correct name.
     """
     tag = f" [{rule_id}]" if rule_id else ""
-    _log(f"{YELLOW}[policy:deny_with_notify]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+    # cpp#151 B0: deny-with-notify is unconditionally terminal (cpp#128 left it
+    # so deliberately — an escalate exists to put a human in the loop). The
+    # suffix is rendered anyway so every refusal line in the log states its
+    # lethality, and so the AC5 grep for `(non-terminal)` cannot match here.
+    _log(
+        f"{YELLOW}[policy:deny_with_notify]{RESET} {BOLD}{tool_name}{RESET}: "
+        f"{detail}{tag}{TERMINAL_SUFFIX}"
+    )
 
 
 def log_turn_summary(turn: int, summary: str) -> None:
