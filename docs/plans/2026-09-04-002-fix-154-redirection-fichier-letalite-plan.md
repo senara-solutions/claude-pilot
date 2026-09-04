@@ -158,11 +158,20 @@ L'AC1 énonce la classe par sa cause : « un refus dont la cause est la forme
 
 (b) est un **sur-ensemble** de l'AC1, pas une contradiction : l'AC1 énonce une
 condition suffisante (« reste non terminal **quand** … »), pas une condition
-exclusive. **Ce point est explicitement soumis à l'arbitrage de l'architecte.**
-Si l'architecte préfère la lettre stricte, le repli est (a) : déplacer l'appel
-au nouveau prédicat du corps de `is_tier3_dangerous_for_lethality` vers le seul
-site `:1231`, sans autre changement — les lignes 3 et 4 restent alors létales et
-sont fichées en suivi.
+exclusive.
+
+**Décision VERROUILLÉE : (b).** Arbitrée en première passe par mika-arch
+(session `b16f49b4`, F2) : « la cohérence avec cpp#151 B0 (une seule computation
+de létalité) et la couverture des écritures de travail dans le worktree
+justifient le sur-ensemble ». L'implémenteur ne rouvre pas ce choix.
+
+*Note historique (ne pas implémenter).* L'option (a) a été écartée, pas mise en
+réserve. Elle consistait à ne toucher que le site `:1231` ; elle laissait létales
+les lignes 3 et 4 de la mesure — `cat > probe.rs` et `echo hi > notes.txt` dans
+le worktree, les deux écritures de fichier de travail les plus banales — et
+introduisait une seconde notion de létalité à côté de la première. Elle est
+consignée ici pour que le prochain lecteur sache qu'elle a été pesée, non pour
+lui offrir un choix.
 
 ### D3 — Une cible portant une expansion (`$n`) est admise, avec son résidu nommé
 
@@ -229,13 +238,38 @@ quand cpp#154 est mergé.
 
 Extraction lexicale de **toutes** les cibles de redirection d'une commande.
 
-- Reconnaît `>`, `>>`, `N>`, `N>>` (avec ou sans espace avant la cible).
-- Ignore `>&`, `>(`, `<(` — déjà couverts par leurs propres motifs tier3, et
-  ce ne sont pas des cibles fichier.
-- Rend `None` si une cible n'est pas extractible (guillemets déséquilibrés,
-  redirection en fin de chaîne sans opérande) → **fail-closed** : l'appelant
-  traite comme non contenu, donc létal.
-- Aucun accès disque.
+**Formes EXTRAITES** (elles désignent un fichier, leur cible doit être validée) :
+
+- `>`, `>>`, `N>`, `N>>` — avec ou sans espace avant la cible.
+- `&>`, `&>>` — redirection combinée stdout+stderr. **Elles écrivent bien un
+  fichier**, donc leur cible est extraite et validée comme les autres.
+
+**Formes IGNORÉES** (elles ne désignent aucun fichier ; les laisser en place ne
+retire rien, donc le motif `>` continue de matcher et la létalité tient) :
+
+- `>&M`, `N>&M` — duplication de descripteur de fichier (`2>&1`). L'opérande
+  est un numéro de descripteur, pas un chemin.
+- `>(`, `<(` — substitution de processus, déjà couverte par ses propres motifs
+  `>\(` / `<\(` dans `TIER3_PATTERNS`.
+
+**Fail-closed** : rend `None` si une cible n'est pas extractible (guillemets
+déséquilibrés, redirection en fin de chaîne sans opérande). L'appelant traite
+alors comme non contenu, donc létal — c'est-à-dire le comportement de `main`.
+
+Aucun accès disque.
+
+> **Correction assumée d'un point de F3 (première passe, session `b16f49b4`).**
+> F3 demandait d'ajouter `N>&M` **et `&>`** à la liste des formes *ignorées*.
+> `N>&M` : oui, appliqué ci-dessus. **`&>` : non — et c'est délibéré.** `&> f`
+> écrit réellement dans `f` (bash : stdout **et** stderr vers `f`). L'ignorer
+> serait sûr au sens fail-closed — le `>` non retiré laisse le motif matcher,
+> donc la commande reste létale — mais laisserait mourir un pilote sur
+> `cmd &> /tmp/log`, exactement la classe que ce ticket ferme. L'**intention**
+> de F3 (« ne pas fabriquer un faux confinement en mal-analysant une forme qui
+> n'est pas une cible fichier ») est portée intégralement ; elle s'applique à
+> `N>&M`, pas à `&>`. Ce point est resoumis à l'architecte en seconde passe : si
+> l'architecte maintient F3 à la lettre, `&>` bascule dans les formes ignorées,
+> au coût nommé ci-dessus.
 
 ### L2 — `_is_contained_redirect_target(dest) -> bool` (`tier1.py`)
 
@@ -296,6 +330,19 @@ les localise par `grep -n "_denial_is_terminal" tests/` et les cite par
   inchangée : ces write-kinds passent par `_destination_veto_reason`, que ce
   plan ne touche pas.
 
+Et, pour les formes de redirection énumérées en L1 :
+
+- `cmd 2>&1 | tail` → **reste non létal** (aucune cible fichier ; `2>&1` est
+  ignoré par L1 et déjà exempté en amont par `_FD_DEVNULL_RE`/le motif
+  `(?!\(|&[\d-])`). Test de non-régression : c'est l'idiome que cpp#130 cite
+  comme le survivant de la « two-character life-or-death gap ».
+- `cmd &> /tmp/log` → **devient non létal** (cible extraite, contenue) ;
+  `cmd &> /etc/log` → **reste létal**. C'est le couple qui prouve que `&>` est
+  traité comme une cible fichier et non ignoré (voir la correction assumée
+  en L1).
+- `cmd > >(tee f)` → **reste létal** (substitution de processus, motif `>\(`
+  indépendant du retrait).
+
 ### L6 — Test d'atteignabilité de `bash-cat-heredoc-tmp` (AC4, branche 1)
 
 Test asseyant, sur `cat > /tmp/<token> <<'EOF'…EOF` **seul**, la chaîne complète
@@ -350,6 +397,25 @@ La règle n'est **pas** retirée : la mesure M4 établit qu'elle est honorée.
 **Ajouté par ce plan (D4) :** l'extension de `_segment_write_kind` aux
 redirections — fichée en suivi, pas faite ici.
 
+## Fire-Disposition
+
+Trois des six livrables sont des **détecteurs** (L4, L5, L6). Leur disposition
+au tir est fixée ici, avant écriture, conformément à la gate mika#1574 — et non
+laissée à l'appréciation de l'implémenteur au moment où le rouge apparaît.
+
+| Livrable | Nature | Tir sur état PRÉEXISTANT | Tir à l'EXÉCUTION |
+|---|---|---|---|
+| **L4** — anti-vacuité (3 commandes mortes) | détecteur | **Attendu rouge**, et ce rouge est le livrable : il est capturé et collé dans le corps de la PR (AC3). Un L4 qui ne serait PAS rouge avant L3 invalide le test, pas le code. | **(c) halte-et-remontée.** Un échec après L3 signifie que le retrait ne couvre pas une des trois formes mortes : arrêt, pas d'ajustement du test. |
+| **L5** — non-régression (cpp#38/#42/#128/#130) | détecteur | **Attendu vert.** Un rouge préexistant sur `main` est une découverte, pas un test à corriger : halte et remontée à l'opérateur avant toute modification. | **(c) halte-et-remontée.** Un rouge après L3 signifie que le retrait a mordu sur une classe létale légitime. Arrêt. **Interdit explicitement : ajuster, marquer `xfail`, ou réécrire un test cpp#128/#130** — l'AC2 exige qu'ils soient *nommés*, pas *réécrits*. |
+| **L6** — atteignabilité `bash-cat-heredoc-tmp` | détecteur | **Attendu vert** (mesure M4 sur `e893c6d`). Un rouge préexistant contredirait M4 : halte et remontée — la branche « atteignable » de l'AC4 tomberait, et le choix AC4 devrait être rouvert avec l'architecte. | **(c) halte-et-remontée.** L6 est aussi le canari de D4 : s'il rougit après L3, c'est qu'un changement a atteint le chemin autorisé, ce que ce plan interdit. |
+| **L1/L2/L3** — extraction, prédicat, retrait | **pas des détecteurs** | Sans objet. | Sans objet : purement lexicaux, aucun état persistant n'est lu ni écrit, aucune base, aucun fichier. Le seul effet observable est la valeur de retour de `_denial_is_terminal`. |
+
+**Aucun détecteur de ce plan n'écrit d'état, n'ouvre de ticket, ni ne notifie.**
+Ce sont des tests `pytest`. La disposition « observations futures uniquement »
+ne s'applique donc à aucun d'eux ; la disposition unique est **(c)
+halte-et-remontée**, avec la seule exception nommée du rouge *attendu et
+capturé* de L4 avant L3.
+
 ## Risques
 
 - **R1 — « on rend non létale une commande qui écrit hors du worktree ».** Non :
@@ -365,10 +431,14 @@ redirections — fichée en suivi, pas faite ici.
   vivent dans la même fonction, dans cet ordre, avec un commentaire unique. Les
   tests d'arête de cpp#130 (`/dev/null.txt`, `/dev/nullified`,
   `/dev/null/../etc/passwd`) sont conservés tels quels et doivent rester verts.
-- **R4 — D2 (sur-ensemble de l'AC1) est refusé par l'architecte.** Repli chiffré
-  en D2 : déplacer l'appel vers le seul site `:1231`. Coût : une ligne déplacée,
-  deux cas de L4/L5 requalifiés, deux morts (lignes 3-4 de la mesure) laissées
-  ouvertes en suivi.
+- **R4 — le sur-ensemble de D2 rend survivable un refus PAR DÉFAUT
+  (`rule_id = None`), c'est-à-dire la posture « unknown, ask a human » du tier 2.**
+  C'est le risque réel de D2, et il est assumé : le refus reste un refus, la
+  commande n'est jamais exécutée, et la boucle de refus est bornée par
+  `maxTurns=200` — le seul des quatre garde-fous de séance qui borne réellement
+  une séance occupée-mais-stérile, comme l'établit le bloc de doctrine de
+  `_denial_is_terminal` (`permissions.py:706-718`). Ce que D2 rend survivable,
+  c'est un refus, pas une écriture.
 
 ## Références
 
