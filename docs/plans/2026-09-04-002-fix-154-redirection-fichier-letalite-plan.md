@@ -267,9 +267,14 @@ Aucun accès disque.
 > `cmd &> /tmp/log`, exactement la classe que ce ticket ferme. L'**intention**
 > de F3 (« ne pas fabriquer un faux confinement en mal-analysant une forme qui
 > n'est pas une cible fichier ») est portée intégralement ; elle s'applique à
-> `N>&M`, pas à `&>`. Ce point est resoumis à l'architecte en seconde passe : si
-> l'architecte maintient F3 à la lettre, `&>` bascule dans les formes ignorées,
-> au coût nommé ci-dessus.
+> `N>&M`, pas à `&>`.
+>
+> **TRANCHÉ en seconde passe (session `b16f49b4`, `Verdict: GROOMED`) :** la
+> correction est retenue. Verbatim de l'architecte — « la divergence sur `&>`
+> (conservé comme cible fichier) étant justifiée par l'objectif du ticket
+> (éviter les morts sur redirections vers /tmp) et documentée dans L1 avec tests
+> correspondants ajoutés en L5 ». **`&>` et `&>>` sont des cibles fichier
+> extraites et validées.** L'implémenteur ne rouvre pas ce point.
 
 ### L2 — `_is_contained_redirect_target(dest) -> bool` (`tier1.py`)
 
