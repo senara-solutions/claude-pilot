@@ -407,3 +407,159 @@ for f in <ces fichiers>; do tail -5 "$f" | grep -q 'error_during_execution' && e
   **non corrigé ici** : il mérite son propre ticket.
 - A2/A3 (exécution de scripts de test depuis une boucle) : décision de Vincent,
   distincte du GO sur A1.
+
+---
+
+## Journal d'exécution — volet (B), 2026-09-04
+
+GO opérateur reçu pour **(B) seul**. Le bandeau HOLD reste en place pour (A) :
+aucune ligne de `policies/permissions.yaml` ni d'aucun fichier de politique
+n'est touchée par ce travail.
+
+### Fourche B-repro — le verdict, et la branche de Fire-Disposition prise
+
+**Aucune cause locale.** L'étape 6 de la phase B-repro demandait d'inspecter ce
+que le SDK transmet pour un `PermissionResultDeny` dont le `message` est vide.
+Trois constats de code ferment l'hypothèse :
+
+1. Le refus observé ne passe **pas** par le site de règle mais par le
+   **chain-veto** : `bash-grep` est une règle `decision: allow`
+   (`policies/permissions.yaml:128-132`), donc la commande composée est
+   acceptée par la règle puis vetoée par `_bash_allow_is_chain_safe`. Son
+   message est le `veto_reason` construit sur place
+   (`permissions.py`, site chain-veto) — une f-string, jamais vide.
+2. Sur le site de règle, `PolicyRule.reason` est un champ requis
+   (`policy.py:40`) et `PolicyDefault.reason` a un défaut non vide
+   (`policy.py:65`).
+3. Le SDK sérialise le refus en `{"behavior": "deny", "message": …}`
+   (`claude_agent_sdk/_internal/query.py:523-526`) et la trace du ticket montre
+   le `[debug] user message (tool result) received` : **le refus est bien
+   arrivé au modèle, avec du contenu.**
+
+Le `last_content_type=n/a` décrit donc un message côté binaire embarqué, pas un
+`tool_result` vide de notre fait. La cause est strictement amont — cohérent
+avec C1.
+
+**Branche retenue : « B-repro reproduit la mort sans cause locale → B2a seul,
+plus B2c ».** B2b n'est pas livré parce qu'il n'y a rien à corriger à la source
+dans ce dépôt ; le dire vaut mieux que prétendre avoir guéri.
+
+**B2c — dette nommée, non exécutée ici.** Ouvrir un ticket amont chez
+claude-agent-sdk / claude-code est une action tournée vers l'extérieur, sur un
+dépôt tiers : elle sort des bornes de ce dispatch et revient à l'opérateur. Elle
+est portée dans le corps de la PR et dans le commentaire du ticket. **B2c ne
+remplace pas B2a**, qui est livré : le filet ne dépend de personne.
+
+### Phases livrées
+
+| Phase | État | Où |
+|---|---|---|
+| **B0** — journaliser la létalité | livrée | `ui.log_policy_deny(…, *, terminal)` (mot-clé **requis**), `permission_events` 7ᵉ champ `terminal`, `guardrails.note_policy_deny` appelé aux **quatre** sites `[policy:deny]` |
+| **B-repro** — reproduire | livrée | `tests/test_agent.py::_ede` + `_tool_result_user_message` rejouent la trace du 02:44 ; verdict ci-dessus |
+| **B1** — classer (AC2) | livrée | `EDE_AFTER_DENY_SUBTYPE`, `status` inchangé |
+| **B2a** — rendre non létal (AC1) | livrée | `_DenyResumeController` + boucle de sessions dans `_run_agent_inner` : **reprise de session SDK** (`ClaudeAgentOptions.resume`), budget `CLAUDE_PILOT_MAX_DENY_RESUMES` (défaut 2, plafond 5, `0` désactive), jamais silencieuse |
+| **B2b** — corriger à la source | **non livrée**, sans objet | voir le verdict B-repro |
+| **B2c** — ticket amont | **non livrée**, rendue à l'opérateur | hors bornes du dispatch |
+| **A1 / A2 / A3** | **non livrées** | HOLD maintenu, GO non donné |
+
+### AC5 — pourquoi le chiffre n'est pas dans cette PR
+
+AC5 se mesure **après déploiement, sur une fenêtre fraîche**, et la population
+qu'il décrit (« refus **non terminal** ») n'existe dans les journaux qu'à partir
+du premier binaire portant B0. Les journaux d'avant ne portent pas le suffixe :
+les y chercher rendrait zéro pour la mauvaise raison. C'est le risque nommé
+« le zéro d'AC5 peut être atteint par redéfinition de population », et la garde
+est de ne pas mesurer avant que la fenêtre existe.
+
+Commande de mesure, inchangée depuis § Commandes de vérification, et exécutable
+telle quelle une fois le binaire déployé :
+
+```
+grep -l 'policy:deny.*(non-terminal)' /var/log/claude-pilot/*.stderr
+```
+
+**Rappel de déploiement :** `make deploy` **n'installe pas** claude-pilot — le
+`Makefile` ligne 18 teste `claude-pilot-py/pyproject.toml` alors que le
+répertoire s'appelle `claude-pilot`. Un `uv tool install` manuel est requis
+avant toute mesure ; sans lui, la fenêtre fraîche ne s'ouvre jamais et AC5
+mesurerait un binaire d'hier.
+
+### Résidus nommés, non fermés ici
+
+- La troncature à 200 caractères de `_summarize_input` : le corps de la boucle
+  vetoée reste invisible en post-mortem. Défaut d'observabilité réel, mérite son
+  propre ticket (déjà « hors périmètre » dans ce plan).
+- Le champ `terminal` voyage sur le fil cm mais **cm ne le persiste pas encore** :
+  `PermissionEventRequest`
+  (`control-monitor/backend/crates/cm-api/src/routes/permission_events.rs`) ne
+  porte pas `#[serde(deny_unknown_fields)]`, donc le champ est ignoré, pas
+  rejeté. Le porteur qui compte aujourd'hui est la ligne stderr.
+- Les refus des chemins relais / interactif (`log_denied`, `interrupt=False`)
+  n'arment pas le marqueur. Ils ne sont atteignables que sous
+  `MIKA_PILOT_POLICY_DISABLED=1` (rollback d'urgence) et ne sont pas dans la
+  population mesurée par le ticket. Nommé, pas élargi.
+
+
+### Ce que la revue a corrigé — deux findings HIGH, tous deux réels
+
+La revue de code a trouvé deux défauts sérieux dans la première rédaction. Les
+deux sont corrigés ; ils sont consignés ici parce que chacun invalide une
+croyance que le plan portait.
+
+**1. Une reprise *in-process* était structurellement impossible.** La première
+rédaction rejouait un `client.query()` sur le même client et rouvrait
+`receive_response()`. Faux : quand le CLI émet un résultat d'erreur, *« it then
+exits non-zero on purpose »* — les mots du SDK lui-même, nommant
+`error_during_execution` (`claude_agent_sdk/_internal/query.py`) — et le lecteur
+met en file le `ResultError` traînant pour le prochain consommateur
+(`receive_messages` le **lève**). Lire au-delà du `ResultMessage` faisait donc
+remonter cette exception jusqu'à `cli.py`, qui écrivait un `subtype="fatal"`
+sans `task_id` ni `session_id` : la classification AC2 était **perdue sur le
+chemin principal**. Le correctif aurait été pire que l'absence de correctif.
+
+La reprise est désormais celle que le plan nommait en propre : un **nouveau**
+`ClaudeSDKClient` portant `ClaudeAgentOptions.resume=<session id>`, ouvert par
+une boucle de sessions. `_merge_stream` est revenu à sa forme d'origine et ne
+lit jamais au-delà d'un `ResultMessage` — la classe de panne est fermée par
+construction, pas par une garde. Une session reprise qui ne démarre pas est
+rattrapée et rend la **classification différée**, pour que l'échec du
+rattrapage ne coûte pas le diagnostic.
+
+**2. Le marqueur collant rendait un refus délibérément létal reprenable.** La
+première rédaction ne consultait que `nonterminal_policy_deny`, qui est
+**collant**. Un seul refus anodin en début de session (`echo probe; ls`) armait
+donc le marqueur pour de bon, et *toute* mort ultérieure — y compris un veto de
+confinement — devenait éligible à la reprise. Le commentaire affirmait
+l'inverse : vrai du veto pris isolément, faux d'une session. Et le test de
+non-régression ne l'attrapait pas, parce qu'il exerçait une session dont
+l'**unique** refus était létal — il vérifiait la prémisse, pas le monde.
+
+Deux vetos indépendants ferment le trou, et il en faut deux :
+`guardrails.terminal_policy_deny` (collant lui aussi : une session qui a une
+fois tenté de sortir de son worktree ne redevient pas fiable trois tours plus
+tard) et `ResultMessage.terminal_reason ∈ {aborted_tools, aborted_streaming}`,
+qui est le rapport du SDK lui-même sur une interruption que **nous** avons
+demandée. Le second ne dépend d'aucune de nos écritures : les deux devraient
+échouer ensemble. Un test par veto, chacun vérifié non vacu en le neutralisant.
+
+**Deux corrections mineures, du même mouvement.** Le prompt de reprise ne nomme
+plus `Write`/`Edit` : ces outils sont approuvés en tier1 sur `is_within_project`
+seul, là où une écriture Bash passe **en plus** la liste noire du plan de
+contrôle (cpp#42) — recommander la surface la plus faible à un modèle dont
+l'écriture vient d'être refusée aurait fait de ce texte un contournement. Et
+`CLAUDE_PILOT_MAX_DENY_RESUMES` échoue désormais vers **0**, pas vers le défaut :
+un opérateur qui tape `0.0` ou `false` pour couper la reprise ne doit pas la
+recevoir à plein régime. Plafond dur à 5, parce que chaque reprise ouvre une
+boucle CLI avec son propre `maxTurns` — le seul garde-fou qui borne réellement
+une boucle de refus occupée.
+
+### Ce qui reste non prouvé, et le dit
+
+La reprise est prouvée **à la couture** : des faux clients établissent qu'une
+seconde session est ouverte avec `resume=<session id>`, que le prompt de reprise
+est son premier message, et qu'un appel d'outil postérieur atteint les
+garde-fous. Elle n'est **pas** prouvée contre un vrai CLI — aucune session
+pilote n'a été lancée pendant ce travail. C'est exactement ce que mesure AC5 sur
+la fenêtre fraîche, et c'est pourquoi le levier de retrait
+(`CLAUDE_PILOT_MAX_DENY_RESUMES=0`) est documenté et testé : il laisse B0+B1
+debout, qui ne dépendent d'aucune hypothèse.

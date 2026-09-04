@@ -892,8 +892,15 @@ def _record_decision(
     ``PermissionResultDeny`` maps to wire ``"deny"``. AskUserQuestion answers
     are structurally ``PermissionResultAllow`` (they carry the answers dict
     as ``updated_input``) and therefore emit as ``allow``.
+
+    The wire's ``terminal`` field (cpp#151 B0) is DERIVED from the result object
+    rather than passed in: it is read off the very ``PermissionResultDeny`` the
+    SDK is about to receive, so the audit corpus and the runtime cannot say
+    different things about the same refusal, at any site, ever. ``None`` on the
+    allow paths, where lethality is not applicable.
     """
     decision = "allow" if isinstance(result, PermissionResultAllow) else "deny"
+    terminal = result.interrupt if isinstance(result, PermissionResultDeny) else None
     permission_events.emit(
         tool_name=tool_name,
         decision=decision,
@@ -901,6 +908,7 @@ def _record_decision(
         cwd=cwd,
         tool_use_id=ctx.tool_use_id or "",
         agent_id=ctx.agent_id,
+        terminal=terminal,
     )
     return result
 
@@ -1051,11 +1059,22 @@ def create_permission_handler(
                         "tier3-dangerous or command-substitution tail onto the "
                         "allowed prefix"
                     )
-                    log_policy_deny(tool_name, detail, pd.rule_id)
+                    # cpp#151 B0: ONE lethality computation, three consumers
+                    # (the log line, the SDK result, the audit event + session
+                    # marker). Calling `_denial_is_terminal` separately per
+                    # consumer would let them drift on a future edit.
+                    chain_terminal = _denial_is_terminal(tool_name, tool_input, cwd)
+                    log_policy_deny(
+                        tool_name, detail, pd.rule_id, terminal=chain_terminal
+                    )
+                    if guardrails is not None:
+                        guardrails.note_policy_deny(
+                            f"{tool_name}: {detail}", terminal=chain_terminal
+                        )
                     return _record_decision(
                         PermissionResultDeny(
                             message=veto_reason,
-                            interrupt=_denial_is_terminal(tool_name, tool_input, cwd),
+                            interrupt=chain_terminal,
                         ),
                         tool_name=tool_name,
                         rule_id=f"{pd.rule_id}:chain-veto",
@@ -1080,7 +1099,21 @@ def create_permission_handler(
                         tool_input.get("command", ""), cwd
                     )
                     if dest_veto is not None:
-                        log_policy_deny(tool_name, detail, pd.rule_id)
+                        # cpp#151 B0: `terminal=True` is a LITERAL here, not a
+                        # `_denial_is_terminal` call — this site's
+                        # `interrupt=True` is unconditional by design (see the
+                        # cpp#128 exception block above), and the log must say
+                        # so for the same reason the code does. On the session
+                        # this arms `terminal_policy_deny`, which VETOES the
+                        # cpp#151 resume for the rest of the run: a containment
+                        # breach is a kill we asked for and must never earn
+                        # another turn, not even via an earlier harmless
+                        # refusal that armed the survivable marker.
+                        log_policy_deny(tool_name, detail, pd.rule_id, terminal=True)
+                        if guardrails is not None:
+                            guardrails.note_policy_deny(
+                                f"{tool_name}: {detail}", terminal=True
+                            )
                         return _record_decision(
                             PermissionResultDeny(message=dest_veto, interrupt=True),
                             tool_name=tool_name,
@@ -1115,7 +1148,19 @@ def create_permission_handler(
                         cwd=cwd,
                         ctx=ctx,
                     )
-                log_policy_deny(tool_name, detail, pd.rule_id)
+                deny_terminal = _denial_is_terminal(tool_name, tool_input, cwd)
+                log_policy_deny(tool_name, detail, pd.rule_id, terminal=deny_terminal)
+                # cpp#151 B0/B1: mark the session when — and only when — the
+                # refusal is survivable. This is the site the ticket's eight
+                # dead sessions came through: a read-only composed command
+                # refused under `bash-grep`, non-terminal by
+                # `_denial_is_terminal`, and yet followed by an
+                # `error_during_execution`. The marker is what lets agent.py
+                # name that shape at exit (AC2) and offer it one resume (AC1).
+                if guardrails is not None:
+                    guardrails.note_policy_deny(
+                        f"{tool_name}: {detail}", terminal=deny_terminal
+                    )
                 # cpp#144: an AskUserQuestion refused here is the ordinary
                 # headless-pilot shape — the policy default-denies it (nobody
                 # is present to answer) and, being non-Bash, the refusal is
@@ -1129,7 +1174,7 @@ def create_permission_handler(
                 return _record_decision(
                     PermissionResultDeny(
                         message=pd.reason,
-                        interrupt=_denial_is_terminal(tool_name, tool_input, cwd),
+                        interrupt=deny_terminal,
                     ),
                     tool_name=tool_name,
                     rule_id=pd.rule_id or "policy-default",
@@ -1151,6 +1196,12 @@ def create_permission_handler(
             # retry loop into an operator-notification flood on the very channel
             # that compensates for non-lethal denials elsewhere.
             log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
+            # cpp#151 B0: terminal by design (unchanged by cpp#128 — an escalate
+            # exists to put a human in the loop). Recorded on the wire, and arms
+            # `terminal_policy_deny` so no resume is offered for the rest of the
+            # run — resuming past an escalate would defeat its only purpose.
+            if guardrails is not None:
+                guardrails.note_policy_deny(f"{tool_name}: {detail}", terminal=True)
             _fire_notify(tool_name, detail, pd.reason)
             return _record_decision(
                 PermissionResultDeny(message=pd.reason, interrupt=True),

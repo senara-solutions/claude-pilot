@@ -179,6 +179,22 @@ class ResultJson(BaseModel):
           negative control (cpp#144 AC2): a session that takes the same denial,
           adapts, and goes on to a `gh pr create` still reports "success" —
           the marker only weighs at exit, never mid-session.
+        - "error_during_execution:after_deny" (cpp#151) — the SDK loop ended in
+          `error_during_execution` and the session had earlier taken a
+          NON-TERMINAL policy refusal: one `_denial_is_terminal` judged
+          survivable, delivered to the model as a tool_result, and which the run
+          was supposed to continue past (cpp#128). Measured at 8 of 25 sessions
+          that took a refusal, against 0 of 15 that took none. Emitted only
+          after the bounded session-resume (CLAUDE_PILOT_MAX_DENY_RESUMES,
+          default 2) declined, was spent, or failed to come up;
+          `termination_reason` names the refusal and the resume attempts spent.
+          A run that took a DELIBERATELY lethal refusal — destination veto
+          (worktree containment / control plane), tier3-dangerous Bash, or
+          deny-with-notify — is never resumed: `guardrails.terminal_policy_deny`
+          vetoes it permanently, and an interrupt-abort the SDK reports as
+          `terminal_reason="aborted_tools"` is refused independently. Such a run
+          may still CARRY this subtype (naming a death is always safe); what it
+          can never do is buy another turn.
         - Guardrail aborts, from `GuardrailAbortReason.guardrail` below:
           "stall_detected", "empty_response", "idle_timeout" (cpp#54-era),
           "rate_limited" (cpp#119), and "awaiting_tool" / "awaiting_model"

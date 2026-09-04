@@ -763,3 +763,280 @@ def test_mkdir_tmp_scratch_is_permitted_but_other_outside_targets_stay_lethal(
     assert f("/etc/passwd") is False
     assert f("esc/via-symlink") is False, "relative -- not a literal /tmp/ operand"
     assert f("") is False
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#151 B0/B1 — the lethality of a refusal becomes readable, and the
+# survivable half marks the session
+#
+# cpp#128 split the DECISION from the LETHALITY and left the second half
+# unlogged: `ui.log_policy_deny` took no `terminal` argument and
+# `_record_decision` emitted only `decision` + `rule_id`. Standing in front of
+# the eight dead sessions in the cpp#151 body, nobody could say which ones
+# claude-pilot had ASKED to kill (destination veto, tier3-dangerous Bash —
+# correct by design) and which died DESPITE `interrupt=False`. These tests pin
+# both halves at once: the stderr suffix an operator greps, and the session
+# marker agent.py reads.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _deny_lines(captured: str) -> list[str]:
+    """Every `[policy:deny]`-family line in a captured stderr blob, ANSI intact.
+
+    Matching on the bare tag rather than the colored prefix keeps the helper
+    independent of the palette in `ui.py`.
+    """
+    return [ln for ln in captured.splitlines() if "[policy:deny" in ln]
+
+
+def test_151_nonterminal_rule_deny_says_so_and_marks_the_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exact shape that killed the ticket's sessions: a rule-based refusal
+    of a non-dangerous Bash command.
+
+    Three consumers of ONE lethality verdict are asserted together, because the
+    bug cpp#151 B0 closes is precisely that they could disagree: the SDK result
+    (`interrupt`), the operator-facing log line, and the session marker
+    agent.py later reads."""
+    policy_file = tmp_path / "rule_deny.yaml"
+    policy_file.write_text(
+        "rules:\n"
+        "  - id: bash-grep\n"
+        "    tool: Bash\n"
+        "    pattern: '^env \\| grep'\n"
+        "    decision: deny\n"
+        "    reason: composed read-only command not allow-listed\n"
+        "default:\n"
+        "  decision: allow\n"
+        "  reason: default allow (test fixture)\n"
+    )
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=guardrails,
+        policy_path=policy_file,
+    )
+    result = asyncio.run(
+        handler("Bash", {"command": "env | grep -c MIKA"}, _mock_ctx())
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "(non-terminal)" in lines[0], lines[0]
+    assert "bash-grep" in lines[0], lines[0]
+    assert guardrails.nonterminal_policy_deny is True
+    assert guardrails.nonterminal_policy_deny_summary is not None
+    assert "env | grep -c MIKA" in guardrails.nonterminal_policy_deny_summary
+
+
+def test_151_tier3_dangerous_deny_says_terminal_and_leaves_the_marker_clear(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NON-REGRESSION, arm 1 of 2 (ticket AC4 / plan § "Ce que (B) ne fait pas").
+
+    A tier3-dangerous Bash command is a refusal claude-pilot ASKS to be fatal.
+    It must keep `interrupt=True`, must say `(terminal)` in the log, and must
+    NOT arm the session marker — arming it would hand a deliberately lethal
+    class a free resume in agent.py, which is the one way this change could
+    have weakened the safety surface."""
+    policy_file = tmp_path / "rule_deny.yaml"
+    policy_file.write_text(
+        "rules:\n"
+        "  - id: deny-sed\n"
+        "    tool: Bash\n"
+        "    pattern: '^sed\\s'\n"
+        "    decision: deny\n"
+        "    reason: in-place edit refused\n"
+        "default:\n"
+        "  decision: allow\n"
+        "  reason: default allow (test fixture)\n"
+    )
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=guardrails,
+        policy_path=policy_file,
+    )
+    result = asyncio.run(
+        handler("Bash", {"command": "sed -i 's/a/b/' notes.txt"}, _mock_ctx())
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True, "cpp#128's deliberate lethal class must stay lethal"
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "(terminal)" in lines[0], lines[0]
+    assert "(non-terminal)" not in lines[0], lines[0]
+    assert guardrails.nonterminal_policy_deny is False, (
+        "a refusal we asked to be fatal must never arm the resume marker"
+    )
+
+
+def test_151_destination_veto_says_terminal_and_leaves_the_marker_clear(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NON-REGRESSION, arm 2 of 2: worktree containment.
+
+    A write escaping the worktree reaches the destination-veto site, whose
+    `interrupt=True` is unconditional by design (cpp#128's named exception).
+    Same three assertions as the tier3 arm — and the marker stays clear, so a
+    session that has already left its sandbox in intent cannot buy another
+    turn."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        guardrails=guardrails,
+        policy_path=_BUNDLED_POLICY,
+    )
+    result = asyncio.run(
+        handler("Bash", {"command": "mkdir -p /definitely/outside/x"}, _mock_ctx())
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "(terminal)" in lines[0], lines[0]
+    assert "(non-terminal)" not in lines[0], lines[0]
+    assert guardrails.nonterminal_policy_deny is False
+
+
+def test_151_chain_veto_reports_the_lethality_it_actually_returned(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The chain-veto site is the one whose verdict is COMPUTED rather than
+    literal, so both of its outcomes are pinned over the same command shape.
+
+    Inside the worktree the composed `mkdir` is refused and survivable; the
+    identical shape pointing outside is refused and fatal. If a future edit
+    made the log line quote a second, independently-computed verdict, one of
+    these two arms would disagree with its `interrupt`."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        guardrails=guardrails,
+        policy_path=_BUNDLED_POLICY,
+    )
+
+    inside = asyncio.run(
+        handler("Bash", {"command": 'echo "go"; mkdir -p docs/plans'}, _mock_ctx())
+    )
+    assert isinstance(inside, PermissionResultDeny)
+    assert inside.interrupt is False
+    inside_lines = _deny_lines(capsys.readouterr().err)
+    assert len(inside_lines) == 1, inside_lines
+    assert "(non-terminal)" in inside_lines[0], inside_lines[0]
+    assert guardrails.nonterminal_policy_deny is True
+
+    outside = asyncio.run(
+        handler(
+            "Bash",
+            {"command": 'echo "go"; mkdir -p /definitely/outside/x'},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(outside, PermissionResultDeny)
+    assert outside.interrupt is True
+    outside_lines = _deny_lines(capsys.readouterr().err)
+    assert len(outside_lines) == 1, outside_lines
+    assert "(terminal)" in outside_lines[0], outside_lines[0]
+    assert "(non-terminal)" not in outside_lines[0], outside_lines[0]
+
+
+def test_151_deny_with_notify_is_terminal_and_leaves_the_marker_clear(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`escalate` (deny-with-notify) was untouched by cpp#128 and stays
+    untouched here: terminal on the wire, `(terminal)` in the log, marker
+    clear. An escalate exists to put a human in the loop; resuming past one
+    would defeat its only purpose."""
+    policy_file = tmp_path / "escalate.yaml"
+    policy_file.write_text(
+        "rules:\n"
+        "  - id: escalate-skill\n"
+        "    tool: Skill\n"
+        "    pattern: '^test-target$'\n"
+        "    decision: escalate\n"
+        "    reason: rule-based test escalate\n"
+        "default:\n"
+        "  decision: allow\n"
+        "  reason: default allow (test fixture)\n"
+    )
+    guardrails = SessionGuardrails(GUARDRAIL_DEFAULTS.model_copy())
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        guardrails=guardrails,
+        policy_path=policy_file,
+    )
+
+    original = permissions_module._fire_notify
+    permissions_module._fire_notify = lambda *_a: None  # type: ignore[assignment]
+    try:
+        result = asyncio.run(handler("Skill", {"skill": "test-target"}, _mock_ctx()))
+    finally:
+        permissions_module._fire_notify = original  # type: ignore[assignment]
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "[policy:deny_with_notify]" in lines[0], lines[0]
+    assert "(terminal)" in lines[0], lines[0]
+    assert guardrails.nonterminal_policy_deny is False
+
+
+def test_151_terminal_flag_reaches_the_audit_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B0 step 3: the same verdict travels on the cm#99 side-channel.
+
+    Both arms in one test — a wire field that is always the same value carries
+    exactly as little as the absent field it replaces."""
+    emitted: list[dict[str, object]] = []
+
+    def _capture(**kwargs: object) -> None:
+        emitted.append(kwargs)
+
+    monkeypatch.setattr(permissions_module.permission_events, "emit", _capture)
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        policy_path=_BUNDLED_POLICY,
+    )
+    asyncio.run(handler("Bash", {"command": 'echo "go"; mkdir -p docs/plans'}, _mock_ctx()))
+    asyncio.run(
+        handler("Bash", {"command": "mkdir -p /definitely/outside/x"}, _mock_ctx())
+    )
+
+    assert len(emitted) == 2, emitted
+    assert emitted[0]["decision"] == "deny"
+    assert emitted[0]["terminal"] is False
+    assert emitted[1]["decision"] == "deny"
+    assert emitted[1]["terminal"] is True

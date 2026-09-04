@@ -24,14 +24,27 @@ block, or influence a decision. Concretely:
    (``deque(maxlen=…)``). Overflow (e.g. cm down for an hour) drops the
    oldest tail, never blocks the producer, never grows unbounded. AC3.
 
-**Contract (FIXED — must match cm ingestion at commit 27ee2f8).** Six fields,
+**Contract (FIXED — must match cm ingestion at commit 27ee2f8).** Seven fields,
 exactly — ``tool_name``, ``decision``, ``rule_id``, ``cwd``, ``tool_use_id``,
-``agent_id`` — assembled via an EXPLICIT allowlist in :func:`_build_body` so
+``agent_id``, ``terminal`` — assembled via an EXPLICIT allowlist in :func:`_build_body` so
 no adjacent decision-context field can ever be spread onto the wire (defense
 in depth for the corpus-side reconstruction cm already does — the cm side
 tolerates unknowns; the wire side never sends them). ``decision`` is
 normalised to lowercase ``"allow"`` or ``"deny"`` — cm rejects anything else
 with 400.
+
+``terminal`` (cpp#151 B0) is the seventh field and the only one cm does not yet
+persist. It says whether a refusal ALSO aborted the SDK agent loop
+(``PermissionResultDeny(interrupt=True)``) — the half of the cpp#128 split that
+was never recorded anywhere, which is why the eight dead sessions in the cpp#151
+body could not be separated into "claude-pilot asked for this kill" and "died
+despite ``interrupt=False``". ``None`` for an allow (not applicable). Verified
+safe to send ahead of the cm-side column: cm's ``PermissionEventRequest``
+(``control-monitor/backend/crates/cm-api/src/routes/permission_events.rs``)
+carries no ``#[serde(deny_unknown_fields)]``, so an unknown key is ignored, not
+rejected with 400. The load-bearing carrier of this signal is the stderr line
+(``ui.log_policy_deny``, which the AC5 measurement greps); this field is the
+same fact on the audit wire, ready the day cm adds the column.
 
 Env-var gating mirrors :mod:`inbox_writer`:
 
@@ -92,6 +105,7 @@ _ALLOWED_BODY_FIELDS: Final[tuple[str, ...]] = (
     "cwd",
     "tool_use_id",
     "agent_id",
+    "terminal",
 )
 
 #: Accepted decision values on the wire. cm rejects any other value with 400
@@ -160,6 +174,7 @@ class PermissionEventEmitter:
         cwd: str,
         tool_use_id: str,
         agent_id: str | None,
+        terminal: bool | None = None,
     ) -> None:
         """Enqueue one permission-decision event. Non-blocking, fail-open.
 
@@ -192,6 +207,10 @@ class PermissionEventEmitter:
             cwd=str(cwd),
             tool_use_id=str(tool_use_id) if tool_use_id is not None else "",
             agent_id=str(agent_id) if agent_id is not None else None,
+            # cpp#151 B0. Coerced defensively like the string fields above: a
+            # mid-refactor call site passing a non-bool must not crash the
+            # classifier, and `None` stays `None` (allow → not applicable).
+            terminal=bool(terminal) if terminal is not None else None,
         )
 
         with self._cond:
@@ -383,6 +402,7 @@ def _build_body(
     cwd: str,
     tool_use_id: str,
     agent_id: str | None,
+    terminal: bool | None = None,
 ) -> dict[str, Any]:
     """Assemble the wire body from named args ONLY.
 
@@ -398,6 +418,7 @@ def _build_body(
         "cwd": cwd,
         "tool_use_id": tool_use_id,
         "agent_id": agent_id,
+        "terminal": terminal,
     }
     # Structural assertion: the constructed body's key set MUST equal the
     # allowlist. This is a code-review invariant on top of the explicit
@@ -422,6 +443,7 @@ def emit(
     cwd: str,
     tool_use_id: str,
     agent_id: str | None,
+    terminal: bool | None = None,
 ) -> None:
     """Enqueue a permission-decision event. Non-blocking, fail-open.
 
@@ -436,6 +458,7 @@ def emit(
             cwd=cwd,
             tool_use_id=tool_use_id,
             agent_id=agent_id,
+            terminal=terminal,
         )
     except Exception:
         # Absolute fail-open backstop — the classifier callback must never
