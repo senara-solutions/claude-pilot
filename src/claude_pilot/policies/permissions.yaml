@@ -58,9 +58,9 @@ rules:
 
   - id: bash-for-loop-safe-body
     tool: Bash
-    pattern: '^for\s+\w+\s+in\s+[^;|&`><\\]+;\s*do\s+(echo|printf|grep|cat|head|tail|ls|wc|find|test|\[|dirname|basename)([^;|&`><\\]*);\s*done\s*$'
+    pattern: '^for\s+\w+\s+in\s+[^;|&`><\\]+;\s*do\s+(echo|printf|grep|cat|head|tail|ls|wc|find(?![^;]*(?:-delete|-exec|-execdir|-ok|-okdir|-fprint|-fls|-fprintf)\b)|test|\[|dirname|basename)(?![\w.\-/])([^;|&`><\\]*);\s*done\s*$'
     decision: allow
-    reason: "for-loop with enumerated read-only body (echo/printf/grep/cat/head/tail/ls/wc/find/test/[/dirname/basename); in-list + body-args exclude chain metachars/redirects/escapes; $var permitted (substitution caught upstream); fully anchored (cpp#92)"
+    reason: "for-loop with enumerated read-only body (echo/printf/grep/cat/head/tail/ls/wc/find/test/[/dirname/basename); `find` action flags (-delete/-exec*/-ok*/-fprint*/-fls) excluded; in-list + body-args exclude chain metachars/redirects/escapes; $var permitted (substitution caught upstream); fully anchored (cpp#92, hardened cpp#151)"
 
   # cpp#100: dev-groom's "explore-then-execute-with-fallback" compound.
   # Founding evidence — mika-spirit task 1a4244b6 (groom mika#1867) halted
@@ -156,6 +156,15 @@ rules:
   #     any `$(`, backtick, `$'` BEFORE this rule is evaluated).
   #   - Body command is one of 13 read-only shell primitives (all in tier1
   #     SAFE_SHELL_COMMANDS). Enumerated closed-world; no `eval`/`sh`/`bash`.
+  #     `find` carries an extra negative lookahead over its own body: the arg
+  #     charset excludes `;` (so `-exec … \;` cannot match) but NOT `-exec … {} +`
+  #     nor `-delete`, both of which execute or destroy. Closed cpp#151 while
+  #     writing the sibling battery — a pre-existing hole, found by testing the
+  #     rule rather than the ticket.
+  #     The `(?![\w.\-/])` tail after the alternation closes the same class of
+  #     hole by word prefix: without it `cat` claimed `catastrophe` and `ls`
+  #     claimed `lsof`, so an arbitrary binary whose name starts with an
+  #     allow-listed word ran under a closed-world allow-list.
   #   - Body args — same charset: excludes chain/redirect/escape; permits
   #     `$var` and quoted strings with variables (`"step $i"`).
   #   - Fully anchored `^…\s*done\s*$` — nothing rides before `for` or after
@@ -177,6 +186,31 @@ rules:
     pattern: "^for\\s+\\w+\\s+in\\s.*;\\s*do\\s"
     decision: allow
     reason: "shell-for loops for batch orientation queries — broad-shape fall-through for cases not covered by bash-for-loop-safe-body; chain-safe still applies (splits do/done body — typically vetoes)"
+
+  # cpp#151 volet A — `cd <dir> && for …` (AC3). Same contract as
+  # `bash-for-loop-orientation` directly above: a BROAD selector whose only job
+  # is to reach chain-safe. It grants nothing on its own — `_bash_allow_is_chain_safe`
+  # then either recognises the whole command as a sanctioned read-only loop
+  # (`_is_sanctioned_readonly_for_loop`, which is where every safety invariant
+  # lives, including the worktree-relative constraint on the `cd` target) or
+  # splits on `&&`/`;` and vetoes, as it does today.
+  #
+  # Why the selector is needed at all: without it, `cd docs && for f in *.md;
+  # do echo $f; cat $f; done` matches NO rule and dies on the policy default
+  # before chain-safe is ever consulted. The loop-only form reached chain-safe
+  # by accident — via `bash-grep`'s `\sgrep\s` — which is precisely the
+  # mis-arbitration cpp#151 documents.
+  #
+  # The path charset here excludes chain metachars/redirects/escapes so the
+  # selector cannot itself be the thing that matches a chained danger; it stays
+  # deliberately LOOSER than the helper (it admits `..`, `~`, absolute paths),
+  # because over-selecting is harmless — chain-safe is the decision — while
+  # under-selecting reproduces the default-deny that founded this ticket.
+  - id: bash-cd-for-loop-orientation
+    tool: Bash
+    pattern: "^cd\\s+[^\\s;|&`><\\\\]+\\s*&&\\s*for\\s+\\w+\\s+in\\s.*;\\s*do\\s"
+    decision: allow
+    reason: "cd <dir> && for … — broad-shape selector so chain-safe can arbitrate the loop; `_is_sanctioned_readonly_for_loop` carries the invariants, otherwise chain-safe splits and vetoes (cpp#151 volet A, AC3)"
 
   - id: bash-cat-heredoc-tmp
     tool: Bash
