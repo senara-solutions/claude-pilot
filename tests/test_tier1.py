@@ -16,9 +16,11 @@ import pytest
 from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
+    _is_contained_redirect_target,
     _is_safe_command_builtin,
     _is_safe_sort_command,
     _is_safe_xargs_command,
+    _redirect_targets,
     _split_compound_command,
     contains_unquoted_metacharacter,
     is_safe_bash_command,
@@ -1199,11 +1201,16 @@ class TestTier3DevnullRedirectLethality:
         assert is_tier3_dangerous_for_lethality("mika ask >> /dev/null") is False
 
     def test_real_write_target_stays_lethal(self) -> None:
-        # A redirect to an arbitrary path is a genuine write and stays fatal in
-        # both classifiers.
+        # A redirect to an arbitrary path OUTSIDE the contained set is a genuine
+        # escape and stays fatal in both classifiers.
+        #
+        # cpp#154 migrated one assertion out of this method: `mika ask >
+        # /tmp/exfil` was asserted lethal here, and `/tmp` is now a contained
+        # working-file destination. The inverted assertion lives in
+        # `TestTier3ContainedRedirectLethality` below, where its change of
+        # verdict is visible; nothing else in this cpp#130 class is touched.
         assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is True
         assert is_tier3_dangerous_for_lethality("echo hi >/etc/passwd") is True
-        assert is_tier3_dangerous_for_lethality("mika ask > /tmp/exfil") is True
 
     def test_danger_alongside_devnull_stays_lethal(self) -> None:
         # The strip removes only the /dev/null sink; a dangerous verb chained
@@ -1219,6 +1226,164 @@ class TestTier3DevnullRedirectLethality:
         # NOT strip, so the bare-`>` pattern still fires and it stays fatal.
         assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is True
         assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
+
+
+class TestTier3ContainedRedirectLethality:
+    """cpp#154: a redirect whose LITERAL target is contained — under `/tmp/` or
+    relative to the worktree — stays REFUSED but is no longer session-fatal.
+
+    Same shape and same single mechanism as cpp#130 one class above: only
+    `is_tier3_dangerous_for_lethality` narrows, `is_tier3_dangerous` (the
+    REFUSAL) is untouched, and nothing here widens any allow-list. The strip is
+    purely lexical on the text as written — no `Path.resolve()`, no `stat` — the
+    load-bearing choice `_is_sanctioned_tmp_scratch` documents at
+    `permissions.py:922-968`.
+    """
+
+    def test_contained_redirect_still_refused(self) -> None:
+        # Invariant kept: still tier3 for the REFUSAL, so still denied.
+        assert is_tier3_dangerous("echo hi > /tmp/scratch.md") is True
+        assert is_tier3_dangerous("echo hi > notes.txt") is True
+        assert is_tier3_dangerous("cmd &> /tmp/log") is True
+
+    def test_contained_redirect_not_lethal(self) -> None:
+        # The narrowing. Negative control: every one of these returns True
+        # without the fix.
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/scratch.md") is False
+        assert is_tier3_dangerous_for_lethality("echo hi >> /tmp/scratch.md") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > notes.txt") is False
+        assert (
+            is_tier3_dangerous_for_lethality("echo hi > docs/plans/x.md") is False
+        )
+        # Parameter expansion in the target (D3) — the two `mkdir` deaths of
+        # mika#2158 redirect to `/tmp/2158bodies/$n.md`, so excluding `$` would
+        # make AC3 fail while claiming to fix the ticket.
+        assert (
+            is_tier3_dangerous_for_lethality("gh issue view 1 > /tmp/b/$n.md")
+            is False
+        )
+        assert (
+            is_tier3_dangerous_for_lethality("gh issue view 1 2>/tmp/b/${n}.err")
+            is False
+        )
+        # cpp#154 migrated from `test_real_write_target_stays_lethal` (cpp#130).
+        assert is_tier3_dangerous_for_lethality("mika ask > /tmp/exfil") is False
+
+    def test_leading_expansion_target_stays_lethal(self) -> None:
+        # `$HOME/x` names the same destination as `~/x`; admitting it would make
+        # the `~` rejection one respelling away from useless. A `$` that is not
+        # the head of a parameter name fails closed for the same reason.
+        assert is_tier3_dangerous_for_lethality("echo hi > $HOME/x") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > ${HOME}/.bashrc") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > $OLDPWD/y") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > $(whoami)") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > $") is True
+        # Control: a MID-PATH expansion stays contained (D3) — undoing this
+        # would undo AC3, whose two `mkdir` deaths write `/tmp/.../$n.md`.
+        assert is_tier3_dangerous_for_lethality("cmd > /tmp/b/$n.md") is False
+
+    def test_strip_never_swallows_the_next_line(self) -> None:
+        # `_REDIRECT_RE` separates operator from target with `[ \t]*`, not
+        # `\s*`. With `\s*` a line-final `>` would take the next line's first
+        # token as its target and blank the VERB: `"echo done >\nbash -c 'id'"`
+        # would strip to `"echo done   -c 'id'"` and lose the `bash -c` match.
+        # Blanking a redirect must never blank a verb.
+        assert is_tier3_dangerous_for_lethality("echo done >\nbash -c 'id'") is True
+        assert is_tier3_dangerous_for_lethality("echo done >\nrm -rf /") is True
+        # The target is not extractable at all now, so the extractor fails
+        # closed rather than reaching across the newline.
+        assert _redirect_targets("echo done >\nbash -c 'id'") is None
+
+    def test_tmp_prefix_boundary(self) -> None:
+        # The direct analogue of cpp#130's `/dev/nullified` / `/dev/null.txt`
+        # boundary tests one class above: only a literal `/tmp/` prefix counts.
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmpfoo/x") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmpevil") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/ok") is False
+
+    def test_uncontained_redirect_stays_lethal(self) -> None:
+        # Absolute outside /tmp, `..` anywhere, and `~` are each disqualifying.
+        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > ../x") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/../etc/x") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > ~/x") is True
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp") is True
+        # A quoted target falls outside the charset — fail-closed, so lethal.
+        # `_redirect_targets` is NOT quote-aware: it hands the quote characters
+        # through and the charset rejects them. This trio pins that coupling, so
+        # a future widening of the charset cannot silently exempt a quoted
+        # target without one of these going red.
+        assert is_tier3_dangerous_for_lethality('echo hi > "/tmp/a b.md"') is True
+        assert is_tier3_dangerous_for_lethality("echo hi > '/tmp/a b.md'") is True
+        assert _redirect_targets('echo hi > "/tmp/a') == ['"/tmp/a']
+
+    def test_danger_alongside_contained_redirect_stays_lethal(self) -> None:
+        # AC2: the strip removes the REDIRECT, never the dangerous verb.
+        assert is_tier3_dangerous_for_lethality("rm -rf /tmp/y > /tmp/log") is True
+        assert (
+            is_tier3_dangerous_for_lethality("git push --force origin x > /tmp/log")
+            is True
+        )
+        assert is_tier3_dangerous_for_lethality("sed -i s/a/b/ f > notes.txt") is True
+        assert is_tier3_dangerous_for_lethality('bash -c "id" > notes.txt') is True
+
+    def test_non_file_redirect_forms(self) -> None:
+        # `2>&1` names no file: ignored by the extractor, and already exempt
+        # upstream via the `(?!\(|&[\d-])` lookahead. This is the idiom cpp#130
+        # names as the survivor of its "two-character life-or-death gap".
+        assert is_tier3_dangerous_for_lethality("cmd 2>&1 | tail") is False
+        assert is_tier3_dangerous_for_lethality("mika ask >&-") is False
+        # `&>` DOES write a file (bash: stdout AND stderr into it), so its
+        # target is extracted and validated like any other — contained passes,
+        # un-contained stays fatal. This pair is the proof that `&>` is not
+        # silently treated as an fd-manipulation form.
+        assert is_tier3_dangerous_for_lethality("cmd &> /tmp/log") is False
+        assert is_tier3_dangerous_for_lethality("cmd &>> /tmp/log") is False
+        assert is_tier3_dangerous_for_lethality("cmd &> /etc/log") is True
+        assert is_tier3_dangerous_for_lethality("cmd &>> /etc/log") is True
+        # `N>>` is an extracted form too — the last of the six to get coverage.
+        assert is_tier3_dangerous_for_lethality("cmd 2>> /tmp/log") is False
+        assert is_tier3_dangerous_for_lethality("cmd 2>> /etc/log") is True
+        # Process substitution keeps its own `>\(` / `<\(` patterns,
+        # independent of the strip — `_REDIRECT_RE` never even matches `<(`.
+        assert is_tier3_dangerous_for_lethality("cmd > >(tee f)") is True
+        assert is_tier3_dangerous_for_lethality("cmd < <(foo)") is True
+
+    def test_devnull_edges_of_cpp130_unchanged(self) -> None:
+        # R3: the two strips live in one function in a load-bearing order.
+        # cpp#130's trailing-boundary edges must stay exactly as they were —
+        # `/dev/null...` is absolute and outside `/tmp/`, so the cpp#154 strip
+        # does not reach them either.
+        assert is_tier3_dangerous_for_lethality("grep -c a b >/dev/null") is False
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null.txt") is True
+
+    def test_extractor_fails_closed(self) -> None:
+        # A redirect with no extractable operand yields `None`, and the caller
+        # then strips nothing at all — `main`'s behaviour, i.e. lethal.
+        assert _redirect_targets("echo hi > /tmp/a.md") == ["/tmp/a.md"]
+        assert _redirect_targets("cmd > /tmp/a 2>/tmp/b") == ["/tmp/a", "/tmp/b"]
+        assert _redirect_targets("cmd 2>&1") == []
+        assert _redirect_targets("cmd >") is None
+        assert _redirect_targets("cmd > | tail") is None
+        # One un-extractable redirect blocks the strip for the whole command.
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/a.md; cmd >") is True
+
+    def test_contained_predicate_unit(self) -> None:
+        assert _is_contained_redirect_target("/tmp/a.md") is True
+        assert _is_contained_redirect_target("notes.txt") is True
+        assert _is_contained_redirect_target("docs/plans/x.md") is True
+        assert _is_contained_redirect_target("/tmp/b/$n.md") is True
+        assert _is_contained_redirect_target("") is False
+        assert _is_contained_redirect_target("/etc/passwd") is False
+        assert _is_contained_redirect_target("/tmp") is False
+        assert _is_contained_redirect_target("~/x") is False
+        assert _is_contained_redirect_target("../x") is False
+        assert _is_contained_redirect_target("/tmp/../etc/x") is False
+        # /dev/null is handled upstream by `_STDOUT_DEVNULL_RE`; this predicate
+        # deliberately does not duplicate it.
+        assert _is_contained_redirect_target("/dev/null") is False
 
 
 class TestSafeBashOutputRedirectIntegration:
