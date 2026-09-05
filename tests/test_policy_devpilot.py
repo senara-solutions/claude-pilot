@@ -1662,6 +1662,52 @@ def test_cpp154_mixed_contained_and_uncontained_redirects_stay_terminal(
     )
 
 
+# The exact command the pilot of mika#2179 died on, values already redacted by
+# the `sed` that killed it. Kept whole and named: the tier3 classifier alone is
+# not what ended that run — `_denial_is_terminal` is.
+INCIDENT_MIKA2179 = (
+    "env | grep -iE 'gh_token|github' | sed 's/=.*/=<set>/' ; echo \"---\"; "
+    "ls ~/.config/gh/hosts.yml 2>&1; echo \"---\"; "
+    "grep -o 'MIKA_GITHUB_TOKEN' ~/.mika/.env 2>/dev/null | head -1"
+)
+
+
+def test_cpp157_the_mika2179_pilot_death_survives(tmp_path: Path) -> None:
+    """AC3 anti-vacuity replay at the level that actually killed the run.
+
+    On `main` this measures `True` — the captured red. The chain is still
+    REFUSED, and correctly so: `_bash_allow_is_chain_safe` cannot honour a `;`
+    chain, and cpp#157 does not touch that. Only the lethality changes, so the
+    model gets a `tool_result` error it can adapt instead of the run being ended.
+
+    Negative control on the cause: the lethality was carried by ONE segment, the
+    quoted `>` of `sed 's/=.*/=<set>/'`. On `main` that segment ALONE measures
+    lethal while the chain DEPRIVED of it does not — which is what rules out the
+    "lethality by chain aggregation" diagnosis this ticket was first filed under.
+    """
+    cwd = _make_worktree(tmp_path)
+    assert _denial_is_terminal("Bash", _bash(INCIDENT_MIKA2179), cwd) is False
+    assert _denial_is_terminal("Bash", _bash("sed 's/=.*/=<set>/'"), cwd) is False
+
+
+def test_cpp157_a_real_redirect_still_ends_the_run(tmp_path: Path) -> None:
+    """AC2/AC3 replay 2 at the `_denial_is_terminal` level: the mask blanks a
+    `<`/`>` only inside quotes, so a genuine redirect to an un-contained
+    destination is untouched and stays terminal — `True` before AND after."""
+    cwd = _make_worktree(tmp_path)
+    for cmd in (
+        "grep x > /etc/y",
+        "echo a > $HOME/z",
+        "echo a > ~/x",
+        "echo a > ../x",
+        "echo 'a>b' > /etc/passwd",
+    ):
+        assert _denial_is_terminal("Bash", _bash(cmd), cwd) is True, cmd
+    # D1: the mask blanks two characters, never a verb — a dangerous command
+    # quoted whole is still fatal.
+    assert _denial_is_terminal("Bash", _bash("echo 'rm -rf /'"), cwd) is True
+
+
 def test_cpp154_bash_cat_heredoc_tmp_is_reachable_end_to_end(tmp_path: Path) -> None:
     """AC4, branch 1 (`reachable`): the `bash-cat-heredoc-tmp` allow rule
     (`permissions.yaml:215`) is honoured by the WHOLE chain, not just by
