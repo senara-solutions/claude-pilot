@@ -379,6 +379,89 @@ def _strip_contained_redirects(command: str) -> str:
     return _REDIRECT_RE.sub(_replace, command)
 
 
+# ── A `<`/`>` INSIDE QUOTES is not a redirect operator (cpp#157) ─────────────
+#
+# The generic `>` entry of `TIER3_PATTERNS` (`:203`) is quote-blind, so it counts
+# as a redirection a `>` that bash reads as ordinary text — the replacement half
+# of `sed 's/=.*/=<set>/'`. Measured: that ONE segment carries the lethality on
+# its own (`is_tier3_dangerous_for_lethality` on the segment alone = True; on the
+# incident chain DEPRIVED of it = False). The form-level refusal it rides on
+# therefore became TERMINAL and killed the pilot of mika#2179 — the fourth pilot
+# death on denial lethality in 48 h (2026-09-05).
+#
+# TWO CHARACTERS, NOT THE QUOTED REGION. The mask blanks `<` and `>` inside a
+# quoted region and NOTHING else. Blanking the whole region would be shorter to
+# write and far wider: `echo 'rm -rf /'` would stop matching `rm -rf` — a verdict
+# change on a class this ticket does not touch and which has nothing to do with
+# redirects. Every other `TIER3_PATTERNS` entry keeps seeing exactly the text it
+# sees on `main`. The corollary is the control that distinguishes the two
+# variants, and it is pinned: `echo 'rm -rf /'` stays lethal.
+#
+# UNTERMINATED QUOTE → RETURN THE COMMAND UNCHANGED, i.e. `main`'s verdict, i.e.
+# lethal. This sense of conservatism is the INVERSE of the two scanners below
+# (`_split_compound_command`, `contains_unquoted_metacharacter`), which treat the
+# remainder as INSIDE the quote — and the inversion is deliberate. Those two
+# decide an ALLOWANCE, so their fail-closed direction is "refuse"; this one
+# decides a LETHALITY, so its fail-closed direction is "do not exempt". Same
+# principle, opposite-facing questions.
+#
+# THIRD QUOTE SCANNER, knowingly. Merging the three is out of scope for a p1
+# lethality fix — two of them sit on the ALLOW path and each carries its own
+# documented conservatism (above). The debt is pinned instead by
+# `TestQuoteScannerBoundaryParity`, a CHARACTERIZATION test: it records where
+# each of the three scanners places a quoted region today, INCLUDING the one
+# boundary on which the two pre-existing scanners already disagree on `main`
+# (`echo "a\\"` — `_split_compound_command` only treats `\X` as an escape pair
+# when `X` is `"`, so it swallows the closing quote and leaves the region open,
+# while `contains_unquoted_metacharacter` skips `\X` atomically and closes it).
+# This mask follows the atomic form, i.e. POSIX and the second scanner. Extracting
+# a shared `_quote_spans()` is filed as follow-up, not done here.
+#
+# Length is preserved (one space per masked character), so no downstream regex
+# index shifts and no two tokens can be glued together.
+def _mask_quoted_redirect_chars(command: str) -> str:
+    r"""Blank every ``<`` and ``>`` that falls inside a single- or double-quoted
+    region; leave the rest of the command byte-for-byte intact (cpp#157).
+
+    Purely lexical — no ``cwd``, no filesystem, ``(str) -> str`` — as
+    ``permissions._is_sanctioned_tmp_scratch`` (`:922-968`) requires of everything
+    on this path. Quote semantics mirror ``contains_unquoted_metacharacter``:
+
+    - Outside quotes, ``'`` and ``"`` open a region.
+    - Inside ``"..."``, ``\X`` is an escape pair consumed atomically (so ``\"``
+      does not close the region); a bare ``"`` closes it.
+    - Inside ``'...'``, backslash is literal — only ``'`` closes.
+    - An unterminated quote returns the command UNCHANGED (fail-closed toward
+      lethal; see the header comment for why this direction is inverted).
+    """
+    n = len(command)
+    i = 0
+    quote_state: str | None = None  # None / "'" / '"'
+    out = list(command)
+
+    while i < n:
+        ch = command[i]
+        if quote_state is None:
+            if ch in ("'", '"'):
+                quote_state = ch
+            i += 1
+            continue
+        if quote_state == '"' and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == quote_state:
+            quote_state = None
+            i += 1
+            continue
+        if ch in ("<", ">"):
+            out[i] = " "
+        i += 1
+
+    if quote_state is not None:
+        return command
+    return "".join(out)
+
+
 def is_tier3_dangerous_for_lethality(command: str) -> bool:
     """`is_tier3_dangerous`, but a redirect whose target writes nowhere
     (`/dev/null`, cpp#130) or writes a CONTAINED working file (under `/tmp` or
@@ -406,13 +489,30 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
     /dev/null strip so cpp#130's trailing-boundary edge cases (`/dev/null.txt`,
     `/dev/nullified`, `/dev/null/../etc/passwd`) keep their own behaviour.
 
-    ORDER IS LOAD-BEARING: /dev/null first (cpp#130), contained targets second
-    (cpp#154). Both live in this one function, and `_denial_is_terminal` is the
-    single consumer — cpp#151 B0 collapsed three separate lethality computations
-    into one precisely so two notions of "fatal" could not drift apart.
+    cpp#157 adds a third narrowing, and it runs INNERMOST: a `<` or `>` sitting
+    inside a quoted region is ordinary text to bash, not a redirect operator, so
+    it is masked before any pattern runs. `sed 's/=.*/=<set>/'` is no longer on
+    its own session-fatal — while staying REFUSED, unchanged, since
+    `is_tier3_dangerous` is not touched.
+
+    ORDER IS LOAD-BEARING, now across three narrowings: quoted `<`/`>` masked
+    FIRST (cpp#157), /dev/null second (cpp#130), contained targets third
+    (cpp#154). The mask must come first because the two later strips extract
+    redirect TARGETS, and a quoted `>` fabricates a phantom one: on `main`,
+    `_redirect_targets("echo 'a>b'")` yields `["b'"]`, which
+    `_is_contained_redirect_target`'s charset rejects only by the accident of the
+    trailing quote. Masking first removes the phantom target outright instead of
+    relying on that accident. The relative order of cpp#130 and cpp#154 is
+    unchanged, so their edge cases (`/dev/nullified`, `/dev/null.txt`,
+    `/dev/null/../etc/passwd`) keep their own behaviour. All three live in this
+    one function, and `_denial_is_terminal` is the single consumer — cpp#151 B0
+    collapsed three separate lethality computations into one precisely so two
+    notions of "fatal" could not drift apart.
     """
     return is_tier3_dangerous(
-        _strip_contained_redirects(_STDOUT_DEVNULL_RE.sub(" ", command))
+        _strip_contained_redirects(
+            _STDOUT_DEVNULL_RE.sub(" ", _mask_quoted_redirect_chars(command))
+        )
     )
 
 

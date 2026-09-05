@@ -28,6 +28,7 @@ from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
     _is_contained_redirect_target,
+    _mask_quoted_redirect_chars,
     _redirect_targets,
     _split_compound_command,
     is_safe_bash_command,
@@ -1077,9 +1078,24 @@ def _redirect_destination_veto_reason(command: str, cwd: str) -> str | None:
     so `is_tier3_dangerous_for_lethality` returned ``True`` and the caller
     returned before getting here. The predicate is re-checked anyway rather than
     assumed — the two call sites must not be able to drift into disagreement.
+
+    The command is masked by `_mask_quoted_redirect_chars` first (cpp#157) for
+    exactly that reason. `_redirect_targets` is quote-blind, so on the RAW text a
+    `>` inside quotes fabricates a phantom target — `"echo 'a>b'"` yields
+    `["b'"]` — that names nothing bash will ever write to. Upstream,
+    `is_tier3_dangerous_for_lethality` no longer sees that `>` at all, so without
+    the mask this function would be reasoning about redirects its own caller has
+    already ruled out, and the invariant stated just above would be false. The
+    direction is monotone and safe: the mask can only REMOVE phantom targets,
+    never add one, and a phantom target is by construction a destination where no
+    byte is written. Measured on the mika#2179 incident chain, both vetoes return
+    ``None`` with AND without the mask — this is for coherence, not for the
+    verdict. Two components answering the same question and drifting apart is the
+    exact failure mode cpp#151 B0 closed.
     """
     if not isinstance(command, str) or not command:
         return None
+    command = _mask_quoted_redirect_chars(command)
     targets = _redirect_targets(command)
     if targets is None:
         return None
