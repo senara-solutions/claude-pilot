@@ -1456,6 +1456,24 @@ class TestTier3QuotedRedirectCharLethality:
             is True
         )
 
+    def test_escaped_quote_outside_quotes_opens_no_region(self) -> None:
+        # Review finding, caught before merge: a backslash OUTSIDE quotes escapes
+        # the next character, so `\\'` is a literal apostrophe and opens nothing.
+        # Without that guard, the two escaped quotes below bracket a REAL
+        # redirect, the mask blanks it, and `> /etc/passwd` becomes survivable —
+        # the exact class AC2 forbids. `True` on `main`, and `True` here.
+        assert is_tier3_dangerous_for_lethality("echo \\' > /etc/passwd \\'") is True
+        assert is_tier3_dangerous_for_lethality('echo \\" > /etc/passwd \\"') is True
+        assert _mask_quoted_redirect_chars("echo \\' > /etc/passwd \\'") == (
+            "echo \\' > /etc/passwd \\'"
+        )
+        # The escaped char is consumed but never masked, so `\\>` — a literal `>`
+        # to bash — stays visible to the pattern and stays lethal (fail-closed).
+        # Target `/etc/passwd`, not a relative one: `echo a \\> b` measures False
+        # on `main` ALREADY, because cpp#154 strips a contained target — nothing
+        # to do with this mask, and it would pin the wrong mechanism.
+        assert is_tier3_dangerous_for_lethality("echo a \\> /etc/passwd") is True
+
     def test_cpp130_and_cpp154_edges_are_named_not_rewritten(self) -> None:
         # L5.4: the mask preserves length and never touches a line ending, so the
         # cpp#154 edge that a redirect strip must never swallow the next line

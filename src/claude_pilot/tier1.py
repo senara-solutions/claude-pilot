@@ -427,7 +427,8 @@ def _mask_quoted_redirect_chars(command: str) -> str:
     ``permissions._is_sanctioned_tmp_scratch`` (`:922-968`) requires of everything
     on this path. Quote semantics mirror ``contains_unquoted_metacharacter``:
 
-    - Outside quotes, ``'`` and ``"`` open a region.
+    - Outside quotes, ``'`` and ``"`` open a region, and ``\X`` is an escape
+      pair consumed atomically — so an escaped quote opens nothing.
     - Inside ``"..."``, ``\X`` is an escape pair consumed atomically (so ``\"``
       does not close the region); a bare ``"`` closes it.
     - Inside ``'...'``, backslash is literal — only ``'`` closes.
@@ -442,6 +443,19 @@ def _mask_quoted_redirect_chars(command: str) -> str:
     while i < n:
         ch = command[i]
         if quote_state is None:
+            if ch == "\\" and i + 1 < n:
+                # A backslash OUTSIDE quotes escapes the next character, so `\'`
+                # is a literal apostrophe and does NOT open a quoted region.
+                # Consuming the pair is load-bearing, not tidiness: without it
+                # `echo \' > /etc/passwd \'` opens a phantom region at the first
+                # `\'` and closes it at the second, masking a redirect bash
+                # performs for real — a genuine `> /etc/passwd` turned survivable,
+                # which is exactly what AC2 forbids. The escaped character is
+                # consumed but NEVER masked, so `\>` (a literal `>` to bash)
+                # stays visible to the pattern and stays lethal: the residue
+                # falls on the fail-closed side.
+                i += 2
+                continue
             if ch in ("'", '"'):
                 quote_state = ch
             i += 1
