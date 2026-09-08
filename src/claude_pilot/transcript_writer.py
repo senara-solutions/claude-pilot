@@ -41,9 +41,25 @@ PILOT_TRANSCRIPT_SCHEMA_VERSION = "v1"
 # would write the same tokens twice.
 _RECORDED_MESSAGES = (AssistantMessage, ResultMessage)
 
-# Set after the first write failure. A missing mount would otherwise emit one
+# Set after the first I/O failure. A missing mount would otherwise emit one
 # error line per SDK message and drown the session's stderr.
 _disarmed = False
+
+# Same throttle for the non-fatal skips, which do NOT disarm the writer.
+_warned_serialization = False
+
+
+def _warn_once(flag: str, detail: str) -> None:
+    """Log ``detail`` the first time ``flag`` fires, then stay quiet.
+
+    A silent skip is the exact sin this ticket exists to fix, so the first one
+    is always reported; the rest are suppressed because a session can carry
+    thousands of messages.
+    """
+    if globals()[flag]:
+        return
+    globals()[flag] = True
+    log_error("pilot-transcript", [detail])
 
 
 def transcript_line(message: AssistantMessage | ResultMessage) -> dict[str, Any]:
@@ -89,6 +105,20 @@ def record_sdk_message(message: object) -> bool:
     if not path:
         return False
 
+    # Serialised BEFORE the file is touched, and its failure is handled
+    # SEPARATELY: an exotic value `asdict`/`json.dumps` cannot render is a
+    # property of ONE message, while an unwritable path is a property of the
+    # whole session. Sharing one handler would let a single odd tool input
+    # disarm the writer for every message that followed it.
+    try:
+        # `default=str` is load-bearing: `asdict` recurses through the
+        # dataclasses but stops at `Any` (`ToolUseBlock.input`,
+        # `ResultMessage.structured_output`).
+        line = json.dumps(transcript_line(message), default=str)
+    except Exception as exc:
+        _warn_once("_warned_serialization", f"skipped one message: {exc}")
+        return False
+
     try:
         # The producer mounts the directory, but creating it here removes the
         # cheapest whole-session failure class for one syscall.
@@ -97,15 +127,10 @@ def record_sdk_message(message: object) -> bool:
         # Opened per line on purpose: no long-lived handle to survive a crash,
         # and a file the producer creates late is picked up on the next write.
         with target.open("a", encoding="utf-8") as fh:
-            # `default=str` is load-bearing: `asdict` recurses through the
-            # dataclasses but stops at `Any` (`ToolUseBlock.input`,
-            # `ResultMessage.structured_output`), so one exotic value would
-            # otherwise raise here and — per the fail-open posture — lose the
-            # line silently.
-            fh.write(json.dumps(transcript_line(message), default=str) + "\n")
-    # Broad on purpose: fail open. Any failure here must cost the session
-    # nothing — a transcript is observability, not the product.
-    except Exception as exc:
+            fh.write(line + "\n")
+    # Fail open: the path is unusable for the rest of the session, so stop
+    # trying. A transcript is observability, never the product.
+    except OSError as exc:
         _disarmed = True
         log_error("pilot-transcript", [f"disabled after write failure on {path}: {exc}"])
         return False

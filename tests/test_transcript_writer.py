@@ -42,10 +42,11 @@ from tests.test_agent import (
 @pytest.fixture(autouse=True)
 def _rearm_writer(monkeypatch: pytest.MonkeyPatch) -> None:
     """The writer disarms itself for the rest of the session after its first
-    write failure (one error line, not one per SDK message). That flag is
-    module state, so a failure test would silently mute every test that ran
-    after it. Re-arm before each test."""
+    I/O failure, and throttles its skip warnings the same way. Both are module
+    state, so a failure test would silently mute every test that ran after it.
+    Re-arm before each test."""
     monkeypatch.setattr(transcript_writer, "_disarmed", False)
+    monkeypatch.setattr(transcript_writer, "_warned_serialization", False)
 
 
 def _read_lines(path: Path) -> list[dict[str, Any]]:
@@ -224,3 +225,30 @@ def test_result_message_is_recorded_even_when_the_branch_breaks_early() -> None:
     with no dependency on how the branch below it exits."""
     assert transcript_writer.transcript_line(_result())["schema_version"] == "v1"
     assert isinstance(_result(), ResultMessage)
+
+
+def test_one_unrenderable_message_does_not_disarm_the_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A message the serializer cannot render is a property of THAT message; an
+    unwritable path is a property of the session. Sharing one handler would let
+    a single odd tool input silently end the transcript — the same class of
+    silent loss this ticket exists to close."""
+    log_file = tmp_path / "t.jsonl"
+    monkeypatch.setenv("ANTHROPIC_LOG_FILE", str(log_file))
+
+    def _explode(_message: Any) -> dict[str, Any]:
+        raise TypeError("cannot render this one")
+
+    monkeypatch.setattr(transcript_writer, "transcript_line", _explode)
+    assert transcript_writer.record_sdk_message(_result()) is False
+    assert transcript_writer._disarmed is False, "a skipped message must not disarm the writer"
+
+    monkeypatch.undo()
+    monkeypatch.setenv("ANTHROPIC_LOG_FILE", str(log_file))
+    assert transcript_writer.record_sdk_message(_result()) is True
+    assert len(_read_lines(log_file)) == 1
+
+    assert capsys.readouterr().err.count("skipped one message") == 1
