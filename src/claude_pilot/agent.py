@@ -31,6 +31,7 @@ from .heartbeat import emit_heartbeat, emit_heartbeat_throttled
 from .inbox_writer import post_handoff
 from .permissions import CanUseTool
 from .tier1 import DENIED_BASH_PATTERNS_HINT
+from .transcript_writer import record_sdk_message
 from .types import ResultJson
 from .ui import (
     log_deny_resume,
@@ -445,6 +446,17 @@ async def _run_agent_inner(
                             except Exception:
                                 pass
                             return 1
+
+                        # cpp#165: the pilot-transcript hook. Deliberately at the TOP
+                        # of the loop body rather than inside the AssistantMessage /
+                        # ResultMessage branches below: the ResultMessage branch can
+                        # `break` before doing anything (cpp#151's deny-resume), so a
+                        # writer sitting inside it would lose exactly the sessions
+                        # that died on a refusal — the population a transcript is
+                        # there to diagnose. One site, no branch can escape it.
+                        # No-op unless $ANTHROPIC_LOG_FILE is set (mika dispatch);
+                        # never raises. See transcript_writer.py.
+                        record_sdk_message(message)
 
                         # cpp#123: StreamEvent is the highest-volume message on the
                         # stream (`include_partial_messages=True`, agent.py options
