@@ -1320,6 +1320,135 @@ def test_dest_validator_fail_closed_on_unparseable_destination(tmp_path: Path) -
     assert _extract_write_destinations("bash-mkdir", "mkdir") is None
 
 
+# ── cpp#150: `bash-mkdir` regex backtracking (greedy flag-group escape) ───────
+#
+# The rule's own `reason` claims relative-only targets, but the optional
+# flag-group `(\s+-\S+)*` could backtrack to zero reps, letting the mandatory
+# `\s+` re-anchor on the space right after `mkdir` and the lookaheads test the
+# FLAG token (`-p`, never `/`/`~`/`$`) instead of the actual target --
+# `mkdir -p /etc/evil` matched, `decision=allow, rule_id=bash-mkdir`, for ANY
+# absolute path regardless of flags. Confirmed empirically against Python's
+# `re` (see the plan doc). Not a live hole -- `_destination_veto_reason`
+# independently vetoes the write at runtime by leading command word, never by
+# this rule_id (cpp#38/#42) -- but the YAML rule did not do what it claimed.
+#
+# Fix mirrors `bash-cp-mv`'s own construction: scan the WHOLE remainder for
+# `\s/`, `\s~`, `\s$` (not just the position right after the mandatory `\s+`),
+# which holds regardless of how the flag-group backtracks.
+#
+# `/tmp/...` is a DELIBERATE exception (`bash-mkdir-tmp-scratch`), not a
+# residual bug: cpp#143's sanctioned /tmp scratch mkdir previously reached
+# `allow` only as a side effect of this SAME backtracking bug, so fixing the
+# bug without restoring the exception explicitly would have silently
+# regressed cpp#143 (the directory would stop being created, though the
+# refusal would stay non-terminal). See that rule's own YAML comment.
+
+
+def test_cpp150_bash_mkdir_absolute_target_no_longer_allowed() -> None:
+    """The issue's own reproduction: `mkdir -p /etc/evil` must not match
+    `bash-mkdir` as allow, with any combination of flags."""
+    for cmd in (
+        "mkdir -p /etc/evil",
+        "mkdir /etc/evil",
+        "mkdir -p -v /etc/evil",
+        "mkdir -m 755 /etc/evil",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert not (pd.decision == "allow" and pd.rule_id == "bash-mkdir"), (
+            f"{cmd}: matched bash-mkdir as allow -- the cpp#150 regression"
+        )
+
+
+def test_cpp150_bash_mkdir_home_and_var_expansion_no_longer_allowed() -> None:
+    for cmd in ("mkdir -p ~/x", "mkdir ~/x", "mkdir -p $FOO/x", "mkdir -p $HOME/x"):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert not (pd.decision == "allow" and pd.rule_id == "bash-mkdir"), cmd
+
+
+def test_cpp150_bash_mkdir_traversal_no_longer_allowed() -> None:
+    for cmd in ("mkdir -p ../x", "mkdir ../x", "mkdir -p a/../../etc"):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert not (pd.decision == "allow" and pd.rule_id == "bash-mkdir"), cmd
+
+
+def test_cpp150_bash_mkdir_tmp_scratch_matches_dedicated_rule_not_bash_mkdir() -> None:
+    """`/tmp/x` is the one absolute shape that IS allowed (cpp#143) -- but via
+    the dedicated `bash-mkdir-tmp-scratch` rule, never `bash-mkdir` itself. A
+    naive fix that widened `bash-mkdir` back open to `/tmp` would reintroduce
+    exactly the unconstrained-absolute-path shape cpp#150 closed."""
+    for cmd in (
+        "mkdir -p /tmp/x",
+        "mkdir /tmp/x",
+        "mkdir -p /tmp/rt005-scratch",
+        "mkdir -p /tmp/a /tmp/b",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-mkdir-tmp-scratch", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp150_bash_mkdir_tmp_traversal_still_denied() -> None:
+    """`/tmp/../etc/evil` must not sneak through the new scratch exception --
+    its `(?!.*\\.\\.)` guard mirrors `_TMP_SCRATCH_MKDIR_RE`."""
+    for cmd in ("mkdir -p /tmp/../etc/evil", "mkdir -p /tmp/x/../../etc"):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision != "allow", f"{cmd}: {pd}"
+
+
+def test_cpp150_bash_mkdir_mixed_tmp_and_absolute_denied() -> None:
+    """A mixed operand list (one sanctioned /tmp target, one not) must not
+    ride the /tmp exception to allow the other target too."""
+    pd = evaluate(_POLICY, "Bash", _bash("mkdir -p /tmp/x /etc/evil"))
+    assert pd.decision != "allow", pd
+
+
+def test_cpp150_bash_mkdir_relative_target_still_allowed() -> None:
+    """POSITIVE control: a genuinely relative `mkdir -p foo/bar` (with or
+    without flags) still matches `bash-mkdir` -- the fix narrows the rule to
+    what it already claimed, it does not narrow it into uselessness."""
+    for cmd in (
+        "mkdir -p foo/bar",
+        "mkdir foo/bar",
+        "mkdir -p crates/mika-os/src",  # mika#1116 founding example
+        "mkdir -p docs/plans",
+        "mkdir -p -v a/b",
+        "mkdir -m 755 foo/bar",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-mkdir", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp150_end_to_end_handler_still_denies_etc_evil(tmp_path: Path) -> None:
+    """Full handler path (policy + chain-safe + destination veto), matching
+    the issue's own repro command. Still refused -- it was already refused
+    before this fix too, via the runtime destination veto (cpp#150 is
+    defense-in-depth on the YAML rule, not a close of a live hole) -- pinned
+    here so a future change cannot reopen the YAML-level gap unnoticed."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree), policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash("mkdir -p /etc/evil"), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+
+def test_cpp150_end_to_end_handler_still_allows_tmp_scratch(tmp_path: Path) -> None:
+    """NON-REGRESSION for cpp#143 through the full handler: the fix must not
+    turn the sanctioned /tmp scratch mkdir into a refusal."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree), policy_path=_BUNDLED
+    )
+    result = asyncio.run(
+        handler("Bash", _bash("mkdir -p /tmp/cpp150-scratch"), _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultAllow)
+
+
 # ── Handler end-to-end: interrupt semantics (cpp#20 joint 2, narrowed cpp#128) ─
 
 
