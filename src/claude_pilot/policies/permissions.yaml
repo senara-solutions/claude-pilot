@@ -223,19 +223,34 @@ rules:
   # + push. Read-only ops are always safe; commit/push are gated by the
   # slash command's own state machine, not by policy.
 
-  # `git show <SHA>:<path> > <relative-path>` — the dispatch-lib pattern for
+  # `git show <rev>:<path> > <relative-path>` — the dispatch-lib pattern for
   # re-importing a grooming plan from its source commit into a fresh worktree
   # (cpp#35; mika-arch session 783d4a04). Must precede bash-git-readonly so the
   # sanctioned shape claims this rule_id (first-match-wins). SAFE because:
-  #   - source is `[a-f0-9]+:` — an IMMUTABLE git object (a hex commit SHA), not
-  #     a movable branch/tag ref. `HEAD`/`main`/`develop`/`feature/*` do not
-  #     match, closing the ref-mutability TOCTOU (bypass surface B3). Edge: a
-  #     branch literally named with only hex chars (e.g. `abcdef`) would match —
-  #     the architect accepted this pathological edge in the GROOMED verdict.
+  #   - source (the ref) is `[\w./-]+` — ANY git-ref-shaped token (a SHA,
+  #     `HEAD`, `FETCH_HEAD`, `ORIG_HEAD`, a branch or tag name, `origin/main`,
+  #     …). cpp#43 already established that mutability is NOT the safety
+  #     boundary here — even the prior hex-only shape admitted a mutable,
+  #     force-pushable branch (`git show deadbeef:f` prefers the ref over the
+  #     object when both exist) — so widening the ref charset from
+  #     `[a-f0-9]+` to the general `[\w./-]+` path charset changes nothing
+  #     about the threat model: safety rests ENTIRELY on the literal redirect
+  #     TARGET (cpp#166), never on what the ref names or whether it can move.
+  #     cpp#166: the groom-plan flow that reuses a plan from another branch
+  #     runs exactly `git show FETCH_HEAD:docs/plans/X.md > docs/plans/X.md`
+  #     — `FETCH_HEAD` is not hex-shaped, so the prior pattern fell through to
+  #     `bash-git-readonly`, which matches the `git show` prefix but grants no
+  #     redirect exception, and `_bash_allow_is_chain_safe`'s wholesale `>`
+  #     veto denied it deterministically. No GROOMED marker could ever be
+  #     posted for a cross-branch plan reuse.
   #   - the redirect TARGET is a literal worktree-relative token: leading `/`
   #     (absolute), leading `~`, and any `..` are rejected by lookaheads; the
   #     `[\w./-]+` char class excludes `$`, backtick, `(`, space and `>`, so no
-  #     shell expansion / substitution / chaining can ride the target.
+  #     shell expansion / substitution / chaining can ride the target. This
+  #     TARGET-side confinement is UNCHANGED by cpp#166 — only the ref (SOURCE)
+  #     charset was widened; the string pattern remains the primary,
+  #     self-contained enforcement of worktree confinement, matched BEFORE the
+  #     command is ever allowed to execute.
   #   - the SOURCE path char class `[\w./-]+` likewise excludes `$(`/backtick.
   # STATIC RESIDUAL (cpp#38) — now closed one layer up at runtime: this string
   # pattern still rejects only literal `../` and CANNOT detect SYMLINK traversal
@@ -250,6 +265,17 @@ rules:
   # docs/solutions/security-issues/command-string-policy-allow-rules-are-
   # compound-unsafe.md §5 / §11. TOCTOU residual of `Path.resolve` is accepted
   # (same as the Write tool's `is_within_project`).
+  #   NOT the cpp#155 gap: cpp#155 is `_segment_write_kind` never classifying
+  #   a BARE redirect (`echo`/`cat`/`tee` + `>`) as a write-kind at all, so
+  #   `_destination_veto_reason` never even looks at its target. `git show >`
+  #   is a NAMED exception in `_segment_write_kind` (`permissions.py`,
+  #   `_GIT_SHOW_RE` + `">" in seg`) that predates cpp#155 and is unaffected by
+  #   its still-open scope — the runtime check DOES see and validate this
+  #   target. That runtime check is still only DEFENSE IN DEPTH here, not the
+  #   sole guard: the regex's own target lookaheads (above) are what
+  #   self-confine the redirect BEFORE the command is even allowed to run —
+  #   this rule widens only the ref/source side, so that self-confinement is
+  #   untouched by cpp#166.
   # Anchored `^...$` is load-bearing: policy.evaluate uses re.search with NO
   # re.MULTILINE, so `$` honors only a single trailing newline — a multi-line
   # injection (`> foo\nrm -rf /`) cannot match here and falls through to the
@@ -259,9 +285,9 @@ rules:
   # place that ban is lifted besides the /tmp heredoc) — keep the id in sync.
   - id: bash-git-show-redirect
     tool: Bash
-    pattern: '^git\s+show\s+[a-f0-9]+:[\w./-]+\s*>\s*(?!/)(?!~)(?!.*\.\.)[\w./-]+\s*$'
+    pattern: '^git\s+show\s+[\w./-]+:[\w./-]+\s*>\s*(?!/)(?!~)(?!.*\.\.)[\w./-]+\s*$'
     decision: allow
-    reason: "git show <ref>:<path> > <relative-path> -- source is ANY hex-shaped ref (full SHA, abbreviated SHA, OR a hex-named branch/tag; NOT immutable -- `git show deadbeef:f` resolves to a mutable, force-pushable branch, cpp#43); safety rests entirely on the literal redirect target (no absolute / ~ / .. / shell-expansion) plus the control-plane denylist (cpp#42), never on source-immutability; permissions.py _bash_allow_is_chain_safe honors this rule_id as a sanctioned redirect (cpp#35)"
+    reason: "git show <ref>:<path> > <relative-path> -- source is ANY git-ref-shaped token (SHA, HEAD, FETCH_HEAD, ORIG_HEAD, branch/tag, origin/main, ...; cpp#166 widened from hex-only); NOT immutable -- mutability was never the safety boundary (cpp#43); safety rests entirely on the literal redirect target (no absolute / ~ / .. / shell-expansion) plus the control-plane denylist (cpp#42), never on source-immutability; permissions.py _bash_allow_is_chain_safe honors this rule_id as a sanctioned redirect (cpp#35)"
 
   - id: bash-git-readonly
     tool: Bash
