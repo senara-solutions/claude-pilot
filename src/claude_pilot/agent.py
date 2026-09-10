@@ -51,6 +51,57 @@ from .ui import (
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
 
+# ── cpp#168: the idle watchdog can be starved by claude-pilot's OWN I/O ─────
+#
+# The ticket's leading hypothesis was a synchronous blocking read inside the
+# bundled CLI subprocess transport. That is NOT what happens: the SDK's own
+# message read (`claude_agent_sdk._internal.transport.subprocess_cli`, pinned
+# 0.2.148) is `anyio`-backed with non-blocking POSIX pipes end to end
+# (`anyio.open_process` + `TextReceiveStream`) — genuinely async-awaitable,
+# with real checkpoints. `_merge_stream` below already races that read against
+# `guardrail_watcher` via `asyncio.wait(..., FIRST_COMPLETED)`, and
+# `asyncio.Event.wait()` resolves deterministically the instant `.set()` is
+# called — so a stuck-but-async read is ALREADY bounded by the idle watchdog
+# firing, with no additional `asyncio.wait_for` needed there. See the plan doc
+# for the full trace.
+#
+# The call that genuinely blocks the event loop's own OS thread sits three
+# lines below `_merge_stream`'s yield: `record_sdk_message` (transcript_writer.py)
+# opens, writes and flushes `$ANTHROPIC_LOG_FILE` synchronously, unconditionally,
+# for EVERY AssistantMessage/ResultMessage — the highest-frequency unconditional
+# call in the whole loop. A full pipe buffer or a hung mount under that path
+# freezes the interpreter thread the event loop runs on, and `asyncio.wait`
+# (idle watchdog included) cannot preempt a blocked thread. Offloading the call
+# to a worker thread — bounded so a truly wedged sink cannot stall the loop
+# indefinitely either — is the fix that actually keeps `_idle_watchdog`
+# scheduled regardless of what the write does. `record_sdk_message` itself is
+# UNCHANGED (still fully synchronous) so its existing test suite
+# (tests/test_transcript_writer.py) keeps its direct-call, no-await contract;
+# only this ONE call site — the sole place it runs inside the SDK message
+# loop — is bounded.
+_TRANSCRIPT_WRITE_TIMEOUT_S = 5.0
+
+
+async def _record_sdk_message_bounded(message: object) -> None:
+    """Run `record_sdk_message` off the event-loop thread, with a hard ceiling.
+
+    A timeout is treated exactly like any other transcript-write failure:
+    best-effort, never fatal — `record_sdk_message`'s own contract is "fails
+    open" (transcript_writer.py). The abandoned thread keeps running to
+    completion or forever in the background; that is a leaked worker thread,
+    not a frozen event loop, and is the trade this fix deliberately makes.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(record_sdk_message, message),
+            timeout=_TRANSCRIPT_WRITE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        log_verbose(
+            f"pilot-transcript write exceeded {_TRANSCRIPT_WRITE_TIMEOUT_S}s; "
+            "continuing without blocking the session (cpp#168)"
+        )
+
 # ── cpp#151: the residual lethality of a refusal ─────────────────────────────
 #
 # cpp#128 split the DECISION (refuse) from the LETHALITY (`interrupt=True`), and
@@ -455,8 +506,10 @@ async def _run_agent_inner(
                         # that died on a refusal — the population a transcript is
                         # there to diagnose. One site, no branch can escape it.
                         # No-op unless $ANTHROPIC_LOG_FILE is set (mika dispatch);
-                        # never raises. See transcript_writer.py.
-                        record_sdk_message(message)
+                        # never raises. See transcript_writer.py. cpp#168: bounded
+                        # and off the event-loop thread — see
+                        # `_record_sdk_message_bounded` above for why.
+                        await _record_sdk_message_bounded(message)
 
                         # cpp#123: StreamEvent is the highest-volume message on the
                         # stream (`include_partial_messages=True`, agent.py options
@@ -947,6 +1000,29 @@ async def _merge_stream(
     that error into the message loop instead of resuming anything. cpp#151's
     recovery is a NEW client resuming the session id, driven by the session
     loop in :func:`_run_agent_inner`.
+
+    Also deliberately UNCHANGED by cpp#168, and this one is worth spelling
+    out because the ticket's own proposed fix named this exact function:
+    wrapping `stream.__anext__()` in `asyncio.wait_for`. That line was not
+    implemented here on purpose. `stream` is `client.receive_response()`,
+    which bottoms out in `claude_agent_sdk._internal.transport.subprocess_cli`
+    — `anyio.open_process` + `TextReceiveStream` over non-blocking POSIX
+    pipes, confirmed against the pinned `claude-agent-sdk==0.2.148`. That read
+    is genuinely async-awaitable, with real checkpoints, so the
+    `asyncio.wait({next_msg, guardrail_watcher}, FIRST_COMPLETED)` race two
+    lines below ALREADY bounds a stuck-but-async read correctly:
+    `asyncio.Event.wait()` (what `guardrail_watcher` awaits) resolves the
+    instant `_idle_watchdog` calls `_abort()`, so `next_msg.cancel()` fires and
+    `_GUARDRAIL_TRIP` is yielded with no additional timeout needed. Adding a
+    parallel `wait_for`/sleep-race here would be inert window-dressing for
+    that path, and a literal per-message extra task would run on the
+    highest-volume code path in the process (a turn emits thousands of
+    `StreamEvent`s under `include_partial_messages=True`), which is exactly
+    the task-churn cpp#123 already went out of its way to avoid for the idle
+    deadline itself. The genuinely synchronous blocking call this ticket's
+    production stalls are best explained by lives in the caller's loop body,
+    not here — see `_record_sdk_message_bounded` / `_TRANSCRIPT_WRITE_TIMEOUT_S`
+    above, and the plan doc for the full investigation.
     """
     stream = client.receive_response().__aiter__()
     while True:

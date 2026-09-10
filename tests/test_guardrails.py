@@ -1382,3 +1382,51 @@ async def test_nonterminal_policy_deny_is_sticky_and_tracks_the_latest(
     # worktree does not become trustworthy again because an earlier refusal
     # happened to be harmless.
     assert guardrails.terminal_policy_deny is True
+
+
+# ── cpp#168: watchdog self-hardening (the "alternative cause") ──────────────
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_crash_terminates_instead_of_dying_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ticket names two candidate causes for the watchdog failing to fire:
+    event-loop starvation (addressed in agent.py / the plan doc) and a
+    fire-and-forget `create_task` whose body dies on a swallowed exception.
+    Nothing ever awaits `_idle_watchdog`'s result — a bare exception escaping
+    it would vanish into asyncio's own "Task exception was never retrieved"
+    handling at best, leaving the session immortal exactly like the two
+    mika#2246 pilots that ran 2h18 and 58min in total silence. The crash
+    itself must now terminate the session, with a reason distinct from
+    genuine `idle_timeout` so the two causes stay distinguishable in the
+    exit line and the audit trail."""
+
+    def _boom(self: SessionGuardrails) -> _WaitState:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(SessionGuardrails, "_wait_state", property(_boom))
+
+    guardrails = SessionGuardrails(_idle_config(idle_ms=20))
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "watchdog_error"
+    assert "boom" in reason.detail
+    assert guardrails.aborted is True
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_cancellation_is_still_a_clean_noop(
+    guardrails: SessionGuardrails,
+) -> None:
+    """The new broad `except Exception` must not swallow
+    `asyncio.CancelledError` (a `BaseException` subclass in 3.11+, so this
+    would not happen by accident, but it is the exact regression the
+    cpp#168 hardening must not introduce): `dispose()` cancelling the task on
+    ordinary session teardown must not be reclassified as a `watchdog_error`
+    abort."""
+    guardrails.dispose()
+    await asyncio.sleep(0)
+    assert guardrails.aborted is False

@@ -866,6 +866,24 @@ class SessionGuardrails:
                 await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
+        except Exception as exc:
+            # cpp#168: the ticket's "alternative cause" — a fire-and-forget
+            # `create_task` (`_reset_idle_timer` above) whose body dies on a
+            # swallowed exception leaves NOTHING watching the session: nobody
+            # awaits this task's result, so a bare `raise` here would only
+            # ever surface as "Task exception was never retrieved" on
+            # asyncio's own default handler (if that), never as a terminated
+            # session. A dead watchdog must not be a SILENT dead watchdog —
+            # abort explicitly, with a reason distinct from `idle_timeout` so
+            # the population "the watchdog itself broke" stays visible instead
+            # of laundering into "the model went silent" (see
+            # `GuardrailAbortReason.guardrail` docstring in types.py).
+            self._abort(
+                "watchdog_error",
+                f"idle watchdog task crashed ({type(exc).__name__}: {exc}); "
+                "terminating rather than leaving the session unmonitored",
+            )
+            return
         secs = round(self._config.idleTimeoutMs / 1000)
         # cpp#123: name the observed stream-event count. A session that produced
         # nothing and one that streamed for hours used to render the same line,
@@ -989,6 +1007,8 @@ class SessionGuardrails:
             # cpp#145: the two waiting states, reached only at their ceilings.
             "awaiting_tool",
             "awaiting_model",
+            # cpp#168: the watchdog task itself crashed. See `_idle_watchdog`.
+            "watchdog_error",
         ],
         detail: str,
     ) -> None:

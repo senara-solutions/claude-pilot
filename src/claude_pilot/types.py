@@ -197,10 +197,13 @@ class ResultJson(BaseModel):
           can never do is buy another turn.
         - Guardrail aborts, from `GuardrailAbortReason.guardrail` below:
           "stall_detected", "empty_response", "idle_timeout" (cpp#54-era),
-          "rate_limited" (cpp#119), and "awaiting_tool" / "awaiting_model"
+          "rate_limited" (cpp#119), "awaiting_tool" / "awaiting_model"
           (cpp#145 — the session was waiting on a tool or on the next turn's
-          first token, and the wait outlived its ceiling). This list was absent
-          before cpp#145 and had been silently stale since cpp#119.
+          first token, and the wait outlived its ceiling), and
+          "watchdog_error" (cpp#168 — the `_idle_watchdog` task itself raised
+          an unexpected exception; see `GuardrailAbortReason.guardrail` below).
+          This list was absent before cpp#145 and had been silently stale
+          since cpp#119.
         - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
           — see SDK_TERMINATION_SUBTYPES in agent.py.
     """
@@ -249,6 +252,14 @@ class GuardrailAbortReason(BaseModel):
     # session went silent with nobody outstanding. Additive in the same sense
     # as `rate_limited` above: consumers that know only the earlier values keep
     # parsing the JSON shape and simply do not special-case the new ones.
+    # cpp#168: `watchdog_error` is reached only if `_idle_watchdog`'s own loop
+    # body raises something other than `asyncio.CancelledError` — the ticket's
+    # "alternative cause" (a fire-and-forget `create_task` dying on a swallowed
+    # exception, leaving the session unmonitored and immortal). Distinct from
+    # `idle_timeout` on purpose: the two failure modes call for different
+    # operator response (a genuinely silent model vs. a bug in the watchdog
+    # itself), and collapsing them back into `idle_timeout` would hide exactly
+    # the population this hardening exists to make visible.
     guardrail: Literal[
         "stall_detected",
         "empty_response",
@@ -256,6 +267,7 @@ class GuardrailAbortReason(BaseModel):
         "rate_limited",
         "awaiting_tool",
         "awaiting_model",
+        "watchdog_error",
     ]
     turns: int
     detail: str
