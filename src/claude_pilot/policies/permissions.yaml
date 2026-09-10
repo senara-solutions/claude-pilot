@@ -366,11 +366,46 @@ rules:
   # SECOND) at the single point a Bash `allow` is honored. Rule logic stays here;
   # destination containment lives in code (the YAML cannot resolve the filesystem).
 
+  # cpp#150: the greedy optional flag-group `(\s+-\S+)*` backtracks to zero
+  # reps, so the ORIGINAL `^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\.\.)\S`
+  # let the mandatory `\s+` re-anchor on the space right after `mkdir` and the
+  # lookaheads test the FLAG token (`-p`, never `/`/`~`/`$`) instead of the
+  # actual target -- `re.compile(...).match("mkdir -p /etc/evil")` matched,
+  # span (0,7), for ANY absolute target regardless of flags. Not a live hole
+  # (`_destination_veto_reason` independently vetoes the write at runtime by
+  # command word, not by this rule_id -- cpp#38/#42), but the rule did not do
+  # what its own `reason` claims. Fix mirrors `bash-cp-mv` immediately below:
+  # add the SAME lookaheads scanning the *whole* remainder for `\s/`, `\s~`,
+  # `\s$` (not just the position right after the mandatory `\s+`), which holds
+  # regardless of how the flag-group backtracks -- verified empirically (see
+  # the plan doc and the cpp#150 section of tests/test_policy_devpilot.py).
   - id: bash-mkdir
     tool: Bash
-    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\.\.)\S'
+    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\s/)(?!.*\s~)(?!.*\s\$)(?!.*\.\.)\S'
     decision: allow
     reason: "mkdir (relative, no .. / absolute / ~ / $ expansion) -- dev-pilot worktree scaffolding (mika#1116: mkdir -p crates/mika-os/src)"
+
+  # cpp#143's sanctioned /tmp scratch exception (see `_is_sanctioned_tmp_scratch`
+  # in permissions.py) previously reached `decision: allow` ONLY as a side
+  # effect of the cpp#150 backtracking bug above -- `mkdir -p /tmp/x` matched
+  # `bash-mkdir` by accident, the same way `mkdir -p /etc/evil` did. Fixing
+  # that bug without this rule would silently regress cpp#143: `/tmp` scratch
+  # mkdir would fall to policy default-deny (still non-terminal, thanks to
+  # `_destination_veto_reason`'s own sanction check inside `_denial_is_terminal`
+  # -- but the directory would never actually be CREATED). This rule restores
+  # the allow explicitly and safely: fully anchored (`^...$`), EVERY operand
+  # after the flags must be a literal `/tmp/...` token (mirrors
+  # `_TMP_SCRATCH_MKDIR_RE`'s own `(?!.*\.\.)` anti-traversal guard), so a
+  # mixed target list (`/tmp/x /etc/evil`) or a `..`-laden one
+  # (`/tmp/../etc/evil`) does not qualify -- unlike the fixed `bash-mkdir`
+  # above, this one is NOT vulnerable to the same backtracking class: it
+  # matches the target POSITIVELY (literal `/tmp/` prefix), never by a
+  # negative lookahead an optional group can dodge.
+  - id: bash-mkdir-tmp-scratch
+    tool: Bash
+    pattern: '^mkdir(\s+-\S+)*(?!.*\.\.)(\s+/tmp/[\w./-]+)+\s*$'
+    decision: allow
+    reason: "mkdir under /tmp only, every operand literally /tmp/... and .. -free -- cpp#143 sanctioned scratch-directory exception, restored explicitly by cpp#150 (previously an accident of the same regex bug that rule fixed)"
 
   - id: bash-cp-mv
     tool: Bash
