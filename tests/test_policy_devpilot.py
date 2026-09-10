@@ -937,7 +937,7 @@ def test_bundled_denies_unsafe(cmd: str) -> None:
 # The dispatch-lib plan-import flow runs `git show <commit>:<path> > <path>` to
 # re-seed a grooming plan into a fresh worktree. Read-only source (immutable git
 # object) + worktree-relative literal target = allowed; every unsafe variant
-# (absolute / .. / substitution / $-expansion / non-SHA ref) stays denied.
+# (absolute / .. / substitution / $-expansion) stays denied.
 
 
 def test_bundled_allows_git_show_redirect_trigger() -> None:
@@ -962,18 +962,76 @@ def test_bundled_allows_git_show_redirect_no_space_after_gt() -> None:
     assert _effective("git show e95a9d8f:file>out.txt") == "allow"
 
 
+# ── cpp#166: ref shape widened from hex-only to any git-ref-shaped token ─────
+#
+# The founding failure: the cross-branch groom-plan-reuse flow runs
+# `git show FETCH_HEAD:docs/plans/<plan>.md > <worktree>/docs/plans/<plan>.md`
+# — `FETCH_HEAD` is not `[a-f0-9]+`, so on `main` (pre-cpp#166) this fell
+# through to `bash-git-readonly` (matches the `git show` prefix, grants no
+# redirect exception) and was denied by `_bash_allow_is_chain_safe`'s
+# wholesale `>` veto. Any ticket whose grooming reuses a cross-branch plan was
+# indispatchable — every re-dispatch re-groomed and failed at the same point.
+# These pin the reproduction (denied pre-fix, allowed post-fix) and the target
+# confinement is UNCHANGED and re-verified for non-hex refs.
+
+
+def test_bundled_allows_git_show_redirect_fetch_head_cross_branch_groom() -> None:
+    # cpp#166 AC — the exact dispatch-lib cross-branch groom-plan-reuse shape.
+    # Pre-fix this was DENIED (see test_guard_denies_pre_166_fetch_head_shape
+    # below, which pins the reproduction against the unwidened pattern).
+    cmd = "git show FETCH_HEAD:docs/plans/x.md > docs/plans/x.md"
+    assert _effective(cmd) == "allow"
+
+
 @pytest.mark.parametrize(
     "cmd",
     [
-        # AC2 regression matrix (cpp#35 brief): each must stay DENY.
-        "git show main:file > /etc/cron.d/pwn",       # absolute target (+ non-SHA)
+        "git show HEAD:file > foo",
+        "git show FETCH_HEAD:file > foo",
+        "git show ORIG_HEAD:file > foo",
+        "git show MERGE_HEAD:file > foo",
+        "git show main:file > foo",                    # branch ref, not SHA
+        "git show feature/166-fix:file > foo",          # branch with a slash
+        "git show origin/main:file > foo",              # remote-tracking ref
+        "git show v1.2.3:file > foo",                   # tag
+        "git show E95A9D8F:file > out.txt",             # uppercase SHA -> now admitted
+    ],
+)
+def test_bundled_allows_git_show_redirect_any_ref_shape(cmd: str) -> None:
+    assert _effective(cmd) == "allow"
+
+
+def test_guard_denies_pre_166_fetch_head_shape() -> None:
+    """Anti-vacuity: pins that the cpp#35-era (hex-only) pattern denied the
+    exact FETCH_HEAD shape cpp#166 fixes. A revert of the YAML widening makes
+    this pattern (and therefore `test_bundled_allows_git_show_redirect_fetch_head_cross_branch_groom`
+    above) fail again."""
+    import re
+
+    pre_166_pattern = re.compile(
+        r"^git\s+show\s+[a-f0-9]+:[\w./-]+\s*>\s*(?!/)(?!~)(?!.*\.\.)[\w./-]+\s*$"
+    )
+    cmd = "git show FETCH_HEAD:docs/plans/x.md > docs/plans/x.md"
+    assert pre_166_pattern.match(cmd) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # AC2 regression matrix (cpp#35 brief, extended cpp#166): each must
+        # stay DENY regardless of the (now widened) source ref shape.
+        "git show main:file > /etc/cron.d/pwn",       # absolute target
         "git show main:file > ../escape",             # .. traversal
         "git show main:file > $(readlink escape)",    # command substitution
         "git show abc123:file > worktree/../escape",  # .. embedded (valid SHA)
         "git show abc123:file > $HOME/anything",      # $-expansion (valid SHA)
-        "git show HEAD:file > foo",                   # branch/HEAD ref, not SHA
-        "git show main:file > foo",                   # branch ref, not SHA
-        "git show E95A9D8F:file > out.txt",           # uppercase SHA -> not [a-f0-9]
+        # cpp#166 AC — the FETCH_HEAD cross-branch-groom shape with an unsafe
+        # target must stay denied exactly like the hex-source case always was.
+        "git show FETCH_HEAD:docs/plans/x.md > /etc/passwd",  # absolute, outside worktree
+        "git show FETCH_HEAD:docs/plans/x.md > ../escape",    # .. traversal
+        "git show FETCH_HEAD:docs/plans/x.md > /tmp/x",       # absolute, outside worktree (/tmp is not exempt here)
+        "git show FETCH_HEAD:docs/plans/x.md > ~/escape",     # ~ expansion
+        "git show FETCH_HEAD:docs/plans/x.md > $(evil)",      # command substitution
         # belt-and-suspenders: append/double-redirect/trailing-chain on the SHA shape
         "git show e95a9d8f:file >> appended",         # append redirect, not sanctioned
         "git show e95a9d8f:file > a > b",             # double redirect
@@ -987,6 +1045,12 @@ def test_bundled_denies_git_show_redirect_unsafe(cmd: str) -> None:
 
 def test_guard_honors_git_show_redirect_sanctioned_shape() -> None:
     cmd = "git show e95a9d8f:docs/plans/X.md > docs/plans/X.md"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_guard_honors_git_show_redirect_fetch_head_shape() -> None:
+    # cpp#166 — the cross-branch groom-plan-reuse shape, at the chain-safe layer.
+    cmd = "git show FETCH_HEAD:docs/plans/x.md > docs/plans/x.md"
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
 
 
@@ -1077,6 +1141,28 @@ def test_dest_validator_ac38_5_git_show_legit_plan_allowed(tmp_path: Path) -> No
 def test_dest_validator_ac38_6_cp_in_worktree_allowed(tmp_path: Path) -> None:
     cwd = _make_worktree(tmp_path)
     assert _dest_effective("cp source docs/plans/copy.md", cwd) == "allow"
+
+
+# cpp#166 — full honoring path (policy + chain-safe + destination validator),
+# for the non-hex ref shape, both directions: worktree-relative target reaches
+# allow end to end, and the SAME symlink-escape check cpp#38 already proved for
+# a hex source still fires for FETCH_HEAD. The destination validator is
+# STRUCTURAL (`_segment_write_kind` keys on `git` + `show` + `>`, never on the
+# ref), so it was never blind to this shape to begin with — this pins that.
+
+
+def test_dest_validator_cpp166_fetch_head_legit_plan_allowed(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    # The exact cross-branch groom-plan-reuse shape that founded cpp#166.
+    assert (
+        _dest_effective("git show FETCH_HEAD:docs/plans/x.md > docs/plans/x.md", cwd)
+        == "allow"
+    )
+
+
+def test_dest_validator_cpp166_fetch_head_symlink_escape_denied(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("git show FETCH_HEAD:payload > esc/passwd", cwd) == "deny"
 
 
 # cpp#42 — control-plane denylist (in-worktree but compromises the agent)

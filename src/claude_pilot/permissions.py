@@ -535,17 +535,24 @@ def _bash_allow_is_chain_safe(
     if _BARE_AMP_RE.search(command):
         return False
 
-    # Sanctioned `git show <SHA>:<path> > <relative-path>` (cpp#35). The wholesale
-    # `>` veto below (a single segment with a redirect is never tier1-safe and is
-    # always tier3-dangerous) otherwise blocks the dispatch-lib plan-import flow.
-    # The `bash-git-show-redirect` policy rule encodes the FULL safe shape in one
-    # anchored regex. NOTE the source is NOT immutable: the `[a-f0-9]+` shape
-    # matches a full SHA, an abbreviated SHA, OR a hex-named branch/tag, and
+    # Sanctioned `git show <rev>:<path> > <relative-path>` (cpp#35, ref shape
+    # widened cpp#166). The wholesale `>` veto below (a single segment with a
+    # redirect is never tier1-safe and is always tier3-dangerous) otherwise
+    # blocks the dispatch-lib plan-import flow — including the cross-branch
+    # groom-plan-reuse shape `git show FETCH_HEAD:docs/plans/X.md >
+    # docs/plans/X.md` that founded cpp#166 (a groom that reuses a plan from
+    # another branch has no GROOMED marker to reach without this exception).
+    # The `bash-git-show-redirect` policy rule encodes the FULL safe shape in
+    # one anchored regex. NOTE the source is NOT immutable: the `[\w./-]+`
+    # shape matches a full SHA, an abbreviated SHA, `HEAD`/`FETCH_HEAD`, a
+    # branch or tag name, or a remote-tracking ref like `origin/main` — and
     # `git show deadbeef:f` resolves `deadbeef` as a mutable, force-pushable
-    # branch (git prefers the ref; cpp#43). Safety therefore rests SOLELY on the
-    # literal worktree-relative target (rejects absolute/`~`/literal-`..`/shell-
-    # expansion), never on source-immutability — so honoring its rule_id here is
-    # the same "sanctioned exception to a wholesale veto" pattern as
+    # branch when one exists (git prefers the ref; cpp#43). Safety therefore
+    # rests SOLELY on the literal worktree-relative target (rejects
+    # absolute/`~`/literal-`..`/shell-expansion), never on source-immutability
+    # or source-shape — so widening the ref charset in cpp#166 changes nothing
+    # about the threat model, and honoring this rule_id here is the same
+    # "sanctioned exception to a wholesale veto" pattern as
     # `_is_sanctioned_pure_heredoc` above. This MUST come AFTER
     # the here-string / heredoc / substitution-marker / bare-`&` vetoes: those run
     # first, so a substitution-laden source (`git show abc:$(evil) > x`) is
@@ -560,6 +567,29 @@ def _bash_allow_is_chain_safe(
     # `bash-mkdir` rules already carry (static policy is a pre-exec shape filter,
     # not a runtime sandbox). Worktree containment is a runtime concern (cf. the
     # Write tool's `is_within_project`); closing it policy-wide is tracked in cpp#38.
+    #
+    # cpp#166 / cpp#155 interaction — why this does NOT lean on the general
+    # redirect veto. `_segment_write_kind` (below, `permissions.py`) classifies
+    # `git show ... >` as a write-kind BY NAME (`_GIT_SHOW_RE` + `">" in seg`),
+    # so `_destination_veto_reason` DOES see and validate this specific
+    # redirect's target at the allow point (`create_permission_handler`) —
+    # unlike a bare `echo`/`cat`/`tee` redirect, which `_segment_write_kind`
+    # still does not classify at all (cpp#155, still open: measured on `main`,
+    # `_destination_veto_reason("echo hi > /etc/passwd", cwd)` returns `None`
+    # because the destination is never even extracted). That runtime check is
+    # real defense-in-depth for THIS shape, not a no-op — but it is not the
+    # PRIMARY confinement either: the YAML pattern's own target lookaheads
+    # (`(?!/)(?!~)(?!.*\.\.)`) self-confine the redirect target as a pre-exec
+    # STRING match, before the command is ever allowed to run at all. cpp#166
+    # only widens the ref/source side of that pattern; the target lookaheads —
+    # the actual confinement — are untouched. So the ordering is: (1) the regex
+    # itself refuses an absolute/`~`/`..`/shell-expansion target outright, (2)
+    # the runtime veto independently re-checks worktree containment (symlink
+    # escapes) and the control-plane denylist for this named write-kind. Either
+    # layer alone would already refuse an out-of-worktree target; neither one
+    # is "the broken cpp#155 veto" being relied upon, because cpp#155's gap is
+    # specifically about write-kinds `_segment_write_kind` does not classify,
+    # and `git show >` is not one of them.
     pd = evaluate(policy, tool_name, tool_input)
     if pd.decision == "allow" and pd.rule_id == "bash-git-show-redirect":
         return True
