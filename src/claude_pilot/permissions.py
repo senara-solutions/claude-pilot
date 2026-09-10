@@ -663,10 +663,18 @@ def _bash_allow_is_chain_safe(
 #     while `echo "go"; mkdir -p /outside/x` fails chain-safety, never reaches
 #     that call site, and would otherwise let a prompt-injected pilot keep
 #     guessing spellings once per turn for the rest of its budget.
-#     Coverage is exactly `_segment_write_kind`'s: `mkdir`, `cp`/`mv`, and
-#     `git show >`. A write verb it does not classify (`touch`, `tee`, ...) is
-#     still REFUSED — nothing is written — but non-terminally. Closing that gap
-#     means teaching `_segment_write_kind` more verbs, which is its own change.
+#     Coverage was originally exactly `_segment_write_kind`'s: `mkdir`, `cp`/
+#     `mv`, and `git show >`. cpp#155 closed the gap this bullet used to name
+#     ("a write verb it does not classify … is still REFUSED but non-
+#     terminally") for shell REDIRECTS specifically: `_segment_write_kind` now
+#     also classifies any other verb's real file-target redirect (`>`, `>>`,
+#     `N>`, `N>>`, `&>`, `&>>`) as write-kind `bash-redirect`, so `echo`/`cat`/
+#     `tee`/… redirecting to a system path now reach `_destination_veto_reason`
+#     too, not only the pre-existing `_redirect_destination_veto_reason` fallback
+#     below. A write verb with NO redirect and no dedicated case above (a bare
+#     `touch /outside/x`, which writes via its own argument, not a shell
+#     redirect) is still outside this coverage and stays non-terminal — that
+#     residual gap is unchanged by cpp#155 and remains open.
 #     `_destination_veto_reason` itself carries one narrow, named exception to
 #     its containment check — a `mkdir` under `/tmp` (cpp#143, see the block
 #     above that function) — so this bullet's "matches `bash-mkdir`, halts" is
@@ -829,10 +837,49 @@ _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+def _segment_redirect_targets(seg: str) -> list[str] | None:
+    """Every file-redirect target in *seg* (cpp#155), quote-masked first.
+
+    Thin wrapper around ``tier1._redirect_targets`` that applies
+    ``_mask_quoted_redirect_chars`` (cpp#157) before extraction, for the same
+    reason ``_redirect_destination_veto_reason`` does: ``_redirect_targets`` is
+    quote-blind, so a ``>`` inside quotes (``echo 'a>b'``) would otherwise
+    fabricate a phantom target naming nothing bash ever writes to. Shared by
+    both ``_segment_write_kind`` (classification) and
+    ``_extract_write_destinations`` (extraction) so the two calls can never
+    disagree on what a segment's redirects are.
+    """
+    return _redirect_targets(_mask_quoted_redirect_chars(seg))
+
+
 def _segment_write_kind(seg: str) -> str | None:
     """Classify a command segment by the file-write it performs, from its leading
-    command word only (rule-order-independent). Returns the write-kind key, or
-    ``None`` for a non-write segment."""
+    command word only (rule-order-independent) for ``cp``/``mv``/``mkdir``/
+    ``git show >``, or from the presence of a real file-target shell redirect
+    (``>``, ``>>``, ``N>``, ``N>>``, ``&>``, ``&>>``) for any other verb —
+    ``echo``, ``cat``, ``tee``, and anything else that writes via redirection
+    (cpp#155). Returns the write-kind key, or ``None`` for a non-write segment.
+
+    The redirect classification is a FALLBACK, checked only after the four
+    leading-word cases: a ``cp``/``mv``/``mkdir``/``git show`` segment that
+    happens to ALSO carry a trailing redirect keeps its existing write-kind and
+    existing (unchanged) destination extraction — extending that combination is
+    out of scope for cpp#155, which targets verbs `_segment_write_kind`
+    classifies not at all.
+
+    A segment whose only redirect targets are fd-duplication (``>&M``,
+    ``N>&M``) or process substitution (``>(``) is NOT classified: those name no
+    file (`_segment_redirect_targets` skips them, same as
+    `_redirect_destination_veto_reason`), so a plain `cmd 2>&1 | tail` segment
+    stays unclassified, exactly as before this change.
+
+    A redirect whose target cannot be extracted at all (`_segment_redirect_
+    targets` returns ``None`` — unbalanced quotes, a trailing bare ``>``) is
+    STILL classified: `_extract_write_destinations` then also returns ``None``
+    for it, and `_destination_veto_reason`'s existing fail-closed branch
+    ("destination could not be parsed") vetoes it — the same fail-closed
+    direction every other write-kind already takes on an unparseable operand.
+    """
     m = _LEADING_CMD_RE.match(seg)
     if not m:
         return None
@@ -843,6 +890,9 @@ def _segment_write_kind(seg: str) -> str | None:
         return "bash-mkdir"
     if cmd == "git" and _GIT_SHOW_RE.match(seg) and ">" in seg:
         return "bash-git-show-redirect"
+    targets = _segment_redirect_targets(seg)
+    if targets is None or targets:
+        return "bash-redirect"
     return None
 
 
@@ -913,6 +963,10 @@ def _extract_write_destinations(kind: str, seg: str) -> list[str] | None:
         return _extract_cp_mv_destination(seg)
     if kind == "bash-mkdir":
         return _extract_mkdir_destinations(seg)
+    if kind == "bash-redirect":
+        # Same extraction `_segment_write_kind` used to classify — see that
+        # function's docstring for why the two calls cannot drift (cpp#155).
+        return _segment_redirect_targets(seg)
     return None
 
 
@@ -1006,15 +1060,33 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
 
     Per-segment so a compound like ``mkdir a && cp s esc/x`` validates each write
     target independently. Each segment is classified STRUCTURALLY by its leading
-    command word (``_segment_write_kind``) — never by a shadowable policy rule_id.
-    Order is load-bearing: SANCTIONED-SCRATCH first (cpp#143, `mkdir` under
-    `/tmp` only — see the block above), then CONTAINMENT (the safety boundary),
-    then CONTROL-PLANE (layered policy on an already-contained path).
-    Unparseable destinations fail closed (vetoed). The caller has already
-    established the whole command as allow + chain-safe, so this only decides
-    where the write lands.
+    command word (``_segment_write_kind``) for ``cp``/``mv``/``mkdir``/
+    ``git show >`` — never by a shadowable policy rule_id — or by the presence
+    of a real file-target shell redirect for any other verb (cpp#155). Order is
+    load-bearing: SANCTIONED-SCRATCH first (cpp#143/#155, `mkdir` or a redirect
+    literally under `/tmp` only — see the blocks above and below), then
+    CONTAINMENT (the safety boundary), then CONTROL-PLANE (layered policy on an
+    already-contained path). Unparseable destinations fail closed (vetoed). The
+    caller has already established the whole command as allow + chain-safe, so
+    this only decides where the write lands.
+
+    The sanctioned ``cat > /tmp/<token> <<'EOF'`` heredoc (cpp#34/#35, the
+    ``bash-cat-heredoc-tmp`` rule) is handled as a WHOLE-COMMAND exemption,
+    before the segment split: `_split_compound_command` splits on a bare
+    newline (cpp#103), so a naive per-segment walk would read each heredoc BODY
+    line as an independent command — a body line that happens to contain
+    literal text like ``echo hi > /etc/passwd`` (inert: bash never executes it,
+    the quoted delimiter disables expansion) would otherwise be misclassified
+    as a live redirect and veto a routine, currently-allowed heredoc write.
+    `_is_sanctioned_pure_heredoc` requires the WHOLE first line to be the
+    opener (`_SANCTIONED_HEREDOC_OPENER_RE`, itself already pinned to
+    `/tmp/(?!.*\\.\\.)[\\w./-]+`) and nothing executable after the terminator, so
+    there is no second real command hiding in a command this predicate accepts
+    — the shortcut is provably safe, not merely convenient.
     """
     if not isinstance(command, str) or not command:
+        return None
+    if _is_sanctioned_pure_heredoc(command):
         return None
     for seg in _split_compound_command(command):
         kind = _segment_write_kind(seg)
@@ -1029,6 +1101,45 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
         for dest in dests:
             if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest):
                 continue
+            if kind == "bash-redirect":
+                if dest == "/dev/null":
+                    # Inert sink (cpp#130) — writes nowhere, so it is not a
+                    # containment question at all. Mirrors the exemption
+                    # `is_tier3_dangerous_for_lethality`'s `_STDOUT_DEVNULL_RE`
+                    # strip already grants; without it, `grep … >/dev/null`
+                    # would regress from non-terminal to a hard destination
+                    # veto the moment this write-kind existed.
+                    continue
+                if not _is_contained_redirect_target(dest):
+                    # SAME lexical predicate `_redirect_destination_veto_
+                    # reason` already uses to decide containment for redirect
+                    # targets (cpp#154): rejects `~`/leading-`$`/`..`/absolute-
+                    # outside-/tmp/bad-charset operands OUTRIGHT, before ever
+                    # calling `is_within_project`. That call is load-bearing
+                    # here specifically: `is_within_project` treats `~` and
+                    # `$VAR` as ordinary path TEXT (Python does no shell
+                    # expansion), so `Path(cwd) / "~/x"` resolves to a
+                    # same-named subdirectory INSIDE the worktree and would
+                    # wrongly read as contained — exactly the class bash
+                    # itself would expand to the real home directory or an
+                    # unpredictable value. Failing closed here, before
+                    # `is_within_project` ever runs, is what keeps `> ~/x` and
+                    # `> $VAR/x` vetoed.
+                    return (
+                        f"redirect destination {dest!r} is not a literal "
+                        "contained path — not lexically under /tmp/ or "
+                        "worktree-relative (denied fail-closed)"
+                    )
+                if dest.startswith("/tmp/"):
+                    # Sanctioned /tmp scratch (cpp#143/#154/#155) — the SAME
+                    # lexical exception `_redirect_destination_veto_reason`
+                    # already grants for the lethality question, reused here
+                    # verbatim (`_is_contained_redirect_target` + the `/tmp/`
+                    # prefix) so the two never drift. This is what keeps
+                    # `echo hi > /tmp/scratch` and the `$n`-suffixed /tmp
+                    # targets of cpp#154's founding mkdir-loop incident
+                    # (`/tmp/2158bodies/$n.md`) un-vetoed here.
+                    continue
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "
@@ -1047,22 +1158,35 @@ def _redirect_destination_veto_reason(command: str, cwd: str) -> str | None:
     for REDIRECT targets; ``None`` when every redirect target is a contained
     working file.
 
-    Why this exists as a separate function rather than a `_segment_write_kind`
-    entry. `_segment_write_kind` classifies only `cp`/`mv`, `mkdir` and
-    `git show >`, so `_destination_veto_reason` has never seen a bare `>` target
-    — measured on `main`: `_destination_veto_reason("echo hi > /etc/passwd", …)`
-    returns ``None`` (cpp#154 plan, measurement M3). Until cpp#154 that gap was
-    covered BY ACCIDENT: the blanket `>` entry in `TIER3_PATTERNS` made every
-    redirect lethal, escape or not. cpp#154 removed the blanket for lexically
-    contained targets and therefore had to restore, on purpose, what the
-    accident was doing on purpose's behalf.
+    Why this exists as a separate function rather than living solely in
+    `_segment_write_kind`. When this function was written, `_segment_write_kind`
+    classified only `cp`/`mv`, `mkdir` and `git show >`, so
+    `_destination_veto_reason` had never seen a bare `>` target — measured on
+    the then-current `main`: `_destination_veto_reason("echo hi > /etc/passwd",
+    …)` returned ``None`` (cpp#154 plan, measurement M3). Until cpp#154 that gap
+    was covered BY ACCIDENT: the blanket `>` entry in `TIER3_PATTERNS` made
+    every redirect lethal, escape or not. cpp#154 removed the blanket for
+    lexically contained targets and therefore had to restore, on purpose, what
+    the accident was doing on purpose's behalf.
 
-    Teaching `_segment_write_kind` about redirects is the "clean" closure and is
-    deliberately NOT done here (plan D4, follow-up claude-pilot#155): that
-    function is ALSO consulted on the ALLOWED path (:1263), where a redirect
-    write-kind would veto `cat > /tmp/x <<'EOF'` — the `bash-cat-heredoc-tmp`
-    rule cpp#154's AC4 pins as reachable end to end. This function is reached
-    ONLY from `_denial_is_terminal`, so no allowed command can be affected by it.
+    cpp#155 CLOSED that gap (`_segment_write_kind` now also classifies a real
+    file-target redirect from any verb as write-kind `bash-redirect`, and
+    `_destination_veto_reason` reuses the SAME `_is_contained_redirect_target` +
+    `/tmp/`-prefix exception this function grants, so the two cannot drift on
+    the /tmp scratch question — see `_destination_veto_reason`'s docstring and
+    its `bash-redirect` branch). `_destination_veto_reason` is now a STRICT
+    SUPERSET of what this function proves for redirects: every case this
+    function vetoes, `_destination_veto_reason` also vetoes. This function is
+    intentionally NOT removed or merged into that one — cpp#151 B0's "one
+    computation" doctrine applies to LETHALITY (`_denial_is_terminal`'s single
+    verdict, which both functions feed into via `or`, so redundancy here cannot
+    produce a false ALLOW), not to every internal helper that reaches it; on a
+    containment-boundary PR, deleting a working, independently-tested check to
+    chase that symmetry was judged not worth the blast radius. Kept as
+    defense-in-depth and because it is reached from ONE MORE place
+    `_destination_veto_reason` structurally cannot reach as cheaply: the whole
+    RAW command text, unsegmented — see `_denial_is_terminal`, which still calls
+    both.
 
     RESOLUTION DIRECTION IS THE WHOLE POINT. cpp#143's hard-won lesson
     (`:922-968`) is that resolving symlinks in order to GRANT an exemption is

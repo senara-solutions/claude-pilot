@@ -21,6 +21,7 @@ from claude_pilot.permissions import (
     _bash_allow_is_chain_safe,
     _denial_is_terminal,
     _destination_veto_reason,
+    _segment_write_kind,
     create_permission_handler,
 )
 from claude_pilot.policy import Policy, evaluate, load_policy
@@ -1867,3 +1868,135 @@ def test_cpp154_bash_cat_heredoc_tmp_is_reachable_end_to_end(tmp_path: Path) -> 
     )
     result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
     assert isinstance(result, PermissionResultAllow)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#155 — `_segment_write_kind` classifies shell-redirect writes (echo/cat/
+# tee/any other verb), closing the gap the ticket measured directly on
+# `_destination_veto_reason`: on `main`,
+# `_destination_veto_reason("echo hi > /etc/passwd", cwd)` returned `None`
+# because the write was never even classified — the aggregate
+# `_denial_is_terminal` verdict was already `True` via
+# `is_tier3_dangerous_for_lethality` + `_redirect_destination_veto_reason`
+# (cpp#154), but the function the ticket names was blind, and — critically —
+# that function is the ONE destination check consulted on the ALLOWED path
+# (`create_permission_handler`, `pd.decision == "allow"` branch), where
+# `_redirect_destination_veto_reason` is never reached at all.
+#
+# The regression trap this section exists to prove closed (cpp#154 plan D4):
+# `_destination_veto_reason` is a literal, unconditional `interrupt=True` on
+# the ALLOWED path (cpp#128) — so naively classifying every redirect would
+# veto `cat > /tmp/x <<'EOF'`, the `bash-cat-heredoc-tmp` rule cpp#154's AC4
+# pins as reachable end to end. The fix reuses the SAME lexical `/tmp`
+# exception (`_is_contained_redirect_target` + the `/tmp/` prefix)
+# `_redirect_destination_veto_reason` already grants, so the two can never
+# answer the /tmp scratch question differently.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_cpp155_destination_veto_reason_now_sees_redirects(tmp_path: Path) -> None:
+    """The gap the ticket measures, closed and pinned directly on the function
+    it names — NOT merely on the aggregate `_denial_is_terminal`.
+
+    Anti-vacuity: on `main` (before cpp#155), every assertion below reads
+    `_destination_veto_reason(...) is None` — pasted as the captured red in
+    the PR body.
+    """
+    cwd = _make_worktree(tmp_path)
+    assert _destination_veto_reason("echo hi > /etc/passwd", cwd) is not None
+    assert _destination_veto_reason("echo hi > ../escape", cwd) is not None
+    assert _destination_veto_reason("echo hi > ~/x", cwd) is not None
+    assert _destination_veto_reason("echo hi > $VAR/x", cwd) is not None
+    assert _destination_veto_reason("echo hi >> /etc/passwd", cwd) is not None
+    assert _destination_veto_reason("cat file > .git/hooks/pre-commit", cwd) is not None
+    # The redirect-equivalent of the cpp#38 symlink-escape tests above: `esc`
+    # resolves to `../OUTSIDE` (`_make_worktree`), exactly as for the
+    # cp/mv/mkdir/git-show write-kinds already covered there.
+    assert _destination_veto_reason("echo hi > esc/x", cwd) is not None
+
+
+def test_cpp155_destination_veto_reason_tmp_scratch_and_worktree_relative_still_none(
+    tmp_path: Path,
+) -> None:
+    """Negative controls: the SAME /tmp lexical exception, and an ordinary
+    worktree-relative write, produce no veto through the new write-kind."""
+    cwd = _make_worktree(tmp_path)
+    assert _destination_veto_reason("echo hi > /tmp/scratch", cwd) is None
+    assert _destination_veto_reason("echo hi > /tmp/2158bodies/$n.md", cwd) is None
+    assert _destination_veto_reason("echo hi > ./out.txt", cwd) is None
+    assert _destination_veto_reason("echo hi > docs/plans/x.md", cwd) is None
+    # /dev/null: writes nowhere -- must not regress into a hard veto now that a
+    # bare redirect is a classified write-kind (mirrors cpp#130's exemption).
+    assert _destination_veto_reason("grep -c a b >/dev/null", cwd) is None
+    assert _destination_veto_reason("grep -c a b >/dev/null 2>&1", cwd) is None
+
+
+def test_cpp155_bash_cat_heredoc_tmp_ac4_not_regressed(tmp_path: Path) -> None:
+    """Explicit regression test mirroring cpp#154 AC4: `cat > /tmp/x <<'EOF'`
+    must stay ALLOWED, non-terminal, end to end — even though
+    `_segment_write_kind` now classifies its `cat > /tmp/x` opener line as a
+    `bash-redirect` write (it did NOT before cpp#155; that is the whole
+    regression trap D4 named).
+
+    Companion to `test_cpp154_bash_cat_heredoc_tmp_is_reachable_end_to_end`
+    above (still present, still green): that test proves the rule was
+    reachable BEFORE cpp#155; this one proves cpp#155 did not withdraw it, and
+    additionally pins that the new classification really does fire on this
+    exact command — so a future reader cannot mistake a no-op for a proof.
+    """
+    cwd = _make_worktree(tmp_path)
+    cmd = "cat > /tmp/cpp155_ac4_probe.rs <<'EOF'\nfn main() {}\nEOF"
+
+    # The new classification DOES fire on the opener line...
+    assert _segment_write_kind(cmd.split("\n")[0]) == "bash-redirect"
+    # ...and the destination veto still does not.
+    assert _destination_veto_reason(cmd, cwd) is None
+
+    decision = evaluate(_POLICY, "Bash", _bash(cmd))
+    assert decision.decision == "allow"
+    assert decision.rule_id == "bash-cat-heredoc-tmp"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow)
+
+
+def test_cpp155_heredoc_body_text_is_not_misread_as_a_live_redirect(
+    tmp_path: Path,
+) -> None:
+    """`_split_compound_command` splits on a bare newline (cpp#103); without the
+    `_is_sanctioned_pure_heredoc` shortcut in `_destination_veto_reason`, a
+    heredoc BODY line containing literal text shaped like a dangerous redirect
+    would be misread as an independent live command and veto a routine,
+    currently-ALLOWED heredoc write. The body is inert (quoted delimiter,
+    cpp#47): nothing in it ever executes.
+    """
+    cwd = _make_worktree(tmp_path)
+    cmd = "cat > /tmp/cpp155_body.rs <<'EOF'\necho hi > /etc/passwd\nEOF"
+    assert _destination_veto_reason(cmd, cwd) is None
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow)
+
+
+def test_cpp155_mkdir_loop_redirect_still_non_terminal_end_to_end(tmp_path: Path) -> None:
+    """AC3 replay at the FULL decision-chain level: the founding mika#2158
+    mkdir-loop incident's redirect targets (`/tmp/2158bodies/$n.md`) must stay
+    non-terminal through `_denial_is_terminal` — which now also consults the
+    newly-extended `_destination_veto_reason` — exactly as they did under
+    cpp#154's `is_tier3_dangerous_for_lethality` + `_redirect_destination_veto_
+    reason` alone.
+    """
+    cwd = _make_worktree(tmp_path)
+    cmd = (
+        "mkdir -p /tmp/2158bodies && for n in 193e368c ce63ad41; do "
+        "gh issue view $n --repo senara-solutions/mika --json body -q .body "
+        "> /tmp/2158bodies/$n.md 2>/tmp/2158bodies/$n.err; done"
+    )
+    assert _destination_veto_reason(cmd, cwd) is None
+    assert _denial_is_terminal("Bash", _bash(cmd), cwd) is False

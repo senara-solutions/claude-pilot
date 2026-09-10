@@ -246,10 +246,16 @@ _STDOUT_DEVNULL_RE = re.compile(r"\d*>{1,2}\s*/dev/null(?![/\w.])")
 # inert `/dev/null` sink. Its own docstring left the rest as debt — "widening the
 # exemption to in-worktree targets is left to the destination veto
 # (`permissions._destination_veto_reason`)". cpp#154 measured that the
-# destination veto CANNOT carry it: `_segment_write_kind` classifies only
-# `cp`/`mv`, `mkdir` and `git show >`, so a redirect is invisible to it —
-# `echo hi > /etc/passwd` returns `_destination_veto_reason = None`. The
-# widening therefore lands HERE, where cpp#130 left it.
+# destination veto could not carry it AT THE TIME: `_segment_write_kind`
+# classified only `cp`/`mv`, `mkdir` and `git show >`, so a redirect was
+# invisible to it — `echo hi > /etc/passwd` returned
+# `_destination_veto_reason = None`. cpp#154 therefore landed the widening HERE
+# instead, as a LETHALITY-only narrowing. cpp#155 later taught
+# `_segment_write_kind` to classify redirects too (so `_destination_veto_reason`
+# now ALSO covers this class, on both the allow and deny routes), but that is
+# an additive, independent check — this function keeps answering its own
+# question (is an already-refused, never-executed command's redirect lexically
+# contained) exactly as it did before, unaffected by cpp#155.
 #
 # What it buys, measured: three claude-pilot sessions on mika#2158 died in one
 # day (2026-09-04) on a denial whose CAUSE was pure FORM — a chain
@@ -496,12 +502,20 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
 
     cpp#154 supersedes cpp#130's parting sentence, which left the in-worktree
     widening "to the destination veto (`permissions._destination_veto_reason`)".
-    That veto CANNOT carry it: `_segment_write_kind` classifies only `cp`/`mv`,
-    `mkdir` and `git show >`, so a bare redirect never reaches it —
-    `echo hi > /etc/passwd` measures `_destination_veto_reason = None`. The
-    widening therefore lands here, in the same function, applied AFTER the
-    /dev/null strip so cpp#130's trailing-boundary edge cases (`/dev/null.txt`,
-    `/dev/nullified`, `/dev/null/../etc/passwd`) keep their own behaviour.
+    At the time that veto could not carry it: `_segment_write_kind` classified
+    only `cp`/`mv`, `mkdir` and `git show >`, so a bare redirect never reached
+    it — `echo hi > /etc/passwd` measured `_destination_veto_reason = None`
+    (cpp#154 plan measurement M3). cpp#155 closed that specific gap
+    (`_segment_write_kind` now classifies redirects too, as write-kind
+    `bash-redirect`), but this function's OWN narrowing — purely lexical and
+    cwd-free — is unaffected and stays exactly as it was: it answers a
+    different question (LETHALITY of an already-refused, never-executed
+    command) from `_destination_veto_reason`'s (containment of a write that
+    IS about to execute, on the allow path), and the two must keep answering
+    it independently. The widening therefore still lands here too, applied
+    AFTER the /dev/null strip so cpp#130's trailing-boundary edge cases
+    (`/dev/null.txt`, `/dev/nullified`, `/dev/null/../etc/passwd`) keep their
+    own behaviour.
 
     cpp#157 adds a third narrowing, and it runs INNERMOST: a `<` or `>` sitting
     inside a quoted region is ordinary text to bash, not a redirect operator, so

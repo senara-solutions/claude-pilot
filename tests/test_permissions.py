@@ -766,6 +766,202 @@ def test_mkdir_tmp_scratch_is_permitted_but_other_outside_targets_stay_lethal(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# cpp#155 — `_segment_write_kind` classifies shell-redirect writes from any
+# verb (`echo`, `cat`, `tee`, …), not just `cp`/`mv`/`mkdir`/`git show >`.
+# `_destination_veto_reason` — the function claude-pilot#155 names as BLIND to
+# redirections ("`_destination_veto_reason` returns None" for
+# `echo hi > /etc/passwd`, measured against `main`) — now sees them too.
+#
+# `_denial_is_terminal`'s AGGREGATE verdict for these commands was already
+# `True` via `is_tier3_dangerous_for_lethality` (cpp#130/#154/#157) and
+# `_redirect_destination_veto_reason` (cpp#154) — this section proves
+# `_destination_veto_reason` now ALSO proves it independently, which is what
+# closes the gap on the function the ticket names, and on the ALLOWED path
+# (`create_permission_handler`'s `pd.decision == "allow"` branch, `:1360`),
+# where `_redirect_destination_veto_reason` is never consulted at all.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_segment_write_kind_classifies_redirects_from_any_verb() -> None:
+    """Unit pin on the new fallback branch (cpp#155)."""
+    f = permissions_module._segment_write_kind
+    # New: a real file-target redirect from a verb none of the four leading-
+    # word cases name.
+    assert f("echo hi > /etc/passwd") == "bash-redirect"
+    assert f("cat > /tmp/x") == "bash-redirect"
+    assert f("tee /tmp/y < in > /tmp/z") == "bash-redirect"
+    assert f("some_unknown_binary --flag > out.log") == "bash-redirect"
+    assert f("echo hi >> /etc/passwd") == "bash-redirect"
+    assert f("cmd &> /tmp/log") == "bash-redirect"
+    # Unaffected: the four leading-word branches still win, unchanged, and the
+    # redirect fallback is never reached for them.
+    assert f("cp a.txt b.txt") == "bash-cp-mv"
+    assert f("mv a.txt b.txt") == "bash-cp-mv"
+    assert f("mkdir -p x") == "bash-mkdir"
+    assert f("git show deadbeef:f > dest") == "bash-git-show-redirect"
+    # No file-target redirect at all -- unclassified, exactly as before.
+    assert f("grep -c a b") is None
+    assert f("echo hi") is None
+    # fd-duplication names no file -- unclassified, mirroring
+    # `_redirect_destination_veto_reason`'s own "ignored" forms.
+    assert f("cmd 2>&1") is None
+    assert f("mika ask >&-") is None
+    # `cmd > >(tee f)`: the FIRST `>`'s "target" text is `>(tee f)`, but the
+    # target charset excludes `>` (it is the delimiter), so the match is an
+    # EMPTY target -- `_redirect_targets` fails closed to `None` for the
+    # WHOLE segment (same as `_redirect_destination_veto_reason` and
+    # `is_tier3_dangerous_for_lethality` already do for this exact string,
+    # pinned in `TestTier3ContainedRedirectLethality`/`test_non_file_redirect_
+    # forms` in test_tier1.py). `None` classifies (this docstring's own
+    # "targets is None ... STILL classified" clause), and the segment then
+    # fails closed downstream too -- `_extract_write_destinations` also
+    # returns `None`, so `_destination_veto_reason` vetoes it as an
+    # unparseable destination. Conservative, not a false negative.
+    assert f("cmd > >(tee f)") == "bash-redirect"
+    assert (
+        permissions_module._extract_write_destinations("bash-redirect", "cmd > >(tee f)")
+        is None
+    )
+    # `tee FILE` (argument-based write, no shell redirect) is a DIFFERENT,
+    # still-open gap -- out of scope for cpp#155, which teaches
+    # `_segment_write_kind` about REDIRECTION OPERATORS specifically (the
+    # ticket's own scope: `>`, `>>`, `N>`, `N>>`, `&>`, `&>>`), not about verbs
+    # whose own argument names a write target. Flagged in the PR body.
+    assert f("tee /etc/passwd") is None
+
+
+def test_destination_veto_now_fires_for_redirects_to_system_or_escaped_paths(
+    tmp_path: Path,
+) -> None:
+    """The exact gap claude-pilot#155 reports, closed and pinned directly on
+    `_destination_veto_reason`.
+
+    Anti-vacuity: every assertion below is `is None` on `main` (before this
+    fix) -- pasted as the captured red in the PR body.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+
+    assert f("echo hi > /etc/passwd", wt) is not None
+    assert f("echo hi > ../escape", wt) is not None
+    assert f("echo hi > ~/x", wt) is not None
+    assert f("echo hi > $VAR/x", wt) is not None
+    assert f("echo hi >> /etc/passwd", wt) is not None
+    assert f("cat /dev/stdin > /etc/shadow", wt) is not None
+    assert f("echo hi > .git/hooks/pre-commit", wt) is not None
+
+
+def test_destination_veto_still_none_for_tmp_scratch_and_worktree_relative(
+    tmp_path: Path,
+) -> None:
+    """Negative controls: the SAME lexical `/tmp` exception cpp#143/#154 already
+    grant (`_is_contained_redirect_target` + the `/tmp/` prefix), reused
+    verbatim, plus an ordinary worktree-relative write."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+
+    assert f("echo hi > /tmp/scratch", wt) is None
+    assert f("echo hi > /tmp/2158bodies/$n.md", wt) is None  # D3 residue, cpp#154
+    assert f("echo hi > ./out.txt", wt) is None
+    assert f("echo hi > notes.txt", wt) is None
+    assert f("echo hi > docs/plans/x.md", wt) is None
+    # /dev/null writes nowhere (cpp#130) -- must not regress into a hard veto
+    # now that a bare redirect is a classified write-kind.
+    assert f("grep -c a b >/dev/null", wt) is None
+    assert f("grep -c a b >/dev/null 2>&1", wt) is None
+    # fd-duplication names no file -- never reaches the veto loop.
+    assert f("cmd 2>&1 | tail", wt) is None
+
+
+def test_destination_veto_symlink_escape_via_bare_redirect(tmp_path: Path) -> None:
+    """cpp#38 extended to a redirect target for the first time (cpp#155): a
+    worktree symlink resolving OUT of the worktree is still an escape, caught
+    by the same disk-resolving `is_within_project` the cp/mv/mkdir write-kinds
+    already use. `_is_contained_redirect_target` lexically admits a plain
+    relative target like `esc/x` (no `..`/`~`/leading-`$`), so the disk check
+    gets a chance to run and catch the symlink -- exactly the cpp#143 lesson
+    (grant exemptions lexically, but let escapes be caught by resolution).
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (tmp_path / "outside").mkdir()
+    (worktree / "esc").symlink_to(tmp_path / "outside", target_is_directory=True)
+    f = permissions_module._destination_veto_reason
+    assert f("echo hi > esc/x", str(worktree)) is not None
+
+
+def test_destination_veto_heredoc_body_text_not_misread_as_a_command(
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the trap named in `_destination_veto_reason`'s own
+    docstring: `_split_compound_command` splits on a bare newline (cpp#103), so
+    without the `_is_sanctioned_pure_heredoc` shortcut, a heredoc BODY line
+    that happens to contain literal text shaped like a dangerous redirect
+    (`echo hi > /etc/passwd`, never executed -- the quoted delimiter makes the
+    body inert, cpp#47) would be misclassified as a live write and veto a
+    routine, currently-ALLOWED heredoc.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    cmd = "cat > /tmp/cpp155_body.rs <<'EOF'\necho hi > /etc/passwd\nEOF"
+    assert permissions_module._destination_veto_reason(cmd, str(worktree)) is None
+
+
+def test_denial_is_terminal_redirect_gap_closed_at_destination_veto_too(
+    tmp_path: Path,
+) -> None:
+    """`_denial_is_terminal` was already `True` for these via
+    `is_tier3_dangerous_for_lethality` (the tier3 `>` pattern is never stripped
+    for an un-contained target) -- this test pins that `_destination_veto_
+    reason` now ALSO proves it independently. The aggregate verdict is
+    unchanged; the specific function claude-pilot#155 names is no longer
+    blind.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    for cmd in (
+        "echo hi > /etc/passwd",
+        "echo hi > ../escape",
+        "echo hi > ~/x",
+        "echo hi > $VAR/x",
+    ):
+        assert permissions_module._destination_veto_reason(cmd, wt) is not None, cmd
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is True
+        ), cmd
+
+
+def test_handler_vetoes_redirect_to_system_path_end_to_end(tmp_path: Path) -> None:
+    """Handler-level proof, mirroring
+    `test_containment_escape_is_lethal_on_the_default_deny_route` above: a
+    redirect to a system path is refused AND terminal through the real
+    `can_use_tool` callback, not merely at the unit level.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    result = asyncio.run(
+        handler("Bash", {"command": "echo hi > /etc/passwd"}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+    # Control: the same shape targeting /tmp scratch stays refused, not fatal.
+    scratch = asyncio.run(
+        handler("Bash", {"command": "echo hi > /tmp/cpp155-scratch"}, _mock_ctx())
+    )
+    assert isinstance(scratch, PermissionResultDeny)
+    assert scratch.interrupt is False
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # cpp#151 B0/B1 — the lethality of a refusal becomes readable, and the
 # survivable half marks the session
 #
