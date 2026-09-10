@@ -22,6 +22,7 @@ from claude_pilot.tier1 import (
     _is_safe_sort_command,
     _is_safe_xargs_command,
     _mask_quoted_redirect_chars,
+    _quote_spans,
     _redirect_targets,
     _split_compound_command,
     contains_unquoted_metacharacter,
@@ -1506,18 +1507,47 @@ class TestTier3QuotedRedirectCharLethality:
 
 
 class TestQuoteScannerBoundaryParity:
-    """cpp#157 D6: this module now carries THREE independent POSIX quote scanners
-    — `_split_compound_command`, `contains_unquoted_metacharacter` and
-    `_mask_quoted_redirect_chars`. Merging them is out of scope for a p1 lethality
-    fix (two of them sit on the ALLOW path), so the duplication is pinned here
-    instead, and the follow-up to extract a shared `_quote_spans()` is filed.
+    """cpp#157 D6 → cpp#158: this module carried THREE independent POSIX quote
+    scanners — `_split_compound_command`, `contains_unquoted_metacharacter` and
+    `_mask_quoted_redirect_chars`. cpp#158 extracted the shared `_quote_spans`
+    (see its docstring and `TestQuoteSpansSharedScanner` below) and routed all
+    three through it. This test is UPDATED BY MEASUREMENT against the unified
+    scanner, per cpp#158's explicit instruction — never deleted, never
+    hand-guessed: every expected value below was re-derived by running the
+    real post-extraction code, exactly as the pre-extraction values were.
 
-    This is a CHARACTERIZATION test, deliberately not an agreement test. The
-    plan's D6 assumed the three would agree on every boundary; measurement on
-    `main` refuted that BEFORE this fix was written — see the two rows below.
-    Asserting agreement would have been red on arrival and unsatisfiable. What is
-    pinned instead is exactly where each scanner places a boundary TODAY, so that
-    a future change to any one of them cannot shift a boundary silently.
+    Two things changed from the cpp#157 version of this test:
+
+    1. DIVERGENCE 1 (`double-quote-double-backslash`, `echo "a\\\\"`) is now
+       RESOLVED — all three scanners agree (closed), matching the
+       `contains_unquoted_metacharacter` / `_mask_quoted_redirect_chars`
+       reading, which was already POSIX. `_split_compound_command` gains this
+       correctness via `_quote_spans`.
+    2. A THIRD row is added (`backslash-single-outside` /
+       `backslash-double-outside`) pinning a divergence this test never
+       measured before extraction because `_split_compound_command` and
+       `contains_unquoted_metacharacter` had NO escape handling outside
+       quotes at all: a backslash-escaped quote character (`\\'`, `\\"`) used
+       to open a PHANTOM region in both of them, while
+       `_mask_quoted_redirect_chars` (cpp#157) already got this right. This is
+       a genuine, pre-cpp#157 authorization-path false negative — see the
+       plan doc's security section (cpp#158) for the live command-
+       substitution bypass this fixes:
+       `contains_unquoted_metacharacter("echo \\\\'$(echo INJECTED)")` was
+       `False` on `main`.
+
+    DIVERGENCE 2 (unterminated quotes) is UNCHANGED and remains deliberate —
+    `_quote_spans` reports the boundary uniformly (`closed=False`), and each
+    caller keeps its own, already-established fail-closed DIRECTION on top of
+    that shared fact (cpp#158's explicit ask: this is a per-caller policy
+    choice, not a scanner property). `_split_compound_command` and
+    `contains_unquoted_metacharacter` decide an ALLOWANCE, so their
+    fail-closed direction is "refuse" (treat the remainder as quoted — which
+    a span already reaching `len(command)` gives them for free);
+    `_mask_quoted_redirect_chars` decides a LETHALITY exemption, so its
+    fail-closed direction is "do not exempt" (return the command unchanged).
+    Same principle, opposite-facing questions — this inversion is NOT a bug
+    and must never be "fixed" into agreement.
 
     The oracle for each scanner is its own observable behaviour on a marker
     appended to the corpus prefix — no scanner is re-implemented here:
@@ -1532,24 +1562,35 @@ class TestQuoteScannerBoundaryParity:
     CORPUS: ClassVar[list[tuple[str, str, bool, bool, bool]]] = [
         ("single-quote-with-backslash", "echo 'a\\b'", False, False, False),
         ("double-quote-escaped-quote", 'echo "a\\"b"', False, False, False),
-        # DIVERGENCE 1, PRE-EXISTING ON `main`, between the two OLD scanners.
-        # `_split_compound_command` treats `\X` as an escape pair only when `X`
-        # is `"`, so on `\\"` its first backslash passes through, its second
-        # pairs with the CLOSING quote and swallows it, and the region stays
-        # open. `contains_unquoted_metacharacter` skips `\X` atomically and
-        # closes the region — which is POSIX, and which the cpp#157 mask follows.
-        # Not repaired here: `_split_compound_command` decides ALLOWANCES, and a
-        # p1 lethality fix does not widen its surface onto that path.
-        ("double-quote-double-backslash", 'echo "a\\\\"', True, False, False),
-        # DIVERGENCE 2, INTRODUCED HERE AND DELIBERATE (D5). The two old scanners
-        # treat an unterminated quote's remainder as INSIDE the quote, because
-        # their fail-closed direction is "refuse". The mask returns the command
-        # UNCHANGED, because its fail-closed direction is "do not exempt". Same
-        # principle, opposite-facing questions.
+        # DIVERGENCE 1, RESOLVED by cpp#158. Pre-extraction, `main` had
+        # `_split_compound_command` treating `\X` as an escape pair only when
+        # `X` is `"`, so on `\\"` its first backslash passed through, its
+        # second paired with the CLOSING quote and swallowed it, leaving the
+        # region open — while `contains_unquoted_metacharacter` and
+        # `_mask_quoted_redirect_chars` already skipped `\X` atomically (any
+        # `X`) and closed. `_quote_spans` adopts the atomic form throughout,
+        # so all three now agree: closed.
+        ("double-quote-double-backslash", 'echo "a\\\\"', False, False, False),
+        # DIVERGENCE 2, DELIBERATE, UNCHANGED (cpp#157 D5). The two allowance
+        # scanners treat an unterminated quote's remainder as INSIDE the
+        # quote (fail-closed = refuse); the lethality mask returns the
+        # command UNCHANGED (fail-closed = do not exempt). Same principle,
+        # opposite-facing questions — see the class docstring.
         ("unterminated-double", 'echo "abc', True, True, False),
         ("unterminated-single", "echo 'abc", True, True, False),
         ("nested-single-in-double", 'echo "a\'b"', False, False, False),
         ("nested-double-in-single", "echo 'a\"b'", False, False, False),
+        # DIVERGENCE 3, RESOLVED by cpp#158 — measured for the first time
+        # here (pre-extraction, `_split_compound_command` and
+        # `contains_unquoted_metacharacter` had no escape handling outside
+        # quotes at all, so this boundary was never characterized). A
+        # backslash-escaped quote character outside any quoted region is
+        # literal to bash (verified: `echo \'$(echo INJECTED)` prints
+        # `'INJECTED`, i.e. bash does NOT treat the `\'` as opening
+        # anything) — so it must NOT open a region. All three now agree:
+        # not quoted.
+        ("backslash-single-outside", "echo \\'", False, False, False),
+        ("backslash-double-outside", 'echo \\"', False, False, False),
     ]
 
     def test_quote_boundaries_are_pinned_for_all_three_scanners(self) -> None:
@@ -1560,6 +1601,18 @@ class TestQuoteScannerBoundaryParity:
             assert split_quoted is exp_split, f"{name}: _split_compound_command"
             assert meta_quoted is exp_meta, f"{name}: contains_unquoted_metacharacter"
             assert mask_quoted is exp_mask, f"{name}: _mask_quoted_redirect_chars"
+
+    def test_the_three_scanners_now_agree_on_every_pinned_boundary(self) -> None:
+        """cpp#158's actual promise, made falsifiable: apart from the
+        DELIBERATE, documented unterminated-quote inversion (D2 in the class
+        docstring), every boundary in CORPUS is now identical across all
+        three scanners. Anti-vacuity: this is exactly what D1 and D3 used to
+        violate on `main` — this test is red without the fix.
+        """
+        for name, _prefix, exp_split, exp_meta, exp_mask in self.CORPUS:
+            if name in ("unterminated-double", "unterminated-single"):
+                continue
+            assert exp_split == exp_meta == exp_mask, f"{name}: scanners disagree"
 
     def test_mask_boundary_on_terminated_commands_is_not_vacuous(self) -> None:
         # The oracle above can never report `True` for the mask: a prefix whose
@@ -1573,6 +1626,131 @@ class TestQuoteScannerBoundaryParity:
         )
         assert _mask_quoted_redirect_chars("echo \"a'b>c\"") == "echo \"a'b c\""
         assert _mask_quoted_redirect_chars("echo 'a\"b>c'") == "echo 'a\"b c'"
+
+
+class TestQuoteSpansSharedScanner:
+    """cpp#158: direct tests of `_quote_spans` itself, the shared scanner all
+    three consumers above now route through. `TestQuoteScannerBoundaryParity`
+    tests it indirectly (via each consumer's own oracle behaviour); this class
+    tests its own return shape directly.
+    """
+
+    def test_no_quotes_returns_empty(self) -> None:
+        assert _quote_spans("echo hello") == []
+
+    def test_simple_closed_single_and_double(self) -> None:
+        assert _quote_spans("echo 'a' \"b\"") == [(5, 8, True), (9, 12, True)]
+
+    def test_unterminated_reports_closed_false_to_end_of_string(self) -> None:
+        cmd = "echo 'abc"
+        spans = _quote_spans(cmd)
+        assert spans == [(5, len(cmd), False)]
+
+    def test_double_quote_backslash_pair_atomic_any_x(self) -> None:
+        # `\X` inside "..." is an escape pair for ANY X, not just `\"` — this
+        # is the D1 fix: `"a\\"` (a, then TWO backslashes, then the closing
+        # quote) closes because the first backslash pairs with the second,
+        # leaving the bare closing quote to close the region.
+        assert _quote_spans('"a\\\\"') == [(0, 5, True)]
+
+    def test_single_quote_backslash_is_literal_not_escape(self) -> None:
+        # Inside '...', backslash has no special meaning — only a literal `'`
+        # closes. `'a\b'` closes at the second `'`, backslash included as
+        # ordinary content.
+        assert _quote_spans("'a\\b'") == [(0, 5, True)]
+
+    def test_backslash_escaped_quote_outside_quotes_opens_nothing(self) -> None:
+        # cpp#158's core fix: OUTSIDE any quote, `\X` is an escape pair for
+        # ANY X, so `\'` and `\"` are literal, escaped characters — no span.
+        assert _quote_spans("echo \\'") == []
+        assert _quote_spans('echo \\"') == []
+
+    def test_escaped_quote_then_real_quote_pair_is_one_genuine_span(self) -> None:
+        # `\'';'` = literal `\'` (no span) + a REAL `'...'` span that swallows
+        # the `;` as literal content. Verified against real bash: `echo
+        # \'';'` prints `';` as ONE argument — no second statement runs.
+        assert _quote_spans("\\'';'") == [(2, 5, True)]
+
+    def test_trailing_dangling_backslash_is_literal(self) -> None:
+        # A backslash as the last byte has no next character to pair with —
+        # treated as an ordinary character, mirroring all three pre-cpp#158
+        # scanners' `i + 1 < n` escape guards.
+        assert _quote_spans("echo \\") == []
+        assert _quote_spans("echo 'a\\") == [(5, 8, False)]
+
+
+class TestSharedQuoteSpansSecurityFixes:
+    """cpp#158's two authorization-path corrections, both root-caused to the
+    SAME missing rule (`_quote_spans`'s atomic `\\X` pair outside quotes),
+    verified against real bash execution (see the plan doc's security
+    section for the full write-up and the exhaustive differential-fuzz
+    methodology used to find every input where behaviour changed across
+    ~2.2M generated commands).
+
+    Anti-vacuity: every assertion here is checked to fail on `main` (i.e.
+    against the pre-cpp#158 scanners) as part of this fix's verification —
+    reverting `_quote_spans`'s outside-quote escape handling reproduces the
+    `main` verdict and turns these red.
+    """
+
+    def test_escaped_quote_no_longer_hides_a_live_command_substitution(self) -> None:
+        """THE closing bug. On `main`, a backslash-escaped quote character
+        outside any quoted region opened a PHANTOM single-quoted span in
+        `contains_unquoted_metacharacter` (it had no outside-quote escape
+        handling at all), swallowing a REAL, live `$(...)` as falsely inert.
+        Verified against real bash: `echo \\'$(echo INJECTED)` actually runs
+        the substitution and prints `'INJECTED` — it is NOT suppressed.
+        `main`: `contains_unquoted_metacharacter(cmd)` is `False` and
+        `is_safe_bash_command(cmd)` is `True` (a live substitution sails
+        through the authorization gate). Post-cpp#158: both correctly flip.
+        """
+        cmd = "echo \\'$(echo INJECTED)"
+        assert contains_unquoted_metacharacter(cmd) is True
+        assert is_safe_bash_command(cmd) is False
+
+    def test_backtick_after_escaped_quote_also_now_detected(self) -> None:
+        """Same bug, backtick form."""
+        cmd = "echo \\'`id`"
+        assert contains_unquoted_metacharacter(cmd) is True
+        assert is_safe_bash_command(cmd) is False
+
+    def test_genuinely_single_quoted_substitution_stays_correctly_inert(self) -> None:
+        """The INVERSE case, proven safe rather than merely asserted: a
+        substitution marker that ends up inside a REAL (not phantom) closed
+        single-quoted span is correctly recognized as inert — this is a
+        pre-existing `contains_unquoted_metacharacter` property (single
+        quotes suppress everything), unaffected by cpp#158. What cpp#158
+        changes is only which spans are REAL: `\\'x'$(echo INJECTED)'` used
+        to be a false positive on `main` (the escaped `\\'` opened a phantom
+        span that swallowed the FIRST real `'`, so bash's own genuine
+        single-quoted region around `$(echo INJECTED)` was never recognized,
+        and `contains_unquoted_metacharacter` flagged it). Verified against
+        real bash: `echo \\'x'$(echo INJECTED)'` prints `'x$(echo INJECTED)`
+        literally — the substitution never runs; `main` denied a genuinely
+        harmless command. Post-cpp#158, both the scanner and the overall
+        verdict agree with real bash.
+        """
+        cmd = "echo \\'x'$(echo INJECTED)'"
+        assert contains_unquoted_metacharacter(cmd) is False
+        assert is_safe_bash_command(cmd) is True
+
+    def test_escaped_quote_before_a_real_quoted_semicolon_is_one_statement(
+        self,
+    ) -> None:
+        """The `_split_compound_command` sibling of the same root fix. On
+        `main`, `_split_compound_command` had no outside-quote escape
+        handling either, so `echo \\'';'` mis-split into `["echo \\''", "'"]`
+        — the bogus trailing `"'"` fragment matches no safelist entry, so
+        `main` denied a command that is, in real bash, a single harmless
+        `echo` call: verified, `echo \\'';'` prints `';` as ONE argument
+        (the `;` is literal, inside the genuine `'...'` span that opens
+        AFTER the escaped `\\'`), no second statement ever runs. Post-
+        cpp#158, `_split_compound_command` sees the same one real span real
+        bash does and returns a single segment.
+        """
+        cmd = "echo \\'';'"
+        assert _split_compound_command(cmd) == [cmd]
+        assert is_safe_bash_command(cmd) is True
 
 
 class TestSafeBashOutputRedirectIntegration:

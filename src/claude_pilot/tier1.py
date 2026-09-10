@@ -411,17 +411,16 @@ def _strip_contained_redirects(command: str) -> str:
 # decides a LETHALITY, so its fail-closed direction is "do not exempt". Same
 # principle, opposite-facing questions.
 #
-# THIRD QUOTE SCANNER, knowingly. Merging the three is out of scope for a p1
-# lethality fix — two of them sit on the ALLOW path and each carries its own
-# documented conservatism (above). The debt is pinned instead by
-# `TestQuoteScannerBoundaryParity`, a CHARACTERIZATION test: it records where
-# each of the three scanners places a quoted region today, INCLUDING the one
-# boundary on which the two pre-existing scanners already disagree on `main`
-# (`echo "a\\"` — `_split_compound_command` only treats `\X` as an escape pair
-# when `X` is `"`, so it swallows the closing quote and leaves the region open,
-# while `contains_unquoted_metacharacter` skips `\X` atomically and closes it).
-# This mask follows the atomic form, i.e. POSIX and the second scanner. Extracting
-# a shared `_quote_spans()` is filed as follow-up, not done here.
+# THIRD CONSUMER OF THE SHARED QUOTE SCANNER (cpp#157 introduced it as a third
+# independent state machine; cpp#158 extracted `_quote_spans`, and this is now
+# one of its three call sites, not a scanner of its own). Its OWN quote-
+# boundary math does not change: this function already used the atomic
+# `\X`-pair rule inside AND outside quotes (cpp#157), which is exactly what
+# `_quote_spans` implements — cpp#158 is a pure extraction here, zero
+# behavioral delta. `_split_compound_command` and `contains_unquoted_metacharacter`
+# are the two that gain correctness (see `_quote_spans`'s docstring and the
+# plan doc's security section) by routing through the same scanner this
+# function already had right.
 #
 # Length is preserved (one space per masked character), so no downstream regex
 # index shifts and no two tokens can be glued together.
@@ -431,54 +430,41 @@ def _mask_quoted_redirect_chars(command: str) -> str:
 
     Purely lexical — no ``cwd``, no filesystem, ``(str) -> str`` — as
     ``permissions._is_sanctioned_tmp_scratch`` (`:922-968`) requires of everything
-    on this path. Quote semantics mirror ``contains_unquoted_metacharacter``:
+    on this path. Quote boundaries come from the shared `_quote_spans`
+    (cpp#158) — see its docstring for the atomic ``\X`` escape rule, inside and
+    outside quotes alike, that this function already implemented pre-cpp#158
+    and that the shared scanner now applies to all three call sites.
 
-    - Outside quotes, ``'`` and ``"`` open a region, and ``\X`` is an escape
-      pair consumed atomically — so an escaped quote opens nothing.
-    - Inside ``"..."``, ``\X`` is an escape pair consumed atomically (so ``\"``
-      does not close the region); a bare ``"`` closes it.
-    - Inside ``'...'``, backslash is literal — only ``'`` closes.
-    - An unterminated quote returns the command UNCHANGED (fail-closed toward
-      lethal; see the header comment for why this direction is inverted).
+    - An unterminated quote (`_quote_spans` reports ``closed=False`` on the
+      trailing span) returns the command UNCHANGED (fail-closed toward
+      lethal; see the header comment for why this direction is the INVERSE of
+      `_split_compound_command`'s and `contains_unquoted_metacharacter`'s).
+    - Inside ``"..."``, a masking walk must repeat `_quote_spans`'s own
+      ``\\X`` pair-consumption (any ``X``): an escaped pair is skipped WHOLE
+      and neither of its two characters is masked, so an escaped ``\\>`` (a
+      literal ``>`` to bash, per the header comment) stays visible to
+      ``TIER3_PATTERNS`` and stays lethal — masking it would silently exempt
+      a real redirect character AC2 requires to stay fatal. Inside ``'...'``,
+      there is no escape concept (backslash is a plain character), so every
+      ``<``/``>`` in the region is masked unconditionally, backslash-preceded
+      or not.
     """
-    n = len(command)
-    i = 0
-    quote_state: str | None = None  # None / "'" / '"'
-    out = list(command)
-
-    while i < n:
-        ch = command[i]
-        if quote_state is None:
-            if ch == "\\" and i + 1 < n:
-                # A backslash OUTSIDE quotes escapes the next character, so `\'`
-                # is a literal apostrophe and does NOT open a quoted region.
-                # Consuming the pair is load-bearing, not tidiness: without it
-                # `echo \' > /etc/passwd \'` opens a phantom region at the first
-                # `\'` and closes it at the second, masking a redirect bash
-                # performs for real — a genuine `> /etc/passwd` turned survivable,
-                # which is exactly what AC2 forbids. The escaped character is
-                # consumed but NEVER masked, so `\>` (a literal `>` to bash)
-                # stays visible to the pattern and stays lethal: the residue
-                # falls on the fail-closed side.
-                i += 2
-                continue
-            if ch in ("'", '"'):
-                quote_state = ch
-            i += 1
-            continue
-        if quote_state == '"' and ch == "\\" and i + 1 < n:
-            i += 2
-            continue
-        if ch == quote_state:
-            quote_state = None
-            i += 1
-            continue
-        if ch in ("<", ">"):
-            out[i] = " "
-        i += 1
-
-    if quote_state is not None:
+    spans = _quote_spans(command)
+    if spans and not spans[-1][2]:
         return command
+
+    out = list(command)
+    for start, end, _closed in spans:
+        quote_char = command[start]
+        k = start
+        while k < end:
+            ch = out[k]
+            if quote_char == '"' and ch == "\\" and k + 1 < end:
+                k += 2
+                continue
+            if ch in ("<", ">"):
+                out[k] = " "
+            k += 1
     return "".join(out)
 
 
@@ -639,20 +625,122 @@ strand your session:
 # ── Safe Bash command checking ───────────────────────────────────────────────
 
 
+def _quote_spans(command: str) -> list[tuple[int, int, bool]]:
+    r"""Return every single- or double-quoted region in *command*, as
+    ``(start, end, closed)`` triples in left-to-right, non-overlapping order.
+
+    ``start`` is the index of the opening quote character. ``end`` is one
+    past the region's last byte: the index after the closing quote character
+    when ``closed`` is True, or ``len(command)`` when the region runs off the
+    end unterminated (``closed`` False). Both delimiters (when present) are
+    included in ``[start, end)`` — callers that only need "is index *i* inside
+    a quoted run" treat the whole span as opaque, delimiters included, which
+    is what all three call sites below already did before this extraction.
+
+    cpp#158: this is the single POSIX-correct quoted-region scanner shared by
+    `_split_compound_command` (authorization), `contains_unquoted_metacharacter`
+    (authorization) and `_mask_quoted_redirect_chars` (lethality) — previously
+    three independent state machines, two of which measurably disagreed on
+    `main` (cpp#157 D6 / `TestQuoteScannerBoundaryParity`). The atomic escape
+    rule below is `_mask_quoted_redirect_chars`'s own (cpp#157) — this
+    extraction changes that function's OWN quote-boundary math not at all; it
+    is the two older scanners that gain correctness here.
+
+    Escape semantics, atomic throughout — the single rule this module now
+    applies everywhere a quote might open or close:
+
+    - OUTSIDE any quote, ``\X`` is an escape pair consumed as one unit for ANY
+      ``X`` — so ``\'`` and ``\"`` are literal, escaped characters and do NOT
+      open a region. Neither `_split_compound_command` nor
+      `contains_unquoted_metacharacter` had this rule before cpp#158: both
+      treated a bare backslash outside quotes as a no-op, so the following
+      quote character opened a PHANTOM region. On `main`,
+      `contains_unquoted_metacharacter("echo \\'$(echo INJECTED)")` is
+      `False` — the phantom region swallows the real, live `$(...)` into what
+      the old scanner believes is inert single-quoted text, and
+      `is_safe_bash_command` on that same string returns `True`. Real bash
+      does expand it (verified: `echo \'$(echo INJECTED)` prints
+      ``'INJECTED``, not a literal `$(echo INJECTED)`). This is a genuine
+      authorization-path false negative on `main`, independent of and
+      pre-dating cpp#157; the plan doc's security section carries the full
+      write-up and the closing proof.
+    - INSIDE ``"..."``, ``\X`` is likewise an escape pair consumed as a unit
+      for any ``X`` — so ``\"`` does not close the region and a doubled
+      ``\\`` immediately before a closing ``"`` does not swallow it. This is
+      the one boundary `_split_compound_command` and
+      `contains_unquoted_metacharacter` already disagreed on before cpp#158
+      (`echo "a\\"` — CORPUS row `double-quote-double-backslash`,
+      `TestQuoteScannerBoundaryParity`): `_split_compound_command` only ever
+      special-cased ``\"`` (checking that the escaped character IS a quote),
+      so on ``\\"`` its first backslash passed through as an ordinary
+      character and its second paired with the closing quote and consumed it,
+      leaving the region open. `contains_unquoted_metacharacter` and
+      `_mask_quoted_redirect_chars` already treated the pair atomically
+      (any ``X``) and closed. This scanner adopts the atomic form throughout,
+      i.e. the POSIX-correct, already-shipped `_mask_quoted_redirect_chars`
+      reading.
+    - INSIDE ``'...'``, backslash is a plain, literal character — only a
+      matching ``'`` closes the region. Unanimous across all three scanners
+      before this extraction; unchanged.
+
+    An unterminated region is reported with ``closed=False`` rather than
+    silently choosing a fail-closed direction: `_split_compound_command` and
+    `contains_unquoted_metacharacter` want the remainder treated as INSIDE
+    the quote (their fail-closed direction is "refuse", and a span already
+    reaching to ``len(command)`` gives them exactly that, span-membership
+    alone, no extra branching needed); `_mask_quoted_redirect_chars` wants the
+    opposite — return the command unchanged (its fail-closed direction is "do
+    not exempt", cpp#157 D5) — and does so by checking ``closed`` on the
+    trailing span itself. Interpreting ``closed`` is deliberately a
+    per-caller decision, per cpp#158's explicit ask: the caller's own verdict
+    on an unterminated quote is a policy choice about what that caller is
+    deciding (an allowance vs. a lethality exemption), not a property of the
+    lexical scan.
+    """
+    spans: list[tuple[int, int, bool]] = []
+    n = len(command)
+    i = 0
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote_char = ch
+            start = i
+            i += 1
+            closed = False
+            while i < n:
+                c2 = command[i]
+                if quote_char == '"' and c2 == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c2 == quote_char:
+                    i += 1
+                    closed = True
+                    break
+                i += 1
+            spans.append((start, i, closed))
+            continue
+        i += 1
+    return spans
+
+
 def _split_compound_command(command: str) -> list[str]:
     """Quote-aware split on shell operators AND raw newlines.
 
     Splits on ``&&``, ``||``, ``;``, ``|``, and ``\\n`` only when they appear
-    OUTSIDE of single- or double-quoted regions. Quote handling mirrors POSIX
-    semantics used by ``contains_unquoted_metacharacter`` in this module:
+    OUTSIDE of single- or double-quoted regions, as computed by the shared
+    `_quote_spans` (cpp#158). Quote boundaries themselves — where a region
+    opens and closes — are entirely `_quote_spans`'s concern; see its
+    docstring for the atomic escape rule (inside AND outside quotes) that
+    replaces this function's former ad hoc, ``\\"``-only escape handling.
 
-    - Inside ``"..."``, ``\\"`` is an escape pair (skipped atomically); other
-      backslash sequences pass through as-is so ``"a\\|b"`` does not close the
-      quote on ``\\``.
-    - Inside ``'...'``, backslash is literal — only a closing ``'`` ends the
-      quoted region.
-    - Unterminated quotes: remaining bytes are treated as inside the quote
-      (conservative — falls through to the LLM relay on malformed input).
+    Unterminated quotes: a `_quote_spans` region that never closes already
+    extends to the end of the command, so every character in it — including
+    what would otherwise be a separator — is skipped exactly as before
+    (conservative — falls through to the LLM relay on malformed input). No
+    separate handling is needed here for that case.
 
     ``\\n`` is included because bash treats a bare newline as a command
     separator equivalent to ``;``. Without splitting on ``\\n``, a payload like
@@ -669,79 +757,64 @@ def _split_compound_command(command: str) -> list[str]:
     """
     segments: list[str] = []
     n = len(command)
+    span_end_at: dict[int, int] = {
+        start: end for start, end, _closed in _quote_spans(command)
+    }
     i = 0
     seg_start = 0
-    quote_state: str | None = None  # None / "'" / '"'
 
     while i < n:
+        if i in span_end_at:
+            i = span_end_at[i]
+            continue
+
         ch = command[i]
 
-        if quote_state is None:
-            if ch in ("'", '"'):
-                quote_state = ch
+        if ch in (";", "\n", "\r"):
+            # `\r` treated as `\n`: some pipelines (Windows-authored payloads,
+            # copy-pasted heredocs) carry CR terminators. Bash on Unix ignores
+            # bare `\r` between tokens, but the classifier fails-closed here —
+            # splitting on `\r` prevents an obfuscation vector where a
+            # payload uses CR to hide a second statement from a `\n`-only
+            # splitter (coherence refute cpp#103 2026-08-06).
+            segments.append(command[seg_start:i].strip())
+            i += 1
+            seg_start = i
+            continue
+        if ch == "&" and i + 1 < n and command[i + 1] == "&":
+            segments.append(command[seg_start:i].strip())
+            i += 2
+            seg_start = i
+            continue
+        if ch == "&":
+            # Single `&` = background operator (statement separator). Bash
+            # runs the LHS in the background and continues with the next
+            # statement — same semantic as `;` for classifier purposes.
+            # BUT: `&` also appears in fd-redirect syntax `2>&1` / `>&2`.
+            # Preceded by `>` → part of a redirect, NOT a separator.
+            # Preceded by `<` → part of process-substitution `<(...)` /
+            # `<&N` — also not a separator. Fix cpp#103 (coherence refute
+            # 2026-08-06): previously single `&` fell through to `i += 1`
+            # and `foo & rm -rf /` never split, so the rm sub scattered
+            # outside the deny check.
+            prev = command[i - 1] if i > 0 else ""
+            if prev in (">", "<"):
                 i += 1
                 continue
-            if ch in (";", "\n", "\r"):
-                # `\r` treated as `\n`: some pipelines (Windows-authored payloads,
-                # copy-pasted heredocs) carry CR terminators. Bash on Unix ignores
-                # bare `\r` between tokens, but the classifier fails-closed here —
-                # splitting on `\r` prevents an obfuscation vector where a
-                # payload uses CR to hide a second statement from a `\n`-only
-                # splitter (coherence refute cpp#103 2026-08-06).
-                segments.append(command[seg_start:i].strip())
-                i += 1
-                seg_start = i
-                continue
-            if ch == "&" and i + 1 < n and command[i + 1] == "&":
+            segments.append(command[seg_start:i].strip())
+            i += 1
+            seg_start = i
+            continue
+        if ch == "|":
+            if i + 1 < n and command[i + 1] == "|":
                 segments.append(command[seg_start:i].strip())
                 i += 2
                 seg_start = i
-                continue
-            if ch == "&":
-                # Single `&` = background operator (statement separator). Bash
-                # runs the LHS in the background and continues with the next
-                # statement — same semantic as `;` for classifier purposes.
-                # BUT: `&` also appears in fd-redirect syntax `2>&1` / `>&2`.
-                # Preceded by `>` → part of a redirect, NOT a separator.
-                # Preceded by `<` → part of process-substitution `<(...)` /
-                # `<&N` — also not a separator. Fix cpp#103 (coherence refute
-                # 2026-08-06): previously single `&` fell through to `i += 1`
-                # and `foo & rm -rf /` never split, so the rm sub scattered
-                # outside the deny check.
-                prev = command[i - 1] if i > 0 else ""
-                if prev in (">", "<"):
-                    i += 1
-                    continue
+            else:
                 segments.append(command[seg_start:i].strip())
                 i += 1
                 seg_start = i
-                continue
-            if ch == "|":
-                if i + 1 < n and command[i + 1] == "|":
-                    segments.append(command[seg_start:i].strip())
-                    i += 2
-                    seg_start = i
-                else:
-                    segments.append(command[seg_start:i].strip())
-                    i += 1
-                    seg_start = i
-                continue
-            i += 1
             continue
-
-        # inside a quote
-        if quote_state == '"':
-            if ch == "\\" and i + 1 < n and command[i + 1] == '"':
-                i += 2
-                continue
-            if ch == '"':
-                quote_state = None
-            i += 1
-            continue
-
-        # quote_state == "'"
-        if ch == "'":
-            quote_state = None
         i += 1
 
     tail = command[seg_start:].strip()
@@ -757,20 +830,43 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     Bash performs command substitution inside double quotes; only single quotes
     suppress it. So the name is historical: the function flags substitution
     markers in unquoted AND double-quoted regions, treating only single-quoted
-    regions as inert. Quote handling follows POSIX semantics:
+    regions as inert. Quote boundaries come from the shared `_quote_spans`
+    (cpp#158); this function's own job is only to decide, for each region
+    `_quote_spans` reports, which markers still count as "unquoted" bash would
+    expand:
 
-    - Outside quotes, a bare backtick, ``$(`` or ``$'`` returns True.
-    - Inside ``"..."`` regions, a bare backtick or ``$(`` returns True (cpp#41
+    - Outside any quoted region (the gaps `_quote_spans` leaves unclaimed), a
+      bare backtick, ``$(`` or ``$'`` returns True.
+    - Inside a ``"..."`` region, a bare backtick or ``$(`` returns True (cpp#41
       closed the double-quoted gap — bash expands both there). ``$'`` is NOT
       flagged inside double quotes: ANSI-C ``$'...'`` quoting is only recognized
-      outside quotes, so inside a double-quoted region ``$'`` is literal.
-    - Inside ``"..."`` regions, ``\\X`` is an escape pair (skipped atomically),
-      so a backslash-suppressed ``\\$(``/``\\```` is NOT flagged and ``\\"`` does
-      not close the region.
-    - Inside ``'...'`` regions, backslash is literal — ``'foo\\\\'`` closes at
-      the second ``'`` and any backtick that follows is unquoted.
-    - Unterminated quotes: the scanner treats all remaining bytes as inside the
-      quote (conservative — falls through to the LLM relay on malformed input).
+      outside quotes, so inside a double-quoted region ``$'`` is literal. The
+      interior scan applies the same atomic ``\\X`` escape rule `_quote_spans`
+      used to find the region's end, so a backslash-suppressed ``\\$(``/``\\```` is
+      NOT flagged.
+    - Inside a ``'...'`` region, nothing is scanned — bash treats everything
+      there as literal, full stop.
+    - Unterminated quotes: `_quote_spans` already extends an unclosed region to
+      `len(command)`, so the remainder is scanned (double-quoted) or skipped
+      entirely (single-quoted) exactly as a closed region of the same kind
+      would be — conservative, falls through to the LLM relay on malformed
+      input.
+
+    cpp#158 fixes a real authorization-path false negative this function
+    carried before the shared scanner: with no escape handling OUTSIDE quotes,
+    a backslash-escaped quote character (``\\'``, ``\\"``) — a literal,
+    non-quoting apostrophe or double-quote to bash — opened a PHANTOM region
+    here. On `main`,
+    ``contains_unquoted_metacharacter("echo \\'$(echo INJECTED)")`` is
+    `False`: the phantom single-quoted region the stray ``'`` after the
+    backslash opens swallows the live, unquoted ``$(echo INJECTED)`` as
+    (wrongly) inert. Verified against real bash:
+    ``echo \\'$(echo INJECTED)`` prints ``'INJECTED`` — the substitution runs
+    for real. `_quote_spans`'s outside-quote atomic ``\\X`` rule closes this:
+    the escaped ``'`` no longer opens anything, so the ``$(`` is correctly
+    seen at top level. See the plan doc's security section for the full
+    authorization-path analysis (this fix only ever ADDS detections here, it
+    never removes one — see the doc for why no case flips the other way).
 
     NOTE: the Rust mirror ``contains_unquoted_metacharacter`` in
     ``crates/mika-agent/src/server/permission_pre_classifier.rs`` (mika repo) does
@@ -781,48 +877,44 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     cpp#41 (double-quoted substitution gap).
     """
     n = len(command)
+    span_end_at: dict[int, tuple[int, str]] = {
+        start: (end, command[start]) for start, end, _closed in _quote_spans(command)
+    }
     i = 0
-    quote_state: str | None = None  # None / "'" / '"'
 
     while i < n:
-        ch = command[i]
-        if quote_state is not None:
-            # Inside a quoted region — handle escape (double-quoted only) first.
-            if quote_state == '"' and ch == '\\' and i + 1 < n:
-                # Skip the `\X` pair. In bash, `\` inside double quotes suppresses
-                # `$`/backtick, so `"\$(x)"` / "\`x\`" are literal — skipping the
-                # pair correctly prevents flagging a SUPPRESSED substitution. `\"`
-                # likewise does not close the region (handled by skipping here).
-                i += 2
-                continue
-            if ch == quote_state:
-                quote_state = None
-                i += 1
-                continue
-            # cpp#41: bash performs command substitution inside DOUBLE quotes —
-            # only SINGLE quotes suppress it. The pre-cpp#41 scanner treated a
-            # double-quoted region as inert and missed `$(`/backtick, so
-            # `grep "$(id)"` auto-approved and bash ran `id`. Scan double-quoted
-            # regions for the two markers bash STILL expands there: `$(` and
-            # backtick. `$'` is deliberately NOT flagged inside double quotes —
-            # ANSI-C `$'...'` quoting is only recognized OUTSIDE quotes; inside a
-            # double-quoted region `$'` is a literal dollar + apostrophe (no
-            # expansion), so flagging it would be a false positive (mika#944's
-            # `$'` guard correctly lives in the UNQUOTED branch only). Single-
-            # quoted regions stay fully inert (bash literal semantics).
-            if quote_state == '"':
-                if ch == "`":
-                    return True
-                if ch == "$" and i + 1 < n and command[i + 1] == "(":
-                    return True
-            i += 1
+        if i in span_end_at:
+            end, quote_char = span_end_at[i]
+            if quote_char == '"':
+                # cpp#41: bash performs command substitution inside DOUBLE
+                # quotes — only SINGLE quotes suppress it. Scan the interior
+                # for the two markers bash still expands there: `$(` and
+                # backtick. `$'` is deliberately NOT flagged inside double
+                # quotes — ANSI-C `$'...'` quoting is only recognized
+                # OUTSIDE quotes; inside a double-quoted region `$'` is a
+                # literal dollar + apostrophe (mika#944's `$'` guard
+                # correctly lives in the top-level branch only).
+                j = i + 1
+                while j < end:
+                    c2 = command[j]
+                    if c2 == "\\" and j + 1 < end:
+                        # Same atomic escape pair `_quote_spans` used to find
+                        # `end`: `\` inside double quotes suppresses `$`/
+                        # backtick, so `"\$(x)"` / `"\`x\`"` are literal.
+                        j += 2
+                        continue
+                    if c2 == "`":
+                        return True
+                    if c2 == "$" and j + 1 < end and command[j + 1] == "(":
+                        return True
+                    j += 1
+            # quote_char == "'": single-quoted region, fully inert — nothing
+            # to scan.
+            i = end
             continue
 
-        # Unquoted region — open a quote or check for metacharacters.
-        if ch == "'" or ch == '"':
-            quote_state = ch
-            i += 1
-            continue
+        # Top level — outside any quoted region.
+        ch = command[i]
         if ch == "`":
             return True
         if ch == "$" and i + 1 < n and command[i + 1] == "(":
