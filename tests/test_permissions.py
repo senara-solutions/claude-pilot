@@ -962,6 +962,142 @@ def test_handler_vetoes_redirect_to_system_path_end_to_end(tmp_path: Path) -> No
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# cpp#176 — REGRESSION of cpp#155/PR#173: an ABSOLUTE redirect target that
+# RESOLVES inside the worktree was vetoed fail-closed, TERMINAL, because
+# `_destination_veto_reason`'s `bash-redirect` containment accepted a target
+# only if it was LEXICALLY under `/tmp/` or worktree-RELATIVE — never an
+# absolute path, no matter where it actually resolved. Builds routinely
+# redirect to an absolute worktree path
+# (`/usr/bin/time -v cargo build ... > <abs-worktree-path>/out`); this killed
+# mika#1719 mid-build, zero commits.
+#
+# The fix routes that case through the SAME cpp#38 `is_within_project`
+# resolution the `cp`/`mv`/`mkdir`/`git show` write-kinds already use for
+# their own destinations — symlink-aware, bounded to the worktree — instead
+# of an automatic lexical veto. It does NOT touch the `/tmp/` exception (kept
+# purely lexical, cpp#143/#150/#155) and does NOT loosen anything else: a
+# target outside the worktree and not under `/tmp/`, and a symlink that
+# resolves outside the worktree, both stay vetoed and terminal.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# These tests deliberately do NOT build their worktree under pytest's own
+# `tmp_path` fixture: on this platform `tmp_path` itself resolves under
+# `/tmp/...`, and an absolute redirect target rooted there would ALSO satisfy
+# the pre-existing, unrelated `/tmp/`-prefix lexical exception (cpp#143/#150/
+# #155) -- confounding "allowed because it resolves in the worktree" (the
+# thing cpp#176 fixes) with "allowed because it is literally under /tmp/"
+# (unchanged, already true before this fix). `_make_non_tmp_worktree` roots
+# the worktree under `/var/tmp` instead, so the redirect target's absolute
+# text never starts with `/tmp/` and the two exceptions cannot be conflated —
+# this is what makes case 1 below a genuine pre-fix regression (a mika
+# worktree lives under `/data/workspace/mika-platform/...`, never `/tmp/`).
+
+
+def _make_non_tmp_worktree(request: pytest.FixtureRequest) -> Path:
+    """A real worktree directory OUTSIDE `/tmp`, cleaned up at test teardown."""
+    import shutil
+    import tempfile
+
+    base = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="cpp176-wt-"))
+    request.addfinalizer(lambda: shutil.rmtree(base, ignore_errors=True))
+    worktree = base / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    return worktree
+
+
+def test_destination_veto_allows_absolute_redirect_target_within_worktree(
+    request: pytest.FixtureRequest,
+) -> None:
+    """cpp#176 — THE REGRESSION CASE, case 1 of the mandatory negative-test
+    gate. On `main` at d9f9254 (the deployed regression, PR#173/cpp#155) this
+    assertion FAILS — `f(...)` returns a non-None veto reason, because an
+    absolute path is accepted ONLY when it is lexically under `/tmp/`, never
+    when it merely resolves inside the worktree. Pasted verbatim as the
+    captured red in the PR body.
+
+    This is the exact shape of the mika#1719 command probe: `cargo build`
+    redirecting stdout to an absolute path under the pilot's own worktree
+    (which, like the real mika#1719 worktree, does NOT live under `/tmp/`).
+    """
+    worktree = _make_non_tmp_worktree(request)
+    (worktree / "sub").mkdir()
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+    abs_target = str(worktree / "sub" / "out.txt")
+    cmd = (
+        "/usr/bin/time -v cargo build --release --features telemetry "
+        f"--bin mika-spirit > {abs_target}"
+    )
+    assert f(cmd, wt) is None
+
+
+def test_destination_veto_symlink_escape_via_absolute_redirect_still_refused(
+    request: pytest.FixtureRequest,
+) -> None:
+    """cpp#176 — mandatory negative-test gate, case 2. Negative control: the
+    fix must NOT loosen containment for a symlink that resolves OUTSIDE the
+    worktree, even when spelled as an ABSOLUTE, worktree-prefixed path.
+    `is_within_project` (cpp#38) resolves symlinks on existing path
+    components, so a real symlink `esc -> <outside the worktree>` still
+    escapes and is still vetoed — the fix ROUTES the absolute case through
+    this same resolution, it does not bypass it.
+    """
+    worktree = _make_non_tmp_worktree(request)
+    outside = worktree.parent / "outside"
+    outside.mkdir()
+    (worktree / "esc").symlink_to(outside, target_is_directory=True)
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+    abs_target = str(worktree / "esc" / "x")
+    assert f(f"cargo build --release > {abs_target}", wt) is not None
+
+
+def test_destination_veto_tmp_absolute_redirect_still_allowed(
+    tmp_path: Path,
+) -> None:
+    """cpp#176 — mandatory negative-test gate, case 3. Negative control: the
+    lexical `/tmp/` exception (cpp#143/#150/#155) is unchanged by this fix —
+    it stays purely lexical (a literal `/tmp/` prefix on the un-resolved
+    operand text), never routed through `is_within_project`/`Path.resolve()`.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+    assert f("echo hi > /tmp/cpp176-scratch", wt) is None
+
+
+def test_destination_veto_mika_1719_probe_command_no_longer_vetoed(
+    request: pytest.FixtureRequest,
+) -> None:
+    """cpp#176 — the EXACT mika#1719 command probe (session 4667a1c2, died
+    2026-09-10 21:16 on `error_during_execution:after_deny`, 0 commits),
+    replayed verbatim against a real worktree dir this test creates, with
+    `cwd` set to that worktree — the shape `_denial_is_terminal`/
+    `_destination_veto_reason` actually saw. The real worktree lived under
+    `/data/workspace/mika-platform/.claude/worktrees/...` (never `/tmp/`),
+    reproduced here by rooting under `/var/tmp` (see
+    `_make_non_tmp_worktree`) so this test cannot be accidentally satisfied by
+    the unrelated `/tmp/` lexical exception. Must now return ``None`` (no
+    veto)."""
+    import shutil
+    import tempfile
+
+    base = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="cpp176-mika1719-"))
+    request.addfinalizer(lambda: shutil.rmtree(base, ignore_errors=True))
+    worktree = base / "mika-platform" / ".claude" / "worktrees" / "fix-1719-telemetry-build"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").mkdir()
+    f = permissions_module._destination_veto_reason
+    wt = str(worktree)
+    cmd = (
+        "/usr/bin/time -v cargo build --release --features telemetry "
+        f"--bin mika-spirit > {wt}/out"
+    )
+    assert f(cmd, wt) is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # cpp#151 B0/B1 — the lethality of a refusal becomes readable, and the
 # survivable half marks the session
 #
