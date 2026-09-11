@@ -989,8 +989,10 @@ async def test_ac7_the_aae80d84_trace_no_longer_kills_the_session() -> None:
     )
     assert guardrails._wait_state is _WaitState.AWAITING_MODEL
 
-    # And the wait closes on the proof that the model resumed.
-    guardrails.note_stream_activity("content_block_delta")
+    # And the wait closes only on the proof that the NEXT turn actually
+    # started (cpp#177) — content deltas of the turn already in flight are
+    # liveness, not that proof.
+    guardrails.note_stream_activity("message_start")
     assert guardrails._wait_state is _WaitState.IDLE
     guardrails.dispose()
 
@@ -1043,6 +1045,89 @@ async def test_model_wait_that_never_resumes_dies_at_the_ceiling() -> None:
     guardrails.dispose()
 
 
+# --- cpp#177: content_block_stop of the CURRENT tool_use block must not close
+# the model-wait window its own tool result just opened -----------------------
+#
+# The CLI runs a tool as soon as its input JSON is complete, before the SSE
+# `content_block_stop` for that same `tool_use` block is relayed — so
+# `content_block_stop` reliably arrives on the wire AFTER the tool result, not
+# before. Pre-fix, `content_block_stop` was a member of
+# `_PRODUCTION_STREAM_EVENTS` and reclosed the window the tool result had just
+# opened, so a single-`tool_use` turn ended in `waiting: none` and was
+# measured against `idleTimeoutMs` (300s) instead of `modelWaitCeilingMs`
+# (900s) — killing 7 real sessions ~55s before the model's bimodal ~355s TTFT
+# produced its first token. This is the MANDATORY negative-test gate: case 1
+# is red on pristine (pre-fix) code and green after; case 2 (no tool result —
+# genuine silence) must pass unchanged on both.
+
+
+@pytest.mark.asyncio
+async def test_cpp177_content_block_stop_after_tool_result_does_not_close_the_wait() -> None:
+    """Case 1 (mandatory gate). Verbatim sequence from the ticket's `8a0b6b89`
+    trace: `tool_use` AssistantMessage -> tool result -> `content_block_stop`
+    -> `message_delta` -> `message_stop` -> silence.
+
+    Must yield `waiting: awaiting_model` and NOT abort before
+    `modelWaitCeilingMs`. RED on pre-fix code (`content_block_stop` closes the
+    window the tool result just opened, so the state collapses to IDLE and the
+    session dies at the 40ms/scaled `idleTimeoutMs` used here — the real-world
+    300s); GREEN after (`content_block_stop` is excluded from
+    `_PRODUCTION_STREAM_EVENTS`, so only `message_start` could close it, and
+    none arrives).
+    """
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=20, model_ceiling_ms=10_000)
+    )
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()  # tool result — opens the model-wait window
+    guardrails.note_stream_activity("content_block_stop")
+    guardrails.note_stream_activity("message_delta")
+    guardrails.note_stream_activity("message_stop")
+
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL, (
+        "content_block_stop of the just-dispatched tool_use block must not "
+        "claim the next turn started — this is the cpp#177 mechanism"
+    )
+
+    await asyncio.sleep(0.08)  # 2x the idle budget of pure silence
+
+    assert guardrails.aborted is False, (
+        "the session must be measured against modelWaitCeilingMs, not "
+        "idleTimeoutMs — killing it here reproduces the 7 real 09-04..09-10 "
+        "sessions killed ~55s before their first token"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cpp177_text_only_turn_with_no_tool_result_still_dies_at_idle_timeout() -> None:
+    """Case 2 (mandatory regression guard, negative control). The SAME
+    trailing shape — `content_block_stop` / `message_delta` / `message_stop` —
+    but WITHOUT a tool result: a text-only turn where the model spoke and
+    stopped. Must STILL abort at `idleTimeoutMs`. This is the existing
+    `on_assistant_message` no-tool-use case (guardrails.py `:618-623` — "the
+    model spoke and stopped") and cpp#177 must not reopen it: nobody is
+    outstanding, so this must pass unchanged before AND after the fix.
+    """
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40, model_ceiling_ms=10_000))
+    guardrails.on_assistant_message([_text("done")], message_id="msg_1")
+    guardrails.note_stream_activity("content_block_stop")
+    guardrails.note_stream_activity("message_delta")
+    guardrails.note_stream_activity("message_stop")
+
+    assert guardrails._wait_state is _WaitState.IDLE, (
+        "no tool result and no message_start: nobody is being waited on"
+    )
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout", (
+        "a genuinely silent text-only turn must still die at idleTimeoutMs — "
+        "cpp#177 must not exempt the case it was never meant to touch"
+    )
+    guardrails.dispose()
+
+
 @pytest.mark.asyncio
 async def test_returning_to_idle_restores_the_tighter_idle_budget() -> None:
     """A session that leaves a wait must go back onto the 300s budget, not stay
@@ -1055,7 +1140,7 @@ async def test_returning_to_idle_restores_the_tighter_idle_budget() -> None:
     guardrails.note_activity()
     assert guardrails._wait_state is _WaitState.AWAITING_MODEL
 
-    guardrails.note_stream_activity("content_block_start")  # the next turn begins
+    guardrails.note_stream_activity("message_start")  # the next turn begins (cpp#177)
     assert guardrails._wait_state is _WaitState.IDLE
 
     reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)

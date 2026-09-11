@@ -67,21 +67,30 @@ class _WaitState(Enum):
     AWAITING_MODEL = "awaiting_model"
 
 
-# cpp#145: the SSE events that prove the model is PRODUCING, as opposed to the
-# turn-closing trailers `message_delta` / `message_stop`. agent.py's
-# `_PROGRESS_STREAM_EVENT_TYPES` (cpp#123) deliberately includes the trailers —
-# for rearming the idle deadline they are liveness, and that stays true. They
-# are excluded HERE, and only here, because "the deadline may move" and "nobody
-# is being waited on" are different claims, and the second one is false while a
-# turn is closing.
-_PRODUCTION_STREAM_EVENTS = frozenset(
-    {
-        "message_start",
-        "content_block_start",
-        "content_block_delta",
-        "content_block_stop",
-    }
-)
+# cpp#145/cpp#177: the SSE events that prove the model is PRODUCING, as opposed
+# to everything else agent.py forwards here for LIVENESS (rearming the idle
+# deadline via `_bump_idle_deadline()`, unconditionally, regardless of this
+# set). agent.py's `_PROGRESS_STREAM_EVENT_TYPES` (cpp#123) deliberately
+# includes all six raw SSE event types — for rearming the deadline they are
+# all liveness, and that stays true. Only `message_start` is production HERE,
+# because "the deadline may move" and "the next turn started" are different
+# claims, and only `message_start` proves the second one.
+#
+# cpp#145 first cut this down from "any stream event" to excluding the
+# turn-closing trailers `message_delta` / `message_stop` (a trailer of the
+# turn that just ENDED is not evidence the next one began). cpp#177 measured
+# that the cut stopped one event short: `content_block_stop` of the CURRENT
+# `tool_use` block reliably arrives on the wire AFTER that block's own tool
+# result — the CLI starts running the tool as soon as its input JSON is
+# complete, before the SSE `content_block_stop` is relayed — so it was still
+# misclassified as "next turn producing" and reclosed the model-wait window
+# the tool result had just opened. `content_block_start` / `content_block_delta`
+# are excluded for the same reason: between a `message_stop` and the next
+# `message_start`, nothing the wire delivers is the next turn's production —
+# only `message_start` itself is. All three stay LIVENESS (they still rearm
+# the deadline, unconditionally, via `note_stream_activity`'s unconditional
+# `_bump_idle_deadline()` call) — they simply no longer close the window.
+_PRODUCTION_STREAM_EVENTS = frozenset({"message_start"})
 
 
 @dataclass(frozen=True)
@@ -421,15 +430,21 @@ class SessionGuardrails:
         The counter is incremented unconditionally; only the deadline needs a
         running loop.
 
-        cpp#145: `event_type` is the raw SSE event name. Only the events in
-        `_PRODUCTION_STREAM_EVENTS` close the model-wait window; the
-        turn-closing trailers `message_delta` / `message_stop` rearm the
-        deadline and count, exactly as before, but they do NOT claim the model
-        has resumed — in three of the six killed sessions those trailers arrive
-        AFTER the tool result, and treating them as production is what would
-        leave those sessions dying at 300s. `None` (an older caller, or a test
-        that does not care) is treated as production, preserving the previous
-        signature's behaviour.
+        cpp#145/cpp#177: `event_type` is the raw SSE event name. Only
+        `message_start` — the one event that can only ever begin a NEW turn —
+        closes the model-wait window. Every other event in
+        `_PROGRESS_STREAM_EVENT_TYPES` (`content_block_start`,
+        `content_block_delta`, `content_block_stop`, `message_delta`,
+        `message_stop`) rearms the deadline and counts, exactly as before, but
+        does NOT claim the model has resumed. `message_delta` / `message_stop`
+        are the CURRENT turn's own closing trailers; `content_block_start` /
+        `content_block_delta` / `content_block_stop` are its content blocks —
+        `content_block_stop` of the tool_use block that triggered the tool
+        result arrives on the wire AFTER that result (cpp#177: the CLI runs
+        the tool before the SSE close is relayed). None of the five are
+        evidence that a NEXT turn exists yet; only `message_start` is. `None`
+        (an older caller, or a test that does not care) is treated as
+        production, preserving the previous signature's behaviour.
 
         A stream event NEVER retires an outstanding tool. Generation and tool
         execution overlap on the real wire; only the tool's result ends its
