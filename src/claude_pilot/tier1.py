@@ -316,6 +316,42 @@ _CONTAINED_REDIRECT_TARGET_RE = re.compile(r"^[\w./$@{}-]+$")
 _BARE_DOLLAR_RE = re.compile(r"\$(?![A-Za-z_{])")
 
 
+def _is_lexically_disqualified_redirect_target(dest: str) -> bool:
+    """Whether a LITERAL redirect target text is disqualified OUTRIGHT — never a
+    write destination any part of this module will accept, no matter what
+    ``cwd``/worktree it is weighed against, and never handed to
+    ``Path.resolve()`` (cpp#38's ``is_within_project``) to find out.
+
+    This is the SAME disqualifier set `_is_contained_redirect_target` has
+    always used for `~`/leading-`$`/`..`/a disallowed charset/a bare `$` — see
+    that function's own docstring and cpp#154 plan D3 for why those must fail
+    closed BEFORE any resolve: `is_within_project` does no shell-expansion, so
+    `Path(cwd) / "~/x"` or `Path(cwd) / "$VAR/x"` would resolve to literal
+    same-named subdirectories INSIDE the worktree and wrongly read as
+    contained — the opposite of what bash would actually do.
+
+    Extracted as its own predicate (cpp#176) so `_destination_veto_reason` can
+    tell "disqualified outright" apart from "merely fails the /tmp/ prefix
+    literal" — an absolute path that fails ONLY the latter is not disqualified
+    here: it is a worktree-containment CANDIDATE the caller may still route
+    through `is_within_project`. `_is_contained_redirect_target` itself is
+    unchanged in behavior — it is now just this predicate plus its own final
+    `/tmp/`-prefix literal — so every existing caller of that function keeps
+    its exact verdict.
+    """
+    if not dest:
+        return True
+    if ".." in dest:
+        return True
+    if dest.startswith("~") or dest.startswith("$"):
+        return True
+    if _CONTAINED_REDIRECT_TARGET_RE.match(dest) is None:
+        return True
+    if _BARE_DOLLAR_RE.search(dest) is not None:
+        return True
+    return False
+
+
 def _is_contained_redirect_target(dest: str) -> bool:
     """Whether a LITERAL redirect target text is contained: in-worktree (relative)
     or under ``/tmp`` (cpp#154).
@@ -325,15 +361,7 @@ def _is_contained_redirect_target(dest: str) -> bool:
     is deliberately NOT duplicated here (an absolute path outside ``/tmp/``
     returns False).
     """
-    if not dest:
-        return False
-    if ".." in dest:
-        return False
-    if dest.startswith("~") or dest.startswith("$"):
-        return False
-    if _CONTAINED_REDIRECT_TARGET_RE.match(dest) is None:
-        return False
-    if _BARE_DOLLAR_RE.search(dest) is not None:
+    if _is_lexically_disqualified_redirect_target(dest):
         return False
     if dest.startswith("/"):
         return dest.startswith("/tmp/")

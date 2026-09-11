@@ -28,6 +28,7 @@ from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
     _is_contained_redirect_target,
+    _is_lexically_disqualified_redirect_target,
     _mask_quoted_redirect_chars,
     _redirect_targets,
     _split_compound_command,
@@ -1140,21 +1141,20 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
                     # would regress from non-terminal to a hard destination
                     # veto the moment this write-kind existed.
                     continue
-                if not _is_contained_redirect_target(dest):
-                    # SAME lexical predicate `_redirect_destination_veto_
-                    # reason` already uses to decide containment for redirect
-                    # targets (cpp#154): rejects `~`/leading-`$`/`..`/absolute-
-                    # outside-/tmp/bad-charset operands OUTRIGHT, before ever
-                    # calling `is_within_project`. That call is load-bearing
-                    # here specifically: `is_within_project` treats `~` and
-                    # `$VAR` as ordinary path TEXT (Python does no shell
-                    # expansion), so `Path(cwd) / "~/x"` resolves to a
-                    # same-named subdirectory INSIDE the worktree and would
-                    # wrongly read as contained — exactly the class bash
-                    # itself would expand to the real home directory or an
-                    # unpredictable value. Failing closed here, before
-                    # `is_within_project` ever runs, is what keeps `> ~/x` and
-                    # `> $VAR/x` vetoed.
+                if _is_lexically_disqualified_redirect_target(dest):
+                    # `~`/leading-`$`/`..`/bad-charset/bare-`$` operands are
+                    # rejected OUTRIGHT, before ever calling
+                    # `is_within_project` — the SAME disqualifier set
+                    # `_is_contained_redirect_target` has always used (cpp#154
+                    # plan D3). That call is load-bearing here specifically:
+                    # `is_within_project` treats `~` and `$VAR` as ordinary
+                    # path TEXT (Python does no shell expansion), so
+                    # `Path(cwd) / "~/x"` resolves to a same-named
+                    # subdirectory INSIDE the worktree and would wrongly read
+                    # as contained — exactly the class bash itself would
+                    # expand to the real home directory or an unpredictable
+                    # value. Failing closed here, before `is_within_project`
+                    # ever runs, is what keeps `> ~/x` and `> $VAR/x` vetoed.
                     return (
                         f"redirect destination {dest!r} is not a literal "
                         "contained path — not lexically under /tmp/ or "
@@ -1168,8 +1168,26 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
                     # prefix) so the two never drift. This is what keeps
                     # `echo hi > /tmp/scratch` and the `$n`-suffixed /tmp
                     # targets of cpp#154's founding mkdir-loop incident
-                    # (`/tmp/2158bodies/$n.md`) un-vetoed here.
+                    # (`/tmp/2158bodies/$n.md`) un-vetoed here. Deliberately
+                    # kept LEXICAL, not resolved (cpp#143/#150/#155) — see
+                    # `_is_lexically_disqualified_redirect_target`'s
+                    # docstring.
                     continue
+                # (cpp#176) Everything else — a worktree-relative target, OR
+                # an ABSOLUTE target that is not disqualified above and is
+                # simply not lexically under `/tmp/` — is a worktree-
+                # containment CANDIDATE, not an automatic veto. It falls
+                # through to the SAME `is_within_project` resolution
+                # cp/mv/mkdir/git-show already use just below: symlink-aware,
+                # bounded to the worktree, so an absolute path that actually
+                # RESOLVES inside the worktree (a build writing to its own
+                # absolute worktree path, e.g. mika#1719) is allowed, while a
+                # symlink crafted to resolve OUTSIDE the worktree — or a
+                # genuinely external absolute path like `/etc/passwd` — is
+                # still refused by that same resolve. Before this fix, an
+                # absolute-but-in-worktree target was vetoed here, above,
+                # fail-closed, without ever reaching that check (PR#173/
+                # cpp#155 regression, claude-pilot#176).
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "
