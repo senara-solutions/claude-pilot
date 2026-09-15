@@ -93,6 +93,61 @@ class _WaitState(Enum):
 _PRODUCTION_STREAM_EVENTS = frozenset({"message_start"})
 
 
+# ── cpp#185 D1: prompt-cache-dead detector ───────────────────────────────────
+#
+# P0 #2313's root cause (MPC-side relay forwarding `Connection: keep-alive`)
+# is fixed (mika#2316). This guardrail is defense-in-depth, not the fix: if a
+# sandboxed pilot's prompt cache dies for ANY other reason, `cache_read=0`
+# with a large `cache_creation` on every turn means the full 100-250k token
+# context is being re-sent and re-written EVERY turn instead of read from
+# cache — a groom burns 10-12M uncached Opus tokens before the weekly ceiling
+# catches it. This does not diagnose the cause; it bounds the damage.
+#
+# Two false-positive guards, both required (cpp#185 body, verbatim):
+#   1. Turn 1 legitimately misses (there is nothing to read yet) — a LONE
+#      miss must never trip. Handled by requiring 3 CONSECUTIVE misses, never
+#      by special-casing turn number.
+#   2. A miss on a small prompt (a short tool result, a brief reply) is not
+#      evidence of a broken cache — it was never going to create a
+#      cacheable prefix worth reading back. Gated on `cache_creation_input_tokens`
+#      exceeding a substantial-prefix threshold, so routine small turns
+#      never count as evidence either way.
+#: Minimum `cache_creation_input_tokens` on a `cache_read_input_tokens == 0`
+#: turn for that miss to count as EVIDENCE the cache is dead, rather than an
+#: ordinary short prompt that was never going to be cached. Sandboxed dead-cache
+#: sessions rewrite 100k-250k tokens per turn (cpp#185 body); 50k sits well
+#: below that floor and well above what a routine short exchange creates.
+PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS = 50_000
+
+#: Consecutive substantial-miss turns before the session is judged cache-dead
+#: and aborted (cpp#185: "3 tours consécutifs"). Any turn that does NOT meet
+#: both conditions above — a genuine hit (`cache_read>0`) OR a miss too small
+#: to be evidence — resets this counter to zero, so a session that only
+#: intermittently misses (the healthy warm-up shape the plan measured: many
+#: small-prefix misses while context is still growing, then a hit once caching
+#: engages) never trips.
+PROMPT_CACHE_DEAD_CONSECUTIVE_MISSES = 3
+
+
+def _usage_int(usage: dict[str, Any] | None, key: str) -> int | None:
+    """Extract an integer usage field, or None if absent/malformed (cpp#185).
+
+    `AssistantMessage.usage` is an untyped `dict[str, Any] | None` taken
+    straight off the wire (`claude_agent_sdk._internal.message_parser`:
+    `usage=data["message"].get("usage")`) — never trust its shape. A missing
+    key, a non-dict `usage`, or a non-int value all yield None, which the
+    caller treats as "no data this call" rather than as a false zero.
+    """
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(key)
+    # bool is a subclass of int in Python; explicitly excluded so a stray
+    # `True`/`False` in a malformed payload cannot masquerade as a token count.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 @dataclass(frozen=True)
 class TurnBoundaryEvent:
     """Emitted when a logical turn just closed (cpp#10).
@@ -102,12 +157,19 @@ class TurnBoundaryEvent:
     summarize what the just-closed turn produced — agent.py reads these to
     decide whether the turn was diagnostically silent and worth logging a
     marker for.
+
+    `cache_read_input_tokens` / `cache_creation_input_tokens` (cpp#185 D1) are
+    the closed turn's cache usage, straight from the SDK `usage` dict, for
+    per-response cache observability. `None` when no `AssistantMessage` in the
+    turn carried usage data (older SDK, malformed payload).
     """
 
     just_closed_turn: int
     had_text: bool
     had_tool_use: bool
     had_thinking_block: bool
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 def resolve_guardrail_defaults(config: GuardrailConfig | None) -> ResolvedGuardrailConfig:
@@ -272,6 +334,25 @@ class SessionGuardrails:
         # mika#2029 take six rounds to read.
         self._last_signal: str | None = None
         self._window_stream_count: int = 0
+        # cpp#185 D1: cache usage for the CURRENT (in-progress) turn. Unlike
+        # `_current_turn_text_len` these do NOT accumulate across
+        # continuation blocks — `cache_read_input_tokens` /
+        # `cache_creation_input_tokens` are input-side counts fixed at the
+        # turn's first token, so a later non-None reading simply confirms
+        # (never revises) an earlier one. Overwritten wholesale at each new
+        # turn boundary in `on_assistant_message`.
+        self._current_turn_cache_read: int | None = None
+        self._current_turn_cache_creation: int | None = None
+        # Guards `_maybe_evaluate_cache_dead_guardrail` to exactly one
+        # evaluation per logical turn (a turn spans several content-block
+        # events sharing one message_id) — set False on every new turn
+        # boundary, True the first time that turn supplies both cache fields.
+        self._cache_dead_evaluated_for_current_turn: bool = False
+        # cpp#185 D1: consecutive turns whose cache reading met BOTH
+        # conditions of the `prompt_cache_dead` guardrail (see the module-level
+        # docstring above `PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS`). Reset to
+        # 0 by ANY turn that does not — a genuine hit or a too-small miss.
+        self._consecutive_cache_dead_misses: int = 0
         self._reset_idle_timer()
 
     @property
@@ -583,6 +664,7 @@ class SessionGuardrails:
         self,
         content: list[dict[str, Any]] | Any,
         message_id: str | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> TurnBoundaryEvent | None:
         """Called on each AssistantMessage from the SDK.
 
@@ -602,6 +684,13 @@ class SessionGuardrails:
         previously-seen one). Returns `None` on same-turn continuations and on
         the very first turn (no prior turn to close). Agent.py uses this to emit
         a per-turn marker so thinking-only turns are still visible in the log.
+
+        cpp#185 D1: `usage` is the SDK `AssistantMessage.usage` dict for THIS
+        call, straight off the wire. Unlike the content-block evidence above,
+        cache token counts are fixed at the turn's first token rather than
+        accumulating, so they are evaluated (once per turn — see
+        `_maybe_evaluate_cache_dead_guardrail`) as soon as they are known,
+        which may be on this call or a later continuation of the same turn.
         """
         blocks = content if isinstance(content, list) else []
         has_tool_use = any(_block_type(b) == "tool_use" for b in blocks)
@@ -658,6 +747,9 @@ class SessionGuardrails:
             message_id is not None and message_id == self._current_message_id
         )
 
+        cache_read = _usage_int(usage, "cache_read_input_tokens")
+        cache_creation = _usage_int(usage, "cache_creation_input_tokens")
+
         if is_continuation:
             # Same logical turn — accumulate evidence about its productivity.
             self._current_turn_text_len += text_len
@@ -673,6 +765,14 @@ class SessionGuardrails:
                 if self._empty_incremented_for_current_turn:
                     self._consecutive_empty_turns = max(0, self._consecutive_empty_turns - 1)
                     self._empty_incremented_for_current_turn = False
+            # cpp#185 D1: a later block of the SAME turn may be the first one
+            # to carry usage (defensive — see `_usage_int`); keep accumulating
+            # and evaluate as soon as both fields are known.
+            if cache_read is not None:
+                self._current_turn_cache_read = cache_read
+            if cache_creation is not None:
+                self._current_turn_cache_creation = cache_creation
+            self._maybe_evaluate_cache_dead_guardrail()
             return None
 
         # New turn boundary. Capture the just-closed turn's summary before
@@ -685,6 +785,8 @@ class SessionGuardrails:
                 had_text=self._current_turn_text_len > 0,
                 had_tool_use=self._current_turn_has_tool,
                 had_thinking_block=self._current_turn_had_thinking_block,
+                cache_read_input_tokens=self._current_turn_cache_read,
+                cache_creation_input_tokens=self._current_turn_cache_creation,
             )
 
         self._turn_count += 1
@@ -694,6 +796,13 @@ class SessionGuardrails:
         self._current_turn_had_thinking_block = has_thinking
         self._stall_incremented_for_current_turn = False
         self._empty_incremented_for_current_turn = False
+        # cpp#185 D1: this call opens the NEW turn — its cache reading (if any
+        # arrived already) replaces the closed turn's, and the guardrail is
+        # evaluated for it exactly once, as soon as both fields are known.
+        self._current_turn_cache_read = cache_read
+        self._current_turn_cache_creation = cache_creation
+        self._cache_dead_evaluated_for_current_turn = False
+        self._maybe_evaluate_cache_dead_guardrail()
         # Reset idle timer on each new turn — even empty ones.
         # Stall/empty detection handles degenerate-content cases. idle_timeout
         # now fires only on GENUINE SDK silence: no stream deltas AND no new
@@ -742,6 +851,53 @@ class SessionGuardrails:
 
         return boundary_event
 
+    def _maybe_evaluate_cache_dead_guardrail(self) -> None:
+        """cpp#185 D1: evaluate `prompt_cache_dead` for the CURRENT turn.
+
+        Cache token counts are input-side and fixed at the turn's first
+        token (unlike `_current_turn_text_len`, which genuinely accumulates
+        across continuation blocks) — so there is nothing to roll back the
+        way stall/empty detection rolls back a speculative increment: the
+        first call that supplies BOTH `cache_read_input_tokens` and
+        `cache_creation_input_tokens` settles this turn's classification for
+        good. `_cache_dead_evaluated_for_current_turn` makes that evaluation
+        happen exactly once per logical turn, however many content-block
+        events (thinking → text → tool_use) the turn spans.
+
+        A turn counts as a substantial miss only when BOTH hold: a genuine
+        cache miss (`cache_read_input_tokens == 0`) AND a real prefix that
+        should have been cached (`cache_creation_input_tokens` over
+        `PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS`). Any other turn — a hit,
+        a too-small miss, or one with no usage data at all — resets the
+        streak: a single intervening turn that does not match is proof the
+        cache is not PERMANENTLY dead, which is exactly what cpp#185's
+        false-positive guards require (the mandatory first-turn miss, and a
+        session ramping from small to large context before caching engages).
+        """
+        if self._cache_dead_evaluated_for_current_turn:
+            return
+        cache_read = self._current_turn_cache_read
+        cache_creation = self._current_turn_cache_creation
+        if cache_read is None or cache_creation is None:
+            return  # no usage data yet this turn — nothing to classify
+        self._cache_dead_evaluated_for_current_turn = True
+        if (
+            cache_read == 0
+            and cache_creation > PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS
+        ):
+            self._consecutive_cache_dead_misses += 1
+            if self._consecutive_cache_dead_misses >= PROMPT_CACHE_DEAD_CONSECUTIVE_MISSES:
+                self._abort(
+                    "prompt_cache_dead",
+                    f"cache_read_input_tokens==0 with cache_creation_input_tokens>"
+                    f"{PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS} for "
+                    f"{self._consecutive_cache_dead_misses} consecutive turns — "
+                    "the prompt cache appears dead; aborting rather than "
+                    "re-writing the full context every turn",
+                )
+        else:
+            self._consecutive_cache_dead_misses = 0
+
     def close_final_turn(self) -> TurnBoundaryEvent | None:
         """Emit a boundary event for the still-open final turn at session end
         (cpp#10). Called by agent.py from the ResultMessage branch BEFORE
@@ -757,6 +913,8 @@ class SessionGuardrails:
             had_text=self._current_turn_text_len > 0,
             had_tool_use=self._current_turn_has_tool,
             had_thinking_block=self._current_turn_had_thinking_block,
+            cache_read_input_tokens=self._current_turn_cache_read,
+            cache_creation_input_tokens=self._current_turn_cache_creation,
         )
         self._final_turn_closed = True
         self._current_message_id = None
@@ -1024,6 +1182,9 @@ class SessionGuardrails:
             "awaiting_model",
             # cpp#168: the watchdog task itself crashed. See `_idle_watchdog`.
             "watchdog_error",
+            # cpp#185 D1: the prompt cache is dead — see the module docstring
+            # above `PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS`.
+            "prompt_cache_dead",
         ],
         detail: str,
     ) -> None:

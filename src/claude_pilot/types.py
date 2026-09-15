@@ -199,11 +199,14 @@ class ResultJson(BaseModel):
           "stall_detected", "empty_response", "idle_timeout" (cpp#54-era),
           "rate_limited" (cpp#119), "awaiting_tool" / "awaiting_model"
           (cpp#145 — the session was waiting on a tool or on the next turn's
-          first token, and the wait outlived its ceiling), and
+          first token, and the wait outlived its ceiling),
           "watchdog_error" (cpp#168 — the `_idle_watchdog` task itself raised
-          an unexpected exception; see `GuardrailAbortReason.guardrail` below).
-          This list was absent before cpp#145 and had been silently stale
-          since cpp#119.
+          an unexpected exception; see `GuardrailAbortReason.guardrail` below),
+          and "prompt_cache_dead" (cpp#185 D1 — 3 consecutive turns with
+          `cache_read_input_tokens==0` and a substantial
+          `cache_creation_input_tokens`; defense-in-depth, kept even after
+          the #2313 root cause was fixed upstream). This list was absent
+          before cpp#145 and had been silently stale since cpp#119.
         - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
           — see SDK_TERMINATION_SUBTYPES in agent.py.
     """
@@ -260,6 +263,14 @@ class GuardrailAbortReason(BaseModel):
     # operator response (a genuinely silent model vs. a bug in the watchdog
     # itself), and collapsing them back into `idle_timeout` would hide exactly
     # the population this hardening exists to make visible.
+    # cpp#185 D1: `prompt_cache_dead` — defense-in-depth for a sandboxed
+    # session whose prompt cache stopped being read (`cache_read_input_tokens
+    # == 0` for 3 consecutive turns each with a substantial
+    # `cache_creation_input_tokens`). The P0 root cause (#2313) was an
+    # MPC-side relay bug already fixed (mika#2316); this guardrail exists so
+    # that if the cache dies for a DIFFERENT reason, the session stops
+    # cleanly instead of burning 100-250k uncached Opus tokens per turn.
+    # Additive in the same sense as `watchdog_error` above.
     guardrail: Literal[
         "stall_detected",
         "empty_response",
@@ -268,6 +279,7 @@ class GuardrailAbortReason(BaseModel):
         "awaiting_tool",
         "awaiting_model",
         "watchdog_error",
+        "prompt_cache_dead",
     ]
     turns: int
     detail: str
