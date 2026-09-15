@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import sys
 import time
 from typing import Any, Literal
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, CLIJSONDecodeError
 from claude_agent_sdk.types import (
     AssistantMessage,
     RateLimitEvent,
@@ -51,6 +52,17 @@ from .ui import (
 )
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
+
+# cpp#187: named ceiling for `ClaudeAgentOptions.max_buffer_size`, passed into
+# the SDK below. Default (unset) is the SDK's own 1MB
+# (`claude_agent_sdk._internal.transport.subprocess_cli._DEFAULT_MAX_BUFFER_SIZE`),
+# which a single large sub-agent review result routinely exceeds. 10MB is a
+# judgment call, not a measured ceiling — big enough that an ordinary review
+# payload clears it, small enough to still bound one message. Anything past
+# THIS cap still raises `CLIJSONDecodeError`, which the catch in
+# `_run_agent_inner` converts into a clean `transport_message_too_large` halt
+# instead of a crash.
+_SDK_MAX_BUFFER_SIZE_BYTES = 10 * 1024 * 1024
 
 # ── cpp#168: the idle watchdog can be starved by claude-pilot's OWN I/O ─────
 #
@@ -424,6 +436,18 @@ async def _run_agent_inner(
         # best-effort. The LOAD-BEARING guard is the system-prompt hint above;
         # this is harmless if it no-ops and structural if the runtime honors it.
         disallowed_tools=["ScheduleWakeup"],
+        # cpp#187: raise the SDK reader's per-message buffer guard from its
+        # 1MB default to a named ceiling. The guard (subprocess_cli.py
+        # `guard()`) bounds a SINGLE incoming NDJSON line — one SDK message —
+        # not the whole session; a large sub-agent review result (diff + plan
+        # in one payload) routinely exceeds 1MB and, pre-cpp#187, killed the
+        # session outright (mika#2295, mika#2310). 10MB comfortably covers an
+        # ordinary large review while still bounding a single message; the
+        # `CLIJSONDecodeError` catch below (`_is_transport_buffer_overflow`)
+        # is the backstop for anything that still exceeds THIS cap, so
+        # raising it narrows the failure population rather than removing the
+        # guardrail that fix exists for.
+        max_buffer_size=_SDK_MAX_BUFFER_SIZE_BYTES,
         **_sdk_guardrail_kwargs(config),
     )
 
@@ -839,6 +863,61 @@ async def _run_agent_inner(
                             unhandled_message_types.add(type_name)
                             log_unhandled_message(type_name)
 
+            except CLIJSONDecodeError as exc:
+                if not _is_transport_buffer_overflow(exc):
+                    # Genuine malformed JSON from the CLI, not the cpp#187
+                    # buffer-overflow guard trip. Different failure class —
+                    # fall through to the SAME handling a bare
+                    # `except Exception` gave it before this fix (resume-swallow
+                    # on a later session, re-raise on the first).
+                    if resume_from is None:
+                        raise
+                    log_deny_resume_failed(
+                        f"resumed session {resume_from[:8]} did not come up "
+                        f"({type(exc).__name__}: {exc}); reporting the deferred result"
+                    )
+                    break
+
+                # cpp#187: the bundled SDK's line-framer buffer guard
+                # (`subprocess_cli.py`'s `guard()`, ~line 1093) raises
+                # `CLIJSONDecodeError` — not `ProcessError` — when a single
+                # incoming NDJSON line (one SDK message) exceeds
+                # `max_buffer_size` (raised above to `_SDK_MAX_BUFFER_SIZE_BYTES`;
+                # still reachable beyond that cap). This is UPSTREAM of every
+                # line of claude-pilot's own message handling: the reader dies
+                # before `_merge_stream` ever yields the oversized message, so
+                # there is no seam here to truncate the payload — only to catch
+                # the exception the reader raises and end the session cleanly
+                # instead of letting it propagate as a bare crash (mika#2295,
+                # mika#2310: exit 1, zero verdict, draft-PR salvage only). The
+                # `async with ClaudeSDKClient(...)` block above has already
+                # unwound (`__aexit__` ran) by the time control reaches here, so
+                # there is no live `client` to `interrupt()` — unlike the
+                # guardrail-trip site (Site 1) above, which catches inside the
+                # loop while the client is still open.
+                duration_ms = int((time.monotonic() - start_time) * 1000)
+                detail = (
+                    "Incoming SDK message exceeded the transport buffer limit "
+                    f"({exc}); the SDK reader cannot deliver it, so the session "
+                    "is ending cleanly instead of crashing. A large sub-agent "
+                    "review result is the known trigger (cpp#187)."
+                )
+                _emit_result(
+                    ResultJson(
+                        status="terminated",
+                        subtype="transport_message_too_large",
+                        task_id=task_id,
+                        session_id=session_id,
+                        turns=guardrails.turns,
+                        cost_usd=None,  # unknown — no terminal ResultMessage arrived
+                        duration_ms=duration_ms,
+                        termination_reason=detail,
+                    )
+                )
+                emitted_terminal = True
+                log_guardrail("transport_message_too_large", detail)
+                return 1
+
             except Exception as exc:
                 if resume_from is None:
                     raise
@@ -937,6 +1016,36 @@ async def _run_agent_inner(
 
 
 _GUARDRAIL_TRIP: Any = object()
+
+
+def _is_transport_buffer_overflow(exc: CLIJSONDecodeError) -> bool:
+    """Is this `CLIJSONDecodeError` the buffer-guard trip, not genuine
+    malformed JSON? (cpp#187)
+
+    `subprocess_cli.py` raises `CLIJSONDecodeError` from two different sites,
+    and the pinned SDK (0.2.152) gives them the same exception TYPE but a
+    different `original_error`:
+
+    - `_parse_stdout_line`: a complete, correctly-framed line that fails
+      `json.loads` — genuinely corrupt output. `original_error` is a
+      `json.JSONDecodeError`.
+    - `_read_messages_impl`'s `guard()`: a line (or a still-buffering partial
+      line) whose length exceeds `max_buffer_size` — cpp#187's crash.
+      `original_error` is a bare `ValueError("Buffer size ... exceeds limit
+      ...")`, never raised anywhere else in this code path.
+
+    `json.JSONDecodeError` subclasses `ValueError`, so the check is written
+    the narrow way round: buffer-overflow is exactly "a ValueError that is
+    NOT a JSONDecodeError" AND carries the guard's own wording. Requiring
+    both means a future SDK release that raises some other bare ValueError
+    from a genuinely-new failure mode is not silently swallowed as
+    "too large" — it would fail this check and fall through to the generic
+    handler, which is the conservative direction to err in.
+    """
+    err = exc.original_error
+    if isinstance(err, json.JSONDecodeError):
+        return False
+    return isinstance(err, ValueError) and "exceeds limit" in str(err)
 
 
 def _stream_event_is_progress(message: StreamEvent) -> bool:

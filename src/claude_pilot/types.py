@@ -209,6 +209,18 @@ class ResultJson(BaseModel):
           before cpp#145 and had been silently stale since cpp#119.
         - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
           — see SDK_TERMINATION_SUBTYPES in agent.py.
+        - "transport_message_too_large" (cpp#187) — the bundled SDK's line-
+          framer buffer guard (`subprocess_cli.py`) raised `CLIJSONDecodeError`
+          because a single incoming NDJSON message (typically a large
+          sub-agent review result) exceeded `max_buffer_size`. Caught directly
+          in `_run_agent_inner`'s session loop (not routed through
+          `SessionGuardrails`/`GuardrailAbortReason` — the failure originates
+          in the SDK transport reader, outside the guardrail watchdog's
+          domain) and converted into a clean `status="terminated"` halt
+          instead of an unhandled crash. `termination_reason` carries the raw
+          SDK error text. Additive in the same sense as the guardrail
+          subtypes above: existing `subtype`-agnostic consumers (dispatch-lib
+          takes it OPAQUELY) keep parsing the JSON shape unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -14,9 +14,11 @@ the integrated behavior (cpp#10 plan §Test strategy).
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
+from claude_agent_sdk import CLIJSONDecodeError
 from claude_agent_sdk.types import (
     AssistantMessage,
     RateLimitEvent,
@@ -2010,3 +2012,219 @@ def test_151_resume_budget_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
         else:
             monkeypatch.setenv("CLAUDE_PILOT_MAX_DENY_RESUMES", raw)
         assert agent_module._resolve_max_deny_resumes() == expected, raw
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#187: transport buffer-overflow — CLIJSONDecodeError must not crash the
+# session
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Reproduces mika#2295 / mika#2310: the bundled SDK's line-framer buffer guard
+# (`subprocess_cli.py`'s `guard()`) raises `CLIJSONDecodeError` when a single
+# incoming SDK message (a large sub-agent review result, in production)
+# exceeds `max_buffer_size`. That raise happens INSIDE the SDK's own reader,
+# upstream of every one of claude-pilot's message handlers — so these tests
+# simulate it at the one seam that is actually testable: `client.receive_response()`
+# raising the exception mid-stream, exactly as `_merge_stream`'s
+# `next_msg.result()` would surface it from the real transport.
+
+
+def _buffer_overflow_error() -> CLIJSONDecodeError:
+    """The exact shape `subprocess_cli.py`'s `guard()` raises (SDK 0.2.152):
+    the outer message is descriptive prose, not the offending line, and
+    `original_error` is a bare `ValueError` — never a `json.JSONDecodeError`.
+    """
+    return CLIJSONDecodeError(
+        "JSON message exceeded maximum buffer size of 1048576 bytes",
+        ValueError("Buffer size 1500000 exceeds limit 1048576"),
+    )
+
+
+def _malformed_json_error() -> CLIJSONDecodeError:
+    """The exact shape `_parse_stdout_line` raises for genuinely corrupt
+    (but correctly-framed) JSON: `original_error` is a real
+    `json.JSONDecodeError`, which is what distinguishes it from the
+    buffer-overflow case above despite both being `CLIJSONDecodeError`.
+    """
+    try:
+        json.loads("{not valid json")
+    except json.JSONDecodeError as e:
+        return CLIJSONDecodeError("{not valid json", e)
+    raise AssertionError("json.loads was expected to raise")  # pragma: no cover
+
+
+class _RaisingClient:
+    """Like `_FakeClient`, but `receive_response()` raises after yielding a
+    scripted prefix — simulating the SDK reader dying mid-stream."""
+
+    def __init__(self, messages: list[Any], error: Exception) -> None:
+        self._messages = messages
+        self._error = error
+
+    async def __aenter__(self) -> _RaisingClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        return None
+
+    async def query(self, _prompt: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    def receive_response(self) -> Any:
+        async def gen() -> Any:
+            for m in self._messages:
+                yield m
+            raise self._error
+
+        return gen()
+
+
+def _install_raising_client(
+    monkeypatch: pytest.MonkeyPatch, messages: list[Any], error: Exception
+) -> None:
+    def _factory(*_args: Any, **_kwargs: Any) -> _RaisingClient:
+        return _RaisingClient(messages, error)
+
+    monkeypatch.setattr(agent_module, "ClaudeSDKClient", _factory)
+
+
+def test_187_is_transport_buffer_overflow_distinguishes_the_two_shapes() -> None:
+    """Unit-level check of the discriminator both integration tests below
+    depend on: buffer-overflow is a bare ValueError with the guard's own
+    wording; genuine corruption is a `json.JSONDecodeError` (itself a
+    ValueError subclass, which is why the check cannot just be
+    `isinstance(original_error, ValueError)`)."""
+    assert agent_module._is_transport_buffer_overflow(_buffer_overflow_error())
+    assert not agent_module._is_transport_buffer_overflow(_malformed_json_error())
+    # A bare ValueError that happens not to carry the guard's wording must NOT
+    # be treated as a buffer overflow — err on the conservative side for any
+    # future SDK failure mode that is not one of the two known shapes.
+    assert not agent_module._is_transport_buffer_overflow(
+        CLIJSONDecodeError("some other failure", ValueError("unrelated"))
+    )
+
+
+@pytest.mark.asyncio
+async def test_187_buffer_overflow_ends_session_cleanly_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """MANDATORY negative test (cpp#187): a >1MB incoming SDK message —
+    simulated as `CLIJSONDecodeError` from the buffer guard, raised mid-stream
+    exactly as the real transport would raise it — must end the session in a
+    clean `status="terminated"` halt with `subtype="transport_message_too_large"`,
+    NOT propagate as an unhandled crash. This is RED on pre-cpp#187 code (the
+    exception propagates out of `run_agent` uncaught) and GREEN after."""
+    messages: list[Any] = [
+        _init(),
+        _assistant([TextBlock(text="reviewing sub-agent output now")], "msg1"),
+        # No ResultMessage — the reader dies before one can arrive.
+    ]
+    _install_raising_client(monkeypatch, messages, _buffer_overflow_error())
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_187_buffer",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    payload = _terminal_payload(captured.out)
+    assert payload["status"] == "terminated", payload
+    assert payload["subtype"] == "transport_message_too_large", payload
+    assert payload["task_id"] == "task_187_buffer"
+    assert "buffer" in payload["termination_reason"].lower()
+    assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_187_genuine_malformed_json_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the anti-vacuity requirement: a genuinely corrupt
+    JSON line (not the buffer-overflow shape) must NOT be swallowed as
+    `transport_message_too_large`. Pre- and post-cpp#187 behaviour is
+    identical here — first-session failures still propagate — proving the new
+    catch is scoped to the buffer-overflow case only, not to
+    `CLIJSONDecodeError` in general."""
+    messages: list[Any] = [_init()]
+    _install_raising_client(monkeypatch, messages, _malformed_json_error())
+    guardrails = SessionGuardrails(_config())
+
+    with pytest.raises(CLIJSONDecodeError):
+        await run_agent(
+            prompt="test",
+            cwd=".",
+            verbose=False,
+            task_id="task_187_malformed",
+            permission_handler=_noop_permission,
+            guardrails=guardrails,
+        )
+
+
+@pytest.mark.asyncio
+async def test_187_normal_small_message_session_unaffected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression guard: an ordinary (<1MB, no error) session completes
+    exactly as before — the new catch clause must never fire on the happy
+    path."""
+    messages: list[Any] = [
+        _init(),
+        _assistant([TextBlock(text="small ordinary turn")], "msg1"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_187_normal",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    payload = _terminal_payload(captured.out)
+    assert payload["status"] == "success", payload
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_187_max_buffer_size_is_raised_to_a_named_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK exposes `ClaudeAgentOptions.max_buffer_size` (confirmed against
+    the pinned claude-agent-sdk==0.2.152); claude-pilot raises it from the
+    SDK's 1MB default to the named `_SDK_MAX_BUFFER_SIZE_BYTES` ceiling so an
+    ordinary large review no longer needs the clean-halt fallback at all."""
+    captured: dict[str, Any] = {}
+
+    def _capturing_options(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()  # FakeClient ignores options
+
+    monkeypatch.setattr(agent_module, "ClaudeAgentOptions", _capturing_options)
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    assert captured["max_buffer_size"] == agent_module._SDK_MAX_BUFFER_SIZE_BYTES
+    assert captured["max_buffer_size"] > 1024 * 1024
