@@ -1515,3 +1515,195 @@ async def test_idle_watchdog_cancellation_is_still_a_clean_noop(
     guardrails.dispose()
     await asyncio.sleep(0)
     assert guardrails.aborted is False
+
+
+# ── prompt_cache_dead guardrail (cpp#185 D1) ─────────────────────────────────
+#
+# P0 #2313's root cause (MPC-side relay forwarding `Connection: keep-alive`)
+# was fixed upstream (mika#2316). This guardrail is defense-in-depth: if a
+# sandboxed pilot's prompt cache dies for some OTHER reason, `cache_read=0`
+# with a substantial `cache_creation` on 3 consecutive turns aborts the
+# session cleanly instead of burning 100-250k uncached Opus tokens per turn.
+
+
+def _cache_usage(cache_read: int, cache_creation: int) -> dict[str, int]:
+    return {
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_substantial_misses_trip_prompt_cache_dead(
+    guardrails: SessionGuardrails,
+) -> None:
+    """The core positive case: cache_read_input_tokens==0 on 3 consecutive
+    turns, each with cache_creation_input_tokens comfortably over the
+    substantial-prefix threshold, aborts with `prompt_cache_dead`.
+
+    Anti-vacuity (verified by hand, not asserted here): reverting
+    `_maybe_evaluate_cache_dead_guardrail`'s trip condition makes this test
+    fail — `guardrails.aborted` stays False and the final assert raises.
+    """
+    for i in range(3):
+        guardrails.on_assistant_message(
+            [_tool()],
+            message_id=f"msg_{i}",
+            usage=_cache_usage(0, 120_000),
+        )
+
+    assert guardrails.aborted
+    assert guardrails.abort_reason is not None
+    assert guardrails.abort_reason.guardrail == "prompt_cache_dead"
+
+
+@pytest.mark.asyncio
+async def test_two_substantial_misses_do_not_yet_trip(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Exactly 2 consecutive substantial misses is below the 3-turn
+    threshold — the guardrail must not jump the gun."""
+    for i in range(2):
+        guardrails.on_assistant_message(
+            [_tool()],
+            message_id=f"msg_{i}",
+            usage=_cache_usage(0, 120_000),
+        )
+
+    assert not guardrails.aborted
+
+
+@pytest.mark.asyncio
+async def test_first_turn_miss_then_hit_does_not_trip(
+    guardrails: SessionGuardrails,
+) -> None:
+    """False-positive guard #1 (cpp#185 body): turn 1 legitimately misses —
+    there is nothing to read from the cache yet. A single lone miss followed
+    by a genuine hit (cache_read_input_tokens>0) must never trip the
+    guardrail: the counter resets on the hit rather than carrying the first
+    turn's unavoidable miss forward."""
+    guardrails.on_assistant_message(
+        [_tool()], message_id="msg_1", usage=_cache_usage(0, 120_000)
+    )
+    guardrails.on_assistant_message(
+        [_tool()], message_id="msg_2", usage=_cache_usage(150_000, 2_000)
+    )
+
+    assert not guardrails.aborted
+
+
+@pytest.mark.asyncio
+async def test_healthy_session_survives_many_misses_broken_up_by_hits(
+    guardrails: SessionGuardrails,
+) -> None:
+    """The plan's healthy-session shape: repeated substantial misses (context
+    still growing, no stable cache breakpoint yet) with a hit whenever caching
+    momentarily engages — reset-on-hit means no run of misses ever reaches 3
+    in a row, however many turns the session runs for."""
+    for i in range(9):
+        # Every third turn is a hit; the other two are substantial misses.
+        # No 3 consecutive misses ever occur.
+        if i % 3 == 2:
+            usage = _cache_usage(200_000, 3_000)
+        else:
+            usage = _cache_usage(0, 120_000)
+        guardrails.on_assistant_message(
+            [_tool()], message_id=f"msg_{i}", usage=usage
+        )
+
+    assert not guardrails.aborted
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_small_misses_do_not_trip(
+    guardrails: SessionGuardrails,
+) -> None:
+    """False-positive guard #2 (cpp#185 body): a miss on a small prompt is not
+    evidence of a broken cache — it was never going to create a cacheable
+    prefix worth reading back. 3 consecutive misses BELOW the substantial
+    threshold must never trip the guardrail, however many of them occur."""
+    for i in range(3):
+        guardrails.on_assistant_message(
+            [_tool()], message_id=f"msg_{i}", usage=_cache_usage(0, 500)
+        )
+
+    assert not guardrails.aborted
+
+
+@pytest.mark.asyncio
+async def test_missing_usage_data_does_not_trip_or_crash(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Defensive: an AssistantMessage with no `usage` field at all (older SDK,
+    malformed payload) must not be misread as a cache miss — `usage=None` is
+    the default and every existing call site in this file that omits it
+    keeps passing, so this only pins the behaviour explicitly."""
+    for i in range(5):
+        guardrails.on_assistant_message([_tool()], message_id=f"msg_{i}")
+
+    assert not guardrails.aborted
+
+
+@pytest.mark.asyncio
+async def test_cache_dead_survives_across_content_blocks_of_one_turn(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A turn spanning several content-block events (thinking → text →
+    tool_use, all sharing one message_id) must be evaluated exactly once, not
+    once per block — otherwise a 3-block turn alone could exhaust the
+    3-consecutive-miss budget."""
+    for i in range(3):
+        mid = f"msg_{i}"
+        guardrails.on_assistant_message(
+            [_think()], message_id=mid, usage=_cache_usage(0, 120_000)
+        )
+        guardrails.on_assistant_message(
+            [_text("still working")], message_id=mid, usage=_cache_usage(0, 120_000)
+        )
+        guardrails.on_assistant_message(
+            [_tool()], message_id=mid, usage=_cache_usage(0, 120_000)
+        )
+
+    # 3 logical turns, each internally re-affirming the same reading — trips
+    # at exactly 3, the same as the single-block case.
+    assert guardrails.turns == 3
+    assert guardrails.aborted
+    assert guardrails.abort_reason is not None
+    assert guardrails.abort_reason.guardrail == "prompt_cache_dead"
+
+
+@pytest.mark.asyncio
+async def test_turn_boundary_event_carries_cache_usage(
+    guardrails: SessionGuardrails,
+) -> None:
+    """`TurnBoundaryEvent` for the closed turn carries its cache reading, so
+    agent.py can render the per-response `[cache]` log line (cpp#185 D1)."""
+    guardrails.on_assistant_message(
+        [_tool()], message_id="msg_1", usage=_cache_usage(0, 75_000)
+    )
+    event = guardrails.on_assistant_message(
+        [_tool()], message_id="msg_2", usage=_cache_usage(150_000, 1_000)
+    )
+
+    assert event is not None
+    assert event.just_closed_turn == 1
+    assert event.cache_read_input_tokens == 0
+    assert event.cache_creation_input_tokens == 75_000
+
+
+@pytest.mark.asyncio
+async def test_close_final_turn_carries_cache_usage(
+    guardrails: SessionGuardrails,
+) -> None:
+    """The still-open final turn's cache reading is available via
+    `close_final_turn()` too, so the last turn of a session gets the same
+    `[cache]` line as every other one (cpp#185 D1)."""
+    guardrails.on_assistant_message(
+        [_tool()], message_id="msg_1", usage=_cache_usage(0, 60_000)
+    )
+
+    event = guardrails.close_final_turn()
+
+    assert event is not None
+    assert event.cache_read_input_tokens == 0
+    assert event.cache_creation_input_tokens == 60_000

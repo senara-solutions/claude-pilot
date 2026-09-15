@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from .guardrails import (
+    PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS,
+    PROMPT_CACHE_DEAD_CONSECUTIVE_MISSES,
+)
 from .logger import write_file_log, write_log
 from .types import ResolvedGuardrailConfig
 
@@ -194,6 +198,29 @@ def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None
     )
 
 
+def log_cache_usage(
+    turn: int,
+    cache_read_input_tokens: int | None,
+    cache_creation_input_tokens: int | None,
+) -> None:
+    """Per-response prompt-cache observability (cpp#185 D1).
+
+    Emitted for EVERY turn, silent or not — unlike `log_turn_summary`, which
+    only fires for diagnostically silent ones. Deliberately a stable,
+    grep-able `[cache]` line naming both raw SDK usage fields verbatim (no
+    derived ratio, no color-coding) so `grep '\\[cache\\]'` or a log-scraping
+    script gets a consistent shape across every session. `None` (no usage
+    data observed for the turn) renders as `?` rather than `0`, so an absent
+    reading is never confused with a genuine cache-read miss.
+    """
+    cr = cache_read_input_tokens if cache_read_input_tokens is not None else "?"
+    cc = cache_creation_input_tokens if cache_creation_input_tokens is not None else "?"
+    _log(
+        f"{DIM}[cache]{RESET} turn {turn}: "
+        f"cache_read_input_tokens={cr} cache_creation_input_tokens={cc}"
+    )
+
+
 def log_turn_summary(turn: int, summary: str) -> None:
     """Per-turn marker for diagnostically silent turns (cpp#10).
 
@@ -245,6 +272,14 @@ def log_guardrail_config(config: ResolvedGuardrailConfig) -> None:
         parts.append(f"modelWaitCeiling={_ceiling_label(config.modelWaitCeilingMs)}")
     if config.maxBudgetUsd > 0:
         parts.append(f"maxBudget=${config.maxBudgetUsd}")
+    # cpp#185 D1: unconditional, unlike everything above — `prompt_cache_dead`
+    # has no on/off switch (see the module docstring in guardrails.py for why
+    # it stays a constant, not a config field), so it is always armed and
+    # always named in the header.
+    parts.append(
+        f"promptCacheDead={PROMPT_CACHE_DEAD_CONSECUTIVE_MISSES}x"
+        f">{PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS}tok"
+    )
     _log(f"{DIM}[guardrails]{RESET} {' '.join(parts)}")
 
 

@@ -34,6 +34,7 @@ from .tier1 import DENIED_BASH_PATTERNS_HINT
 from .transcript_writer import record_sdk_message
 from .types import ResultJson
 from .ui import (
+    log_cache_usage,
     log_deny_resume,
     log_deny_resume_failed,
     log_done,
@@ -601,6 +602,11 @@ async def _run_agent_inner(
                             event = guardrails.on_assistant_message(
                                 _content_blocks(message),
                                 message_id=getattr(message, "message_id", None),
+                                # cpp#185 D1: the SDK usage dict for this call —
+                                # carries cache_read_input_tokens /
+                                # cache_creation_input_tokens. See
+                                # SessionGuardrails.on_assistant_message.
+                                usage=getattr(message, "usage", None),
                             )
                             if event is not None:
                                 # event.just_closed_turn is the turn that just ENDED;
@@ -608,6 +614,14 @@ async def _run_agent_inner(
                                 # started. cpp#10 — surface drift turns that produced
                                 # no text and no tool calls.
                                 _on_boundary(event)
+                                # cpp#185 D1: per-response cache-token logging, a
+                                # stable grep-able line, for every turn regardless
+                                # of whether it was diagnostically silent.
+                                log_cache_usage(
+                                    event.just_closed_turn,
+                                    event.cache_read_input_tokens,
+                                    event.cache_creation_input_tokens,
+                                )
                                 # cpp#111 D8-2 Transition 2: turn completion. Throttled
                                 # to 1/min so a tool-heavy stream does not flood cm-api.
                                 emit_heartbeat_throttled(
@@ -648,6 +662,13 @@ async def _run_agent_inner(
                             final_event = guardrails.close_final_turn()
                             if final_event is not None:
                                 _on_boundary(final_event)
+                                # cpp#185 D1: the final turn gets the same
+                                # per-response cache line as every other one.
+                                log_cache_usage(
+                                    final_event.just_closed_turn,
+                                    final_event.cache_read_input_tokens,
+                                    final_event.cache_creation_input_tokens,
+                                )
 
                             raw_errors = getattr(message, "errors", None)
                             errors = (
