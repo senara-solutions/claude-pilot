@@ -1132,6 +1132,40 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
         for dest in dests:
             if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest):
                 continue
+            if (
+                kind == "bash-git-show-redirect"
+                and _is_contained_redirect_target(dest)
+                and dest.startswith("/tmp/")
+            ):
+                # cpp#195: the SAME /tmp lexical carve-out cpp#154/#155 already
+                # grant the generic `bash-redirect` write-kind below, extended
+                # to `bash-git-show-redirect` specifically. That write-kind
+                # predates cpp#155's generalization of redirect write-kinds
+                # (it is `git show <ref>:<path> >` from cpp#35/#128) and was
+                # never given the carve-out when cpp#154 introduced it: a
+                # `/tmp/`-contained target fell straight through to the
+                # generic containment check just below and vetoed as
+                # "resolves outside the worktree" — making
+                # `git show origin/main:crates/mika-common/src/home.rs >
+                # /tmp/ck_home_main.rs` (the real mika#2471 halt) TERMINAL via
+                # `_denial_is_terminal`'s call to this function, even though
+                # `is_tier3_dangerous_for_lethality` already blanks that exact
+                # redirect (cpp#154) and `_redirect_destination_veto_reason`
+                # already grants it the carve-out (cpp#154/#155/#176) — only
+                # THIS function's per-write-kind branch had not been extended.
+                # Reuses `_is_contained_redirect_target` + the `/tmp/` prefix
+                # literal verbatim (cpp#154/#155/#176) so the two carve-outs
+                # cannot drift. Does not widen admission: the
+                # `bash-git-show-redirect` YAML rule's pattern already excludes
+                # an absolute target via `(?!/)`, so a `/tmp/...` target here
+                # can only ever arrive already DENIED by policy (default deny,
+                # this function's caller at the deny-path — cpp#128) — this
+                # branch is unreachable from the allow-path call site
+                # (`create_permission_handler`, cpp#128's unconditional
+                # `interrupt=True` destination-veto), which only ever sees a
+                # relative git-show-redirect target. The write stays refused;
+                # only its lethality changes.
+                continue
             if kind == "bash-redirect":
                 if dest == "/dev/null":
                     # Inert sink (cpp#130) — writes nowhere, so it is not a

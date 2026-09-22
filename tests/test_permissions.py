@@ -1372,3 +1372,165 @@ def test_151_terminal_flag_reaches_the_audit_wire(
     assert emitted[0]["terminal"] is False
     assert emitted[1]["decision"] == "deny"
     assert emitted[1]["terminal"] is True
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#195 — `git show <ref>:<path> > /tmp/x` was refused TERMINAL despite the
+# cpp#154 /tmp lexical carve-out. The real halt: mika#2471 (MPC replay against
+# `main`'s classifier, transcript 117d7a20), the exact command reproduced
+# below. Established cause, verified at source (probe against this repo's
+# HEAD, not assumed from the ticket): `is_tier3_dangerous_for_lethality`
+# already strips a lexically-contained `/tmp/` redirect (cpp#154), and
+# `_redirect_destination_veto_reason` (the whole-command, verb-agnostic
+# fallback) already grants the same /tmp carve-out — but `_destination_veto_
+# reason`'s PER-WRITE-KIND branch only ever granted it to the generic
+# `bash-redirect` kind (cpp#155). The write-kind `bash-git-show-redirect`
+# (cpp#35/#128, `git show <ref>:<path> >`) predates that generalization and
+# was never extended: an absolute `/tmp/…` target for THAT kind fell straight
+# through to the generic `is_within_project` containment check and vetoed as
+# "resolves outside the worktree" — terminal, because `_denial_is_terminal`
+# ORs in `_destination_veto_reason`'s verdict.
+#
+# This IS an inconsistency, not a ratified invariant: cpp#154's own carve-out
+# (`is_tier3_dangerous_for_lethality`) is direct evidence of intent (a /tmp
+# research-write is not lethal), and cpp#155's docstring on
+# `_redirect_destination_veto_reason` says in so many words that
+# `_destination_veto_reason` is meant to be "a STRICT SUPERSET of what this
+# function proves for redirects" — which was false for exactly this
+# write-kind until this fix. No doc under `docs/solutions/` ratifies
+# confinement-escape lethality as independent of cpp#154's carve-out for this
+# case; the only design-intent evidence found points the other way.
+#
+# THE FIX IS NARROWLY SCOPED to `_destination_veto_reason`'s
+# `bash-git-show-redirect` branch, reusing the EXACT shared predicate
+# (`_is_contained_redirect_target(dest) and dest.startswith("/tmp/")`) cpp#154/
+# #155/#176 already use for `bash-redirect` — see the block comment at that
+# branch. It does not touch `is_tier3_dangerous`/the REFUSAL, and it does not
+# touch the YAML allow rules: the write STAYS refused, only its LETHALITY
+# changes. The allow-path call site (`create_permission_handler`, the
+# unconditional-`interrupt=True` destination veto) cannot regress from this:
+# it only reaches `bash-git-show-redirect` kind via the `bash-git-show-
+# redirect` YAML rule_id, whose pattern requires a RELATIVE target
+# (`(?!/)`) — a `/tmp/…` absolute target can never carry that rule_id, so it
+# always arrives at `_destination_veto_reason` through the DENY route (chain-
+# veto or default-deny), which is the only route `_denial_is_terminal` feeds.
+# ────────────────────────────────────────────────────────────────────────────
+
+_MIKA_2471_COMMAND = (
+    "git show origin/main:crates/mika-common/src/home.rs > /tmp/ck_home_main.rs"
+)
+
+
+def test_cpp195_destination_veto_git_show_tmp_carve_out(tmp_path: Path) -> None:
+    """Unit-level: `_destination_veto_reason` grants `bash-git-show-redirect`
+    the SAME /tmp carve-out `bash-redirect` already has.
+
+    Anti-vacuity: this assertion is `is not None` on pre-fix `main` — captured
+    red below (`test_cpp195_red_before_fix_is_captured`)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    f = permissions_module._destination_veto_reason
+
+    assert f(_MIKA_2471_COMMAND, wt) is None
+    assert f("git show origin/main:x > /tmp/scratch.rs", wt) is None
+    # Note: `$`-suffixed targets (cpp#154 D3's mkdir-loop residue) are out of
+    # scope here — `_GIT_SHOW_REDIRECT_DEST_RE`'s charset (`[\w./-]+`) has
+    # never admitted `$`, for ANY destination, tmp or not; that is a pre-
+    # existing, unrelated property of git-show-redirect extraction this fix
+    # does not touch (fails closed: unparseable destination stays vetoed).
+
+
+def test_cpp195_destination_veto_git_show_non_tmp_still_vetoed(
+    tmp_path: Path,
+) -> None:
+    """Negative control, same function: every target that is NOT lexically
+    under `/tmp/` stays vetoed exactly as before — no widening."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    f = permissions_module._destination_veto_reason
+
+    assert f("git show origin/main:x > /etc/ck.rs", wt) is not None
+    assert f("git show origin/main:x > /var/outside/ck.rs", wt) is not None
+    assert f("git show origin/main:x > ../escape.rs", wt) is not None
+    assert f("git show origin/main:x > ~/escape.rs", wt) is not None
+
+
+def test_cpp195_denial_is_terminal_mika_2471_replay_survivable(
+    tmp_path: Path,
+) -> None:
+    """Positive — the exact mika#2471 halt command, exact replay. Must become
+    NON-terminal (survivable): the pilot receives the deny and the session
+    continues."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2471_COMMAND}, wt
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git show origin/main:x > /etc/ck.rs",
+        "git show origin/main:x > /var/outside/ck.rs",
+        "git show origin/main:x > ../escape.rs",
+        "sed -i 's/a/b/' f",
+        "rm -rf x",
+        "git push --force origin x",  # pre-existing tier3-lethal case, unchanged
+    ],
+)
+def test_cpp195_negative_stays_terminal(cmd: str, tmp_path: Path) -> None:
+    """Negative — both-directions proof. Nothing that was terminal before this
+    fix stops being terminal: a non-/tmp destination-veto, a traversal escape,
+    and genuinely dangerous verbs are all unaffected."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp195_handler_end_to_end_still_denied_but_survivable(
+    tmp_path: Path,
+) -> None:
+    """Handler-level proof, mirroring `test_handler_vetoes_redirect_to_system_
+    path_end_to_end`: the exact mika#2471 command is REFUSED (never executed)
+    AND non-terminal through the real `can_use_tool` callback — not merely at
+    the unit level. The non-/tmp control on the SAME shape stays refused AND
+    terminal, proving the fix narrows lethality only, not admission."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    result = asyncio.run(
+        handler("Bash", {"command": _MIKA_2471_COMMAND}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny), (
+        "git show ...:x > /tmp/x must STILL be refused — no widening of what "
+        "is admitted"
+    )
+    assert result.interrupt is False, (
+        "the refusal must be survivable — this is the real mika#2471 halt "
+        "command, replayed verbatim"
+    )
+
+    etc_control = asyncio.run(
+        handler(
+            "Bash",
+            {"command": "git show origin/main:x > /etc/cpp195-control.rs"},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(etc_control, PermissionResultDeny)
+    assert etc_control.interrupt is True, (
+        "a non-/tmp destination escape on the SAME write-kind stays terminal"
+    )
