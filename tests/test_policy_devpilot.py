@@ -2086,3 +2086,157 @@ def test_cpp155_mkdir_loop_redirect_still_non_terminal_end_to_end(tmp_path: Path
     )
     assert _destination_veto_reason(cmd, cwd) is None
     assert _denial_is_terminal("Bash", _bash(cmd), cwd) is False
+
+
+# ── cpp#190/#189: read-only research chains (`echo/git-show/sed-n/grep` glue)
+# were denied at policy tier2, misattributed to [bash-grep] because
+# `policy.evaluate`'s first-match-wins `re.search` claims that rule_id on ANY
+# later segment containing " grep " — the ACTUAL cause was per-segment
+# chain-safety failing on a `sed -n '<range>p'` (print-only) segment, which
+# had no allow-list entry anywhere in the general (non-contained) path. The
+# fix adds `_is_safe_sed_print_only` (tier1.py) as a narrow, self-contained,
+# closed-world predicate wired into `_is_safe_sub_command`; `git show
+# <ref>:<path>` (no redirect) and bare `grep`/`echo`/`ls`/`tail`/`cat`/`gh …
+# --help` segments were ALREADY tier1-safe individually (see the plan doc's
+# red-before/green-after table) — the compound as a WHOLE now passes because
+# every segment does, via the pre-existing per-segment chain-safety loop; no
+# change to the chain-safety MECHANISM itself was needed or made.
+
+
+def test_cpp190_founding_chain_now_chain_safe() -> None:
+    """cpp#190 exact halted command (mika#2331, session 202786bc):
+    `echo … && sed -n '<range>p' <file> && echo … && grep -n <pat> <files…>`.
+    """
+    cmd = (
+        'echo "=== dev-deps mika-common ===" && '
+        r"sed -n '/^\[dev-dependencies\]/,/^\[/p' crates/mika-common/Cargo.toml && "
+        'echo "=== wiremock dans workspace ===" && '
+        'grep -n "wiremock" Cargo.toml crates/*/Cargo.toml'
+    )
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_cpp189_sed_range_pipe_cat_numbering_now_chain_safe() -> None:
+    """cpp#189 form 1: `sed -n '<range>p' <file> | cat -n`."""
+    cmd = "sed -n '6320,6470p' skills/bundled/_shared/dispatch-lib.sh | cat -n"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_cpp189_ls_grep_tail_already_chain_safe() -> None:
+    """cpp#189 form 3: `ls DIR | grep PATTERN | tail -N`. Already chain-safe
+    on pristine `main` (every segment is an unconditional SAFE_SHELL_COMMANDS
+    member) — included as a same-issue regression guard, not a new fix."""
+    cmd = 'ls docs/plans/ | grep "^2026-09-1" | tail -8'
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_cpp189_gh_help_pipe_grep_already_chain_safe() -> None:
+    """cpp#189 form 4: `gh … --help 2>&1 | grep …`. Already chain-safe on
+    pristine `main` (`gh pr create` is on SAFE_GH_SUBCOMMANDS; `2>&1` is fd
+    duplication, not a write redirect) — included as a same-issue regression
+    guard, not a new fix."""
+    cmd = 'gh pr create --help 2>&1 | grep -A2 -i "reviewer"'
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_mika2471_cd_echo_git_show_chain_already_chain_safe() -> None:
+    """mika#2471 shape: `cd <worktree> && echo && git show <ref>:<path>`
+    (read via `git show <ref>:<path>`, no redirect, inside a `&&` chain).
+    Already chain-safe on pristine `main` — `git show <ref>:<path>` with no
+    redirect is `is_safe_git_command`-safe standalone (`show` is a
+    SAFE_GIT_SUBCOMMANDS member), so every segment of this chain was already
+    individually tier1-safe. Included as a same-issue regression guard, not a
+    new fix — the as-reported command differs from a live-repro shape."""
+    cmd = "cd /tmp/wt && echo && git show origin/main:crates/mika-common/src/home"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_cpp190_sed_print_chain_full_handler_allows(tmp_path: Path) -> None:
+    """Full decision-chain replay (policy + chain guard + handler dispatch,
+    the production order) for the cpp#190 founding command, inside a real
+    worktree cwd."""
+    cwd = _make_worktree(tmp_path)
+    cmd = (
+        'echo "label" && '
+        "sed -n '1,20p' docs/plans/README.md && "
+        'grep -n "x" docs/plans/README.md'
+    )
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow)
+
+
+# ── Both-directions proof: sed-n/grep read forms admitted, writes NOT ────────
+#
+# The fix widens exactly one thing: `sed -n '<addr>[,<addr>]p' [FILE...]`
+# (print-only, no `-i`, no other sed command letter). Nothing about
+# redirection, substitution-write, or the pre-existing `bash-git-show-redirect`
+# exception's target confinement was touched. These pin that every write form
+# named in the ticket's negative list stays denied, unchanged, after the fix.
+
+
+def test_sed_in_place_write_still_denied() -> None:
+    cmd = "sed -i 's/a/b/' f"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+    assert evaluate(_POLICY, "Bash", _bash(cmd)).decision == "deny"
+
+
+def test_git_show_redirect_to_unsafe_target_still_denied() -> None:
+    """`git show <ref>:<path> > <target>` with an ABSOLUTE or traversal target
+    stays denied — the fix does not touch `bash-git-show-redirect`'s target
+    confinement (cpp#35/#166) or `_destination_veto_reason` (cpp#38/#42)."""
+    for cmd in (
+        "git show origin/main:path > /etc/evil",
+        "git show origin/main:path > ../evil",
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_git_show_redirect_to_safe_relative_target_unchanged_by_this_fix() -> None:
+    """`git show <ref>:<path> > <relative-path>` with a SAFE worktree-relative
+    target is a PRE-EXISTING sanctioned allow (cpp#35/#166), not something
+    this fix grants — pinned here so a future change to the sed/grep read
+    forms cannot be mistaken for having touched this exception."""
+    cmd = "git show origin/main:path > out"
+    decision = evaluate(_POLICY, "Bash", _bash(cmd))
+    assert decision.decision == "allow"
+    assert decision.rule_id == "bash-git-show-redirect"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_grep_redirect_still_denied() -> None:
+    cmd = "grep x f > out"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_write_segment_in_readonly_chain_still_denied() -> None:
+    """A write segment riding alongside otherwise-read-only segments must
+    still veto the WHOLE chain (cpp#178 lesson: prove both directions, not
+    just that the read form passes)."""
+    for cmd in (
+        "echo hi && grep x f > out",
+        "sed -n '1,20p' file && echo hi > out",
+        "sed -n '1,20p' file && rm -rf ~",
+        'echo "=== x ===" && sed -n \'1,20p\' f && grep x f > out',
+    ):
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_write_subshell_in_substitution_still_denied() -> None:
+    cmd = 'echo "$(echo bad > /tmp/pwn)"'
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_cpp190_write_tail_full_handler_denies(tmp_path: Path) -> None:
+    """Full decision-chain replay: the same read-only sed-print prefix as
+    the positive full-handler test above, but with a write tail — must deny
+    end to end, not just at the guard-unit level."""
+    cwd = _make_worktree(tmp_path)
+    cmd = "sed -n '1,20p' docs/plans/README.md && rm -rf ~"
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)

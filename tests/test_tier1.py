@@ -19,6 +19,7 @@ from claude_pilot.tier1 import (
     INTRA_PLATFORM_AGENTS,
     _is_contained_redirect_target,
     _is_safe_command_builtin,
+    _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
     _mask_quoted_redirect_chars,
@@ -830,6 +831,114 @@ def test_tier1_still_approves_other_read_only_shell_tools() -> None:
     assert is_safe_shell_command("cat /tmp/file") is True
     assert is_safe_shell_command("find . -name '*.py'") is True
     assert is_safe_shell_command("ls -la /tmp") is True
+
+
+def test_is_safe_shell_command_still_rejects_sed_n_print() -> None:
+    """cpp#189/#190 regression guard: `_is_safe_sed_print_only` is a SEPARATE,
+    narrow predicate — sed stays out of SAFE_SHELL_COMMANDS entirely, so
+    `is_safe_shell_command`/`is_safe_bash_command`-via-`is_safe_shell_command`
+    must still reject every sed shape, including the print-only one now
+    admitted elsewhere via `_is_safe_sed_print_only`."""
+    assert is_safe_shell_command("sed -n '1,20p' file") is False
+
+
+# ── cpp#189/#190: `sed -n '<addr>[,<addr>]p'` print-only, general chain ──────
+#
+# Read-only research chains (`echo … && sed -n … && grep …`, `sed -n … | cat`)
+# were denied at [bash-grep] / policy default — see `_is_safe_sed_print_only`
+# in tier1.py for the full mechanism. These pin the predicate directly
+# (positive shapes it must admit, negative shapes it must still refuse).
+
+
+def test_sed_print_only_admits_regex_range() -> None:
+    """cpp#190 exact founding shape: address range of two regexes + p."""
+    assert (
+        _is_safe_sed_print_only(
+            r"sed -n '/^\[dev-dependencies\]/,/^\[/p' crates/mika-common/Cargo.toml"
+        )
+        is True
+    )
+
+
+def test_sed_print_only_admits_numeric_range() -> None:
+    """cpp#189 exact founding shape: numeric line range + p."""
+    assert _is_safe_sed_print_only("sed -n '6320,6470p' skills/bundled/_shared/dispatch-lib.sh") is True
+    assert _is_safe_sed_print_only("sed -n '1,20p' foo.txt") is True
+
+
+def test_sed_print_only_admits_single_address_and_last_line() -> None:
+    assert _is_safe_sed_print_only("sed -n '5p' file.txt") is True
+    assert _is_safe_sed_print_only("sed -n '$p' file.txt") is True
+
+
+def test_sed_print_only_admits_no_file_operand() -> None:
+    """A pipe source (`… | sed -n '1,20p'`) has no trailing file operand."""
+    assert _is_safe_sed_print_only("sed -n '1,20p'") is True
+
+
+def test_sed_print_only_denies_in_place_write() -> None:
+    """`-i` (in-place write) must never be admitted by this predicate."""
+    assert _is_safe_sed_print_only("sed -ni '1,20p' file") is False
+    assert _is_safe_sed_print_only("sed -n -i '1,20p' file") is False
+
+
+def test_sed_print_only_denies_write_command_appended() -> None:
+    """A `w` (write) command riding after the address range must deny —
+    the anchored `p'` close-quote is what prevents this."""
+    assert _is_safe_sed_print_only("sed -n '1,20p;w evil' file") is False
+    assert _is_safe_sed_print_only("sed -n '1,20w evil' file") is False
+
+
+def test_sed_print_only_denies_exec_and_read_commands() -> None:
+    """`e` (exec) and `r`/`R` (read arbitrary file) sed commands must deny."""
+    assert _is_safe_sed_print_only("sed -n '1,20e' file") is False
+    assert _is_safe_sed_print_only("sed -n '1,20r /etc/passwd' file") is False
+
+
+def test_sed_print_only_denies_multi_script_flags() -> None:
+    """`-e`/`-f` (multi-script / script-file) must deny — only a single bare
+    `-n '<range>p'` script is admitted."""
+    assert _is_safe_sed_print_only("sed -n -e '1,20p' file") is False
+    assert _is_safe_sed_print_only("sed -n -f script.sed file") is False
+
+
+def test_sed_print_only_denies_without_n_flag() -> None:
+    """Without `-n`, `'ADDRp'` double-prints (default auto-print + explicit
+    `p`) — a different, unenumerated shape; deliberately not admitted."""
+    assert _is_safe_sed_print_only("sed '1,20p' file") is False
+
+
+def test_sed_print_only_denies_redirect() -> None:
+    assert _is_safe_sed_print_only("sed -n '1,20p' file > out") is False
+
+
+def test_sed_print_only_denies_substitution() -> None:
+    assert _is_safe_sed_print_only("sed -n '1,20p' \"$(evil)\"") is False
+
+
+def test_sed_print_only_chain_cpp190_founding_command() -> None:
+    """cpp#190 exact halted command (mika#2331): echo/sed-print/echo/grep
+    chain now passes the general tier1 chain check end to end."""
+    command = (
+        'echo "=== dev-deps mika-common ===" && '
+        r"sed -n '/^\[dev-dependencies\]/,/^\[/p' crates/mika-common/Cargo.toml && "
+        'echo "=== wiremock dans workspace ===" && '
+        'grep -n "wiremock" Cargo.toml crates/*/Cargo.toml'
+    )
+    assert is_safe_bash_command(command) is True
+
+
+def test_sed_print_only_chain_cpp189_pipe_and_numbering() -> None:
+    """cpp#189 form 1: `sed -n '<range>p' <file> | cat -n`."""
+    assert is_safe_bash_command("sed -n '6320,6470p' skills/bundled/_shared/dispatch-lib.sh | cat -n") is True
+
+
+def test_sed_print_only_chain_still_denies_write_tail() -> None:
+    """A read-only sed-print prefix chained onto a dangerous tail must still
+    deny — the fix only admits the read-only LEAF, chain-safety (per-segment
+    re-validation) is unchanged."""
+    assert is_safe_bash_command("sed -n '1,20p' file && rm -rf ~") is False
+    assert is_safe_bash_command("sed -n '1,20p' file && echo hi > out") is False
 
 
 # ── gh api ───────────────────────────────────────────────────────────────────
