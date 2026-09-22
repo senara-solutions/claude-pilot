@@ -837,13 +837,6 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
 _LEADING_CMD_RE = re.compile(r"^\s*(\S+)")
 _GIT_SHOW_RE = re.compile(r"^\s*git\s+show\b")
 
-# `git show <SHA>:<src> > <dest>` — the redirect target is the write destination.
-# Mirrors the anchored `bash-git-show-redirect` YAML pattern's target group; its
-# `[\w./-]+` class excludes spaces/quotes, so a quoted/spaced redirect target
-# can't match the rule at all (it would be denied) — regex-on-raw-segment is safe
-# here, unlike cp/mv/mkdir whose operands are shell-quoted (tokenized via shlex).
-_GIT_SHOW_REDIRECT_DEST_RE = re.compile(r">\s*([\w./-]+)\s*$")
-
 # A `cp`/`mv` short-flag cluster whose last (arg-taking) flag is `-t`
 # (target-directory): `-t`, `-rt`, `-vt`, `-rpt`, … The NEXT token is the target
 # directory. The attached form (`-tDIR`) is NOT matched here — it has no separate
@@ -987,17 +980,42 @@ def _extract_write_destinations(kind: str, seg: str) -> list[str] | None:
     """Destination operand(s) for a write-capable segment, or ``None`` to fail
     closed when the destination cannot be parsed. ``kind`` is the structural
     write-kind from ``_segment_write_kind``, never a policy rule_id."""
-    if kind == "bash-git-show-redirect":
-        m = _GIT_SHOW_REDIRECT_DEST_RE.search(seg)
-        return [m.group(1)] if m else None
+    if kind in ("bash-git-show-redirect", "bash-redirect"):
+        # cpp#195 follow-up: `bash-git-show-redirect` used to extract only ONE
+        # target, via an anchored regex (`>\s*([\w./-]+)\s*$`) matching just
+        # the LAST redirect on the line — correct for the single-redirect
+        # shape the `bash-git-show-redirect` YAML rule admits, but silently
+        # wrong for any OTHER shape reaching this write-kind (classified
+        # structurally, not by rule_id — see `_segment_write_kind`), such as
+        # the real mika#2471 command's `> /tmp/x 2>/dev/null`: the stdout
+        # target was never even looked at, only the trailing `2>/dev/null`
+        # was, and that target then had no carve-out either (below). Reusing
+        # `_segment_redirect_targets` — the SAME extraction `bash-redirect`
+        # already uses, and what `_segment_write_kind` itself calls to
+        # classify a segment `bash-redirect` in the first place — walks EVERY
+        # redirect on the line, so every target is validated, not just the
+        # last one written.
+        #
+        # `_segment_redirect_targets` distinguishes "found redirects but one
+        # target was unparseable" (``None``) from "no redirect at all"
+        # (``[]``) -- a distinction that never arises through the real
+        # classification path (`_segment_write_kind` only ever assigns
+        # `bash-redirect` when at least one target-bearing redirect exists;
+        # `bash-git-show-redirect` likewise requires ``">" in seg``), but
+        # DOES arise from a directly-constructed, kind/seg-mismatched call
+        # (`_extract_write_destinations("bash-git-show-redirect", "git
+        # show")` -- no redirect at all). Normalize the empty case to
+        # ``None`` too, so this function's OWN fail-closed contract ("``None``
+        # when the destination cannot be determined") stays exactly what it
+        # was before this refactor, for every caller, not only the one this
+        # function's usual caller (`_destination_veto_reason`) happens to
+        # treat identically (its `if not dests` already folds both).
+        targets = _segment_redirect_targets(seg)
+        return targets if targets else None
     if kind == "bash-cp-mv":
         return _extract_cp_mv_destination(seg)
     if kind == "bash-mkdir":
         return _extract_mkdir_destinations(seg)
-    if kind == "bash-redirect":
-        # Same extraction `_segment_write_kind` used to classify — see that
-        # function's docstring for why the two calls cannot drift (cpp#155).
-        return _segment_redirect_targets(seg)
     return None
 
 
@@ -1132,7 +1150,31 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
         for dest in dests:
             if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest):
                 continue
-            if kind == "bash-redirect":
+            # cpp#195 (both the original fix and this follow-up): `bash-git-
+            # show-redirect` (cpp#35/#128, `git show <ref>:<path> >`, predates
+            # cpp#155's generalization of redirect write-kinds) shares the
+            # EXACT same per-TARGET carve-out `bash-redirect` (cpp#130/#154/
+            # #155) already has — factored into one branch so the two cannot
+            # re-drift the way cpp#151/#155 name as the failure mode. Before
+            # this factoring, `bash-git-show-redirect` had no carve-out at all
+            # (any target, including a contained `/tmp/…` one, fell straight
+            # through to the containment check below and vetoed) — the
+            # original cpp#195 fix added a narrower, standalone `/tmp` carve
+            # for it, but a SEPARATE bug meant it never fired for the real
+            # mika#2471 command: `_extract_write_destinations`'s git-show
+            # branch used an anchored single-target regex that only ever
+            # captured the LAST redirect on the line, so
+            # `… > /tmp/ck_home_main.rs 2>/dev/null` extracted ONLY
+            # `/dev/null` — a target that had no `/dev/null` carve-out for
+            # this write-kind either, and stayed vetoed as "resolves outside
+            # the worktree". Fixed at both points: extraction now reuses
+            # `_segment_redirect_targets` (below, same as `bash-redirect`) so
+            # EVERY target on the line is walked, and each one is carved out
+            # independently here — the aggregate is non-terminal SSI EVERY
+            # target is individually non-lethal; one genuinely out-of-
+            # worktree, non-/tmp, non-/dev/null target anywhere on the line
+            # still vetoes the whole segment.
+            if kind in ("bash-redirect", "bash-git-show-redirect"):
                 if dest == "/dev/null":
                     # Inert sink (cpp#130) — writes nowhere, so it is not a
                     # containment question at all. Mirrors the exemption
