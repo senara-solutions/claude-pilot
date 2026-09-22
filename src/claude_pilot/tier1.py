@@ -995,6 +995,11 @@ def _is_safe_sub_command(sub: str) -> bool:
         or is_safe_gh_command(sub)
         or is_safe_mika_dispatch(sub)
         or is_safe_exec_when_contained(sub)
+        # cpp#189/#190: `sed -n '<addr>[,<addr>]p' [FILE...]` print-only —
+        # NOT via `is_safe_shell_command`/`SAFE_SHELL_COMMANDS` (sed stays
+        # excluded there, cpp#27); this is its own narrow, self-contained
+        # closed-world predicate. See `_is_safe_sed_print_only` above.
+        or _is_safe_sed_print_only(sub)
     )
 
 
@@ -1293,6 +1298,59 @@ def _is_safe_sed_pure_substitution(sub: str) -> bool:
     from the exact substitution shape → False.
     """
     return any(rgx.match(sub) for rgx in _SAFE_SED_SUB_RES)
+
+
+# ── cpp#190/#189: `sed -n <range>p` print-only, general (non-contained) ──────
+#
+# `_is_safe_sed_pure_substitution` above (the `s///` form) is wired ONLY into
+# `is_git_readonly_compound_when_contained` — a containment-attested (
+# `MIKA_PILOT_CONTAINED=1`) predicate, not reachable by the ordinary dev-groom
+# pilot. cpp#189/#190 are a DIFFERENT sed shape (`-n '<addr-range>p'`, print
+# a line range, no substitution at all) failing in the GENERAL (uncontained)
+# chain path: `sed`/`awk` are deliberately absent from `SAFE_SHELL_COMMANDS`
+# entirely (cpp#27 — both are general-purpose interpreters whose sub-features
+# can't be exhaustively guarded), so every sed shape used to route straight to
+# relay, and a `&&`/`|` chain containing one (`echo … && sed -n … && grep …`,
+# cpp#190; `sed -n … | cat -n`, cpp#189) failed per-segment chain-safety on
+# that ONE segment — logged under whatever unrelated rule_id `policy.evaluate`
+# happened to first-match on the whole string (`[bash-grep]`, `\sgrep\s`
+# matching a LATER segment; see `_is_sanctioned_readonly_for_loop`'s docstring
+# above for the same misattribution class).
+#
+# This predicate does NOT reopen cpp#27: it is not added to
+# `SAFE_SHELL_COMMANDS` (so `is_safe_shell_command("sed …")` — and every
+# cpp#27 regression test — is untouched), and it is a NARROW, closed-world,
+# self-contained shape, exactly the `_is_safe_sed_pure_substitution` pattern:
+#   * `-n` is REQUIRED and is the ONLY flag before the script (no `-i`
+#     in-place, no `-e`/`-f` multi-script/script-file).
+#   * The single-quoted script must be EXACTLY one address or address RANGE
+#     (`NUMBER`, `$` last-line, or `/regex/`) followed by the bare `p`
+#     (print) command and nothing else — the closing `'` is anchored
+#     immediately after `p`, so no other sed command letter (`w`/`W` write,
+#     `e`/`r`/`R` exec/read, `d`/`s`/`y`/`q`/`n`/`a`/`i`/`c`/`!`) or trailing
+#     flag can ride inside the script.
+#   * `sed 'ADDRp' file` WITHOUT `-n` is deliberately NOT admitted — it
+#     prints the addressed line TWICE (the explicit `p` plus sed's default
+#     auto-print), a different shape than the evidence, and read-only-but-
+#     unenumerated routes to relay (over-block is the safe direction, cpp#34
+#     discipline: widen only on evidence).
+#   * File operands share `_SAFE_CAT_RE`'s charset (no shell metacharacters,
+#     no redirect char) — consistent with every other bounded pipe tool here.
+_SED_ADDR = r"(?:\d+|\$|/(?:[^/\\]|\\.)*/)"
+_SAFE_SED_PRINT_RE = re.compile(
+    rf"^\s*sed\s+-n\s+'{_SED_ADDR}(?:,{_SED_ADDR})?p'\s*(?:[A-Za-z0-9_./-]+\s*)*$"
+)
+
+
+def _is_safe_sed_print_only(sub: str) -> bool:
+    """True iff sub is `sed -n '<addr>[,<addr>]p' [FILE...]` (print-only).
+
+    Closed-world: `-n` mandatory and sole flag, script is exactly one
+    address/range + bare `p`, no other sed command letter can appear (the
+    closing quote is anchored right after `p`). See the module comment
+    above (cpp#189/#190) for the full rationale and what stays denied.
+    """
+    return bool(_SAFE_SED_PRINT_RE.match(sub))
 
 
 def _is_safe_echo_literal(sub: str) -> bool:
