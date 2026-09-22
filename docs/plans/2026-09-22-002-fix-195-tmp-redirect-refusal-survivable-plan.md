@@ -197,16 +197,129 @@ Suite complète : `uv run pytest` — 1162 passed (aucune suite cpp#128/#151/
 
 ## Hors portée
 
-- `_GIT_SHOW_REDIRECT_DEST_RE`'s charset (`[\w./-]+`, sans `$`) ne supporte
-  pas les cibles à expansion de paramètre (`/tmp/2158bodies/$n.md`, le résidu
-  D3 de cpp#154) pour le write-kind `git show >` spécifiquement — c'est une
-  propriété PRÉEXISTANTE et non liée à ce bug (elle vaut aussi bien pour
-  `/tmp` que pour toute autre cible git-show) ; hors de la portée de cpp#195,
-  qui ne porte que sur la létalité d'une cible /tmp DÉJÀ extractible.
-- `git show ...:x > /dev/null` reste vétoté par `_destination_veto_reason`
-  pour le write-kind `bash-git-show-redirect` (jamais couvert par le skip
-  `/dev/null` de la branche `bash-redirect`, qui ne s'applique pas à ce
-  write-kind) — préexistant, non touché, non demandé par ce ticket.
+- Le charset de l'extraction (`[^\s;&|<>()]*`, hérité de `_redirect_targets`)
+  ne supporte toujours pas les cibles à expansion de paramètre (`$n`) pour le
+  DEV-NULL check spécifiquement — non pertinent ici (`/dev/null` est un
+  littéral, pas un motif) ; voir aussi le round 2 ci-dessous qui a généralisé
+  l'extraction.
+- ~~`git show ...:x > /dev/null` reste vétoté~~ — **CORRIGÉ au round 2, voir
+  § Suite (round 2)** : c'était précisément le trou qui empêchait le fix
+  original de couvrir la commande réelle #2471.
+
+## Suite (round 2 — MPC review, même ticket)
+
+**Constat de la revue.** Le fix ci-dessus (round 1) répare la forme à UNE
+seule cible (`git show …:x > /tmp/x`). La commande RÉELLE de mika#2471, telle
+que rejouée par MPC, est composée : `git show origin/main:crates/mika-common/
+src/home.rs > /tmp/ck_home_main.rs 2>/dev/null || true`. Elle restait
+TERMINALE après le round 1 — un second bug, distinct et compoundant.
+
+**Cause du round 2, établie à la source (sonde) :**
+`_extract_write_destinations`'s branche `bash-git-show-redirect` utilisait
+`_GIT_SHOW_REDIRECT_DEST_RE = re.compile(r">\s*([\w./-]+)\s*$")` — ancrée en
+FIN de chaîne (`$`), donc ne capturant QUE la DERNIÈRE redirection de la
+ligne. Pour `… > /tmp/ck_home_main.rs 2>/dev/null`, seule la cible
+`/dev/null` (la dernière) était extraite — `/tmp/ck_home_main.rs`, déjà
+carve-out par le round 1, n'était **jamais même examinée**. Et `/dev/null`,
+pour le write-kind `bash-git-show-redirect`, n'avait lui-même AUCUN carve-out
+(le skip `/dev/null` n'existait que dans la branche `bash-redirect`) — donc
+`/dev/null` tombait sur le check générique de confinement et vétotait :
+`"destination '/dev/null' resolves outside the worktree"`. Sonde (probe
+against HEAD `3b8ddfd`, avant ce commit) :
+
+| commande | dests extraits (avant) | dest_veto (avant) | terminal (avant) |
+|---|---|---|---|
+| `… > /tmp/x 2>/dev/null` | `['/dev/null']` (seul !) | non-None (`/dev/null` hors worktree) | True |
+
+**Fix round 2 — deux points, factorisés pour ne pas re-dériver (cpp#151/#155) :**
+
+1. **Extraction complète.** `_extract_write_destinations`'s branche
+   `bash-git-show-redirect` réutilise désormais `_segment_redirect_targets`
+   (LA MÊME extraction que `bash-redirect`, `tier1._redirect_targets` sous le
+   capot) au lieu de l'ancien regex ancré fin-de-chaîne. Résultat : TOUTES
+   les cibles de redirection de la ligne sont extraites, pas seulement la
+   dernière. `_GIT_SHOW_REDIRECT_DEST_RE` est retiré (mort, plus référencé
+   nulle part).
+2. **Carve-out par-cible partagé.** Dans `_destination_veto_reason`, la
+   branche per-target (`/dev/null` skip, disqualification lexicale
+   fail-closed, carve `/tmp/`, sinon containment générique) est désormais
+   UNE seule branche `if kind in ("bash-redirect", "bash-git-show-redirect")`
+   au lieu de deux branches séparées et asymétriques — `bash-git-show-
+   redirect` a maintenant EXACTEMENT le même jeu de carve-outs que
+   `bash-redirect`, cible par cible.
+
+Composabilité : la létalité est non-terminale **SSI CHAQUE cible** de la
+ligne est individuellement non-létale (contenue sous `/tmp/`, ou
+`/dev/null`) ; UNE seule cible réellement hors-worktree (non-/tmp,
+non-/dev/null) sur la ligne reste TERMINALE — prouvé par les tests négatifs
+composés (§ Acceptance criteria, AC2).
+
+**Effet de bord corrigé, nommé.** Un test préexistant appelait directement
+`_extract_write_destinations("bash-git-show-redirect", "git show")` (aucune
+redirection du tout) et attendait `None`. La nouvelle extraction générique
+rend `[]` dans ce cas précis (contrat différent de l'ancien regex, qui
+rendait `None` pour "aucun match"). `_extract_write_destinations` normalise
+maintenant `[] -> None` pour préserver EXACTEMENT le contrat de retour
+préexistant ("`None` = destination indéterminable") pour tout appelant, pas
+seulement `_destination_veto_reason` (dont le `if not dests` traitait déjà
+les deux cas pareil). Aucune assertion de test existante modifiée.
+
+## Acceptance criteria
+
+- **AC1 — replay exact #2471, non-terminal ET refusé.** La commande RÉELLE
+  `git show origin/main:crates/mika-common/src/home.rs > /tmp/ck_home_main.rs
+  2>/dev/null || true` rend `_denial_is_terminal(...) is False`, ET reste
+  `PermissionResultDeny` (jamais `PermissionResultAllow`) via
+  `create_permission_handler` — vérifié end-to-end, pas seulement au niveau
+  unitaire. → `test_cpp195_denial_is_terminal_mika_2471_replay_survivable`,
+  `test_cpp195_handler_end_to_end_still_denied_but_survivable`.
+- **AC2 — négatifs composés restent terminaux.** `> /tmp/x 2>/etc/y` (une
+  cible carve-out + une hors-worktree), `> /etc/x 2>/dev/null` (une
+  hors-worktree + une carve-out), `> ../escape 2>/dev/null` (traversal +
+  carve-out), plus les négatifs simples du round 1 (`/etc`, hors-worktree
+  non-/tmp, `..`, `sed -i`, `rm -rf`, `git push --force`) — tous
+  `_denial_is_terminal(...) is True`, sur les deux têtes (avant/après ce
+  commit). → `test_cpp195_negative_stays_terminal` (paramétré, 9 cas).
+- **AC3 — composition /dev/null couverte.** `git show …:x > /dev/null` seul,
+  et `/dev/null` comme UNE cible parmi plusieurs, sont carve-out pour
+  `bash-git-show-redirect` exactement comme pour `bash-redirect` (cpp#130).
+  → `test_cpp195_destination_veto_git_show_devnull_carve_out`,
+  `test_cpp195_destination_veto_git_show_composition_every_target_extracted`.
+- **AC4 — aucune autorisation nouvelle.** `is_tier3_dangerous` (le
+  classificateur du REFUS), toute règle YAML, et
+  `_redirect_destination_veto_reason` restent inchangés ; le refus (`policy
+  allow ... vetoed` / `PermissionResultDeny`) est identique avant/après, seul
+  `interrupt` (la létalité) change. Le site ALLOW à `interrupt=True`
+  inconditionnel (`:1534`, l'exception cpp#128) reste hors d'atteinte pour
+  une cible `/tmp/…` sur ce write-kind (le rule_id `bash-git-show-redirect`
+  exige une cible RELATIVE). → preuve dans le corps du plan (§ round 1, "Pourquoi
+  ce n'est PAS un élargissement"), et `test_cpp195_handler_end_to_end_still_
+  denied_but_survivable` qui assert `isinstance(result, PermissionResultDeny)`
+  explicitement.
+
+## Preuve deux sens — round 2 (rouge-avant/vert-après)
+
+Rouge capturé en stashant uniquement `permissions.py` (retour à `3b8ddfd`,
+le head de PR#196 avant ce commit), tests gardés :
+
+```
+FAILED test_cpp195_destination_veto_git_show_tmp_carve_out
+FAILED test_cpp195_destination_veto_git_show_devnull_carve_out
+FAILED test_cpp195_destination_veto_git_show_composition_every_target_extracted
+FAILED test_cpp195_denial_is_terminal_mika_2471_replay_survivable
+FAILED test_cpp195_handler_end_to_end_still_denied_but_survivable
+================= 5 failed, 10 passed, 43 deselected in 0.52s ==================
+```
+
+Les 10 passés incluent déjà les 3 négatifs composés (AC2) — ils étaient
+CORRECTS avant même ce round (la composition n'existait pas encore pour les
+rendre faussement survivables, donc rien à régresser là) ; c'est le signal
+qu'AC2 teste bien une propriété qui doit rester vraie, pas une propriété que
+ce commit invente.
+
+Vert après restauration du fix : 15/15 (`-k cpp195`). Suite complète : 1167
+passed (1162 + 5 nouveaux tests round 2). `ruff check .` / `mypy src` /
+`verify-pipeline.sh` : clean.
 
 ## Références
 
