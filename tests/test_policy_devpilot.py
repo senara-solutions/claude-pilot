@@ -318,10 +318,16 @@ def test_guard_still_vetoes_cpp95_near_variants_not_on_allowlist() -> None:
 def test_bash_cd_rule_allows_worktree_absolute_path() -> None:
     """cpp#97 founding shape: `cd /data/workspace/mika-platform/.claude/worktrees/<branch>/mika`.
     Sampled prod failures (mika#1689 task bff37cfa + bf3a6572). YAML rule
-    `bash-cd` fires with charset-restricted path, chain-safe verifies."""
+    `bash-cd` fires with charset-restricted path, chain-safe verifies.
+
+    cpp#199 narrowed this rule to relative paths and absolute paths under a
+    managed `.claude/worktrees/` prefix (AC1/AC2) -- `cd /tmp/spawn-worktree`
+    was dropped from this positive list because it is neither: an absolute
+    path outside the worktree prefix is now exactly the over-block-in-reverse
+    class AC2 closes. See `test_cpp199_bash_cd_absolute_non_worktree_denied`.
+    """
     for cmd in (
         "cd /data/workspace/mika-platform/.claude/worktrees/fix-1689-ci-rescue-path-no-verify-mika-1685/mika",
-        "cd /tmp/spawn-worktree",
         "cd ./relative/path",
         "cd crates/mika-agent",
     ):
@@ -339,6 +345,136 @@ def test_bash_cd_rule_still_vetoes_shell_injection() -> None:
         "cd /path | tee out",  # `|` breaks charset
     ):
         assert _effective(cmd) == "deny", cmd
+
+
+# --- cpp#199: bound `bash-cd` to worktree paths + relative, both directions ---
+#
+# mika#2458-iter2 (dispatch task 49269200) died `(terminal)` at
+# `[policy:deny] Bash: cd /data/workspace/mika-platform/.claude/worktrees/
+# bug-1910-llm-glm-5-2-silent-empty-output-au-max/mika` -- NO `[rule-id]`
+# printed, i.e. the policy DEFAULT fired, not a named rule. Direct
+# `policy.evaluate()` probe against the bundled HEAD policy (pre-cpp#199)
+# shows `bash-cd` DOES statically allow that exact command (rule_id
+# `bash-cd`) -- so this is not an allow-list hole in THIS file (AC3; see the
+# cpp#199 plan doc for the fuller characterization of where the production
+# deny actually came from). The same probe also shows the pre-cpp#199
+# `bash-cd` is over-broad: `cd /`, `cd /etc`, `cd /root` and bare relative
+# `cd ../../etc` traversal all matched `allow` too -- none of those is
+# worktree navigation.
+#
+# Fix bounds `bash-cd` to two mutually exclusive shapes: (i) a RELATIVE path
+# (no leading `/`, `~`, `$`), or (ii) an ABSOLUTE path containing a literal
+# `/.claude/worktrees/` segment -- a pilot's own managed dispatch worktree.
+# A single `(?!.*\\.\\.)` lookahead over the whole remainder excludes `..`
+# traversal from EITHER shape.
+
+
+def test_cpp199_bash_cd_worktree_absolute_path_allowed() -> None:
+    """AC1(ii) -- an absolute cd under a managed `.claude/worktrees/` prefix
+    is allowed, deterministically, via the named `bash-cd` rule (never falls
+    to the non-deterministic relay -- and the relay is unreachable anyway
+    while Tier 2 policy is enabled; see the plan doc AC3)."""
+    for cmd in (
+        # the exact mika#2458-iter2 command that killed the pilot ($7.71, 26 turns)
+        "cd /data/workspace/mika-platform/.claude/worktrees/"
+        "bug-1910-llm-glm-5-2-silent-empty-output-au-max/mika",
+        "cd /data/workspace/mika-platform/.claude/worktrees/some-other-ticket/mika",
+        "cd /home/pilot/.claude/worktrees/x",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-cd", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp199_bash_cd_relative_path_allowed() -> None:
+    """AC1(i) -- ordinary relative `cd` is unaffected by the tightening."""
+    for cmd in ("cd src/foo", "cd ./relative/path", "cd crates/mika-agent", "cd -"):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision == "allow", f"{cmd}: {pd}"
+        assert pd.rule_id == "bash-cd", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp199_bash_cd_absolute_non_worktree_denied() -> None:
+    """AC2 -- THE MANDATORY NEGATIVE TEST. An absolute cd NOT under
+    `.claude/worktrees/` is refused. On pristine `main` (pre-cpp#199) every
+    one of these commands matched `bash-cd` as `allow` (verified by direct
+    `policy.evaluate()` probe -- the over-block-in-reverse this closes); after
+    the fix they must fall through to the file's own `default: deny`."""
+    for cmd in (
+        "cd /",
+        "cd /etc",
+        "cd ~",
+        "cd /root",
+        # a repo root, not a worktree -- distinguishes "absolute path that
+        # happens to be a git checkout" from "absolute path under a managed
+        # dispatch worktree"
+        "cd /data/workspace/mika-platform",
+        "cd /tmp/spawn-worktree",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision != "allow", f"{cmd}: {pd}"
+        assert pd.rule_id != "bash-cd", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp199_bash_cd_traversal_denied_both_shapes() -> None:
+    """`..` escape stays refused whether spelled as a bare relative traversal
+    or smuggled inside an otherwise-worktree-prefixed absolute path."""
+    for cmd in (
+        "cd ..",
+        "cd ../../etc",
+        "cd foo/../../etc",
+        "cd /data/workspace/mika-platform/.claude/worktrees/x/../../../etc",
+    ):
+        pd = evaluate(_POLICY, "Bash", _bash(cmd))
+        assert pd.decision != "allow", f"{cmd}: {pd}"
+        assert pd.rule_id != "bash-cd", f"{cmd}: {pd.rule_id}"
+
+
+def test_cpp199_bash_cd_worktree_prefix_spoof_denied() -> None:
+    """The worktree-prefix check requires a literal `/.claude/worktrees/`
+    SEGMENT (leading `/` immediately before the dot), not just the bare
+    substring `.claude/worktrees/` -- otherwise a sibling directory named to
+    contain that substring (`foo.claude/worktrees/`) would spoof the
+    allowance."""
+    pd = evaluate(_POLICY, "Bash", _bash("cd /data/workspace/foo.claude/worktrees/evil"))
+    assert pd.decision != "allow", pd
+    assert pd.rule_id != "bash-cd", pd.rule_id
+
+
+def test_cpp199_bash_cd_end_to_end_handler_allows_worktree_cd(tmp_path: Path) -> None:
+    """Full handler path (tier1 -> tier1.5 -> policy + chain-safe), not just
+    the raw `policy.evaluate()` probe -- the worktree cd that killed
+    mika#2458-iter2 is allowed all the way through
+    `create_permission_handler`, with no regression from the AC1/AC2
+    tightening.
+
+    NOTE (flagged judgment call): this does NOT re-assert the AC2 negative
+    (`cd /etc` etc.) at the full-handler level. `tier1.SAFE_SHELL_COMMANDS`
+    treats bare `cd <path>` as unconditionally tier1-safe REGARDLESS OF
+    DESTINATION, by deliberate pre-existing design (`tier1.py`: "`cd` has no
+    write side effects; path-traversal risk is addressed by the TIER3
+    command-substitution blockers" -- not by containment) -- confirmed
+    empirically: `is_tier1_auto_approve("Bash", {"command": "cd /etc"}, cwd)`
+    is `True` on pristine `main`, unaffected by this PR. Tier 1 is the
+    pre-classifier GATE, not a named policy rule, and the operator's bearing
+    for cpp#199 is explicit: fix the named `bash-cd` allow-rule only, never
+    the gate. AC1/AC2 are therefore verified at the level the ticket itself
+    prescribes -- direct `policy.evaluate()` probes (see
+    `test_cpp199_bash_cd_absolute_non_worktree_denied` above) -- which is
+    also the level cpp#199's own AC3 investigation shows the production
+    mika#2458 deny actually happened at (rule_id `None`, Tier 2 default;
+    see the plan doc). Closing the tier1 gate for `cd` is a separate,
+    larger-blast-radius change outside this ticket's scope."""
+    worktree = tmp_path / "mika-platform" / ".claude" / "worktrees" / "cpp199-fixture" / "mika"
+    worktree.mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree)
+    )
+
+    allow_result = asyncio.run(
+        handler("Bash", _bash(f"cd {worktree}"), _mock_ctx())
+    )
+    assert isinstance(allow_result, PermissionResultAllow), allow_result
 
 
 # --- cpp#98: 2>/dev/null variants for merge-base substitution ---

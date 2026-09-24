@@ -101,23 +101,52 @@ rules:
   # Common pre-work Bash commands that pilots use to understand the codebase
   # before making changes. Confirmed in mika#1253's pre-wedge pilot log.
 
-  # cpp#97: bare `cd <absolute-path>` — pilot uses this to enter its worktree at
-  # session start. Tier1 has `cd` in SAFE_SHELL_COMMANDS but production evidence
-  # (mika#1689 halted 2× in 15min post cpp#96 deploy on this exact shape) shows
-  # the tier1 auto-approve path is not firing for absolute worktree paths — root
-  # cause under investigation. Explicit YAML allow rule short-circuits the
-  # mystery: `policy.evaluate()` returns allow with rule_id `bash-cd`,
-  # `_bash_allow_is_chain_safe` verifies chain safety (single-segment `cd <path>`
-  # is trivially safe). Path charset restricted to POSIX-safe chars — no shell
-  # metacharacters, no `..` (canonicalized-path assumption; path traversal is
-  # not a concern here since the pilot's cwd is already sandboxed by the
-  # worktree). Failure mode blocked: an attacker-controlled `cd '; rm -rf ~'`
-  # fails the charset restriction (contains `'`) and falls through.
+  # cpp#97 (bound cpp#199): bare `cd <path>` — pilot uses this to enter its
+  # worktree at session start. Tier1 has `cd` in SAFE_SHELL_COMMANDS but
+  # production evidence (mika#1689 halted 2× in 15min post cpp#96 deploy on
+  # this exact shape) shows the tier1 auto-approve path is not firing for
+  # absolute worktree paths — root cause under investigation. Explicit YAML
+  # allow rule short-circuits the mystery: `policy.evaluate()` returns allow
+  # with rule_id `bash-cd`, `_bash_allow_is_chain_safe` verifies chain safety
+  # (single-segment `cd <path>` is trivially safe).
+  #
+  # cpp#199 AC1/AC2 — the ORIGINAL cpp#97 shape (`[A-Za-z0-9_./\-]+`, any
+  # absolute or relative path) was measured over-broad in BOTH directions:
+  #   - UNDER-block (the founding bug): `bash-cd` DOES statically allow the
+  #     exact worktree cd that halted mika#2458-iter2 (verified at HEAD by
+  #     direct `policy.evaluate()` probe — this is NOT an allow-list hole in
+  #     this file; see the cpp#199 plan doc AC3 for where the production deny
+  #     actually came from).
+  #   - OVER-block-in-reverse: the same broad charset also allows `cd /`,
+  #     `cd /etc`, `cd /root`, and any other absolute path with no worktree
+  #     relation at all — and, via the `.` char in the charset, RELATIVE
+  #     traversal (`cd ../../etc`) too. Neither is worktree navigation.
+  #
+  # Fix (voie a, cpp#199): split into two mutually exclusive, deterministic
+  # shapes —
+  #   (i)  RELATIVE path — does not start with `/`, `~`, or `$` (so home/var
+  #        expansion never even reaches the charset check) — ordinary
+  #        in-worktree navigation, unchanged in spirit from cpp#97.
+  #   (ii) ABSOLUTE path that contains a literal `/.claude/worktrees/`
+  #        SEGMENT (leading `/` immediately before `.claude` — not just the
+  #        substring `.claude/worktrees/`, which a sibling directory
+  #        `foo.claude/worktrees/` could spoof) — a pilot's own managed
+  #        dispatch worktree, the cpp#199 founding shape.
+  # A single global `(?!.*\.\.)` lookahead (scoped over the WHOLE remainder,
+  # not just the leading segment) excludes `..` from EITHER shape — closing
+  # the relative-traversal hole cpp#97's charset alone never blocked.
+  # `cd /`, `cd /etc`, `cd /root`, and any absolute path lacking the worktree
+  # segment now match NEITHER branch and fall through to the file's own
+  # `default: deny` (this rule grants nothing; it stops granting something it
+  # used to). `cd ~` was already denied pre-fix (charset never admitted `~`)
+  # and stays denied. Charset otherwise unchanged: POSIX-safe chars only — no
+  # shell metacharacters — so `cd '; rm -rf ~'` still fails to match and
+  # falls through.
   - id: bash-cd
     tool: Bash
-    pattern: "^cd\\s+[A-Za-z0-9_./\\-]+/?$"
+    pattern: "^cd\\s+(?!.*\\.\\.)(?:(?!/)(?!~)(?!\\$)[A-Za-z0-9_./\\-]+|/(?=[A-Za-z0-9_./\\-]*/\\.claude/worktrees/)[A-Za-z0-9_./\\-]+)/?$"
     decision: allow
-    reason: "cd for worktree navigation (cpp#97 — tier1 gap on absolute worktree paths)"
+    reason: "cd for worktree navigation: relative path, or absolute path under a managed .claude/worktrees/ prefix (cpp#199 — bounded from cpp#97's over-broad any-absolute-path allow, no .. traversal either direction)"
 
   - id: bash-find
     tool: Bash
