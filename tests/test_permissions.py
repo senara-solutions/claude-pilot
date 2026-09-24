@@ -1598,3 +1598,217 @@ def test_cpp195_handler_end_to_end_still_denied_but_survivable(
     assert etc_control.interrupt is True, (
         "a non-/tmp destination escape on the SAME write-kind stays terminal"
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#201 — mktemp/heredoc write-destination veto: SURVIVABLE, not terminal
+#
+# mika#2458: a dev-groom died (terminal, PIPELINE_INCOMPLETE, $7.71) on the
+# compound `cd <wt>/mika ; T=$(mktemp -d) ; cat >"$T/log" <<'EOF' … EOF`. Only
+# the `cd` line was read at triage time; the ACTUAL cause is the heredoc
+# write to `$T/log` — a `$`-bearing, lexically unresolvable target
+# (`_is_lexically_disqualified_redirect_target`, cpp#154 D3) that is
+# correctly refused (fail-closed: it cannot be proven contained) but was
+# TERMINAL, same class as cpp#195/#196.
+#
+# The narrower cut (see `tier1._is_mktemp_scratch_redirect_target`'s block
+# comment): only a redirect target rooted at a variable the SAME command
+# assigns from `mktemp`'s own output becomes non-terminal. A blanket "any
+# `$` is survivable" rule was tried FIRST and explicitly rejected — it
+# regresses the ratified `$HOME`-stays-terminal invariant
+# (`test_cpp154_home_expansion_target_stays_terminal` in
+# `test_policy_devpilot.py`, `test_leading_expansion_target_stays_lethal` /
+# `test_real_redirect_stays_lethal` in `test_tier1.py`) that exists
+# specifically so `$HOME`/`$OLDPWD` cannot respell `~` as an escape hatch.
+# Those three tests are UNMODIFIED by this ticket and pass unchanged — see
+# the full-suite run in the plan doc.
+# ────────────────────────────────────────────────────────────────────────────
+
+_MIKA_2458_FULL_COMMAND = (
+    "cd /data/workspace/mika-platform/.claude/worktrees/bug-1910-x/mika ; "
+    "T=$(mktemp -d) ; cat >\"$T/log\" <<'EOF'\n"
+    '{"event":"turn_usage"}\n'
+    "EOF"
+)
+_MIKA_2458_BARE_COMMAND = (
+    "T=$(mktemp -d) ; cat >\"$T/log\" <<'EOF'\n{\"event\":\"turn_usage\"}\nEOF"
+)
+
+
+def test_cpp201_denial_is_terminal_mika_2458_replay_survivable(
+    tmp_path: Path,
+) -> None:
+    """Positive — the exact mika#2458 incident command, verbatim. Must become
+    NON-terminal (survivable): the pilot receives the deny and the session
+    continues. Red-before this fix (measured `True` on pre-fix HEAD, captured
+    in the plan doc)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert permissions_module._destination_veto_reason(
+        _MIKA_2458_FULL_COMMAND, wt
+    ) is not None, "the write must still be REFUSED — no widening of admission"
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2458_FULL_COMMAND}, wt
+        )
+        is False
+    )
+
+
+def test_cpp201_denial_is_terminal_bare_survivable(tmp_path: Path) -> None:
+    """Positive — the same write, without the leading `cd`, isolating that the
+    fix narrows the mktemp/heredoc write itself and has nothing to do with
+    `cd` (which cpp#199 already bounds separately)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2458_BARE_COMMAND}, wt
+        )
+        is False
+    )
+
+
+def test_cpp201_unassigned_dollar_var_stays_terminal(tmp_path: Path) -> None:
+    """Anti-vacuity negative: WITHOUT the `T=$(mktemp -d)` assignment
+    anywhere in the command, `"$T/log"` is exactly as unresolvable as
+    `$HOME/x` and must stay terminal — proves the carve-out is keyed on the
+    provable mktemp origin, not on the mere presence of `$`."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "cat >\"$T/log\" <<'EOF'\nx\nEOF"}, wt
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Resolvable, proven out-of-worktree, non-/tmp — stays terminal.
+        "cat > /etc/passwd <<'EOF'\nx\nEOF",
+        "> /var/outside/x",
+        "echo hi > /etc/cpp201-control",
+        # Genuinely dangerous verbs — unrelated to this write-destination
+        # class, unaffected.
+        "rm -rf x",
+        "sed -i 's/a/b/' /etc/f",
+        "git push --force origin main",
+        # Anti-widening: the ratified `$HOME`-as-`~`-respelling protection
+        # (cpp#154 D3) — must NOT flip just because this ticket touches the
+        # same lethality path.
+        "echo hi > $HOME/.ssh/authorized_keys",
+        "echo hi > ${HOME}/.bashrc",
+        "echo hi > $OLDPWD/y",
+        "echo hi > $(whoami)",
+        "echo hi > $",
+        "echo hi > ~/escape",
+        "echo hi > ../escape",
+        # A DIFFERENT variable than the one assigned from mktemp — proximity
+        # must not exempt it.
+        'T=$(mktemp -d) ; cat > "$OTHER/log"',
+        # A traversal riding a legitimate scratch-var prefix.
+        'T=$(mktemp -d) ; cat > "$T/../../etc/passwd"',
+    ],
+)
+def test_cpp201_negative_stays_terminal(cmd: str, tmp_path: Path) -> None:
+    """Negative — both-directions proof. Nothing that was terminal before this
+    fix stops being terminal, and the ratified `$HOME` invariant is not
+    reopened."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp201_handler_end_to_end_still_denied_but_survivable(
+    tmp_path: Path,
+) -> None:
+    """Handler-level proof, mirroring
+    `test_cpp195_handler_end_to_end_still_denied_but_survivable`: the exact
+    mika#2458 command is REFUSED (never executed) AND non-terminal through
+    the real `can_use_tool` callback — not merely at the unit level. The
+    unassigned-`$T` control on the SAME shape stays refused AND terminal,
+    proving the fix narrows lethality only, not admission."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    result = asyncio.run(
+        handler("Bash", {"command": _MIKA_2458_FULL_COMMAND}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny), (
+        "the mktemp/heredoc write must STILL be refused — no widening of "
+        "what is admitted"
+    )
+    assert result.interrupt is False, (
+        "the refusal must be survivable — this is the real mika#2458 "
+        "incident command, replayed verbatim"
+    )
+    assert result.message is not None and "not lexically under /tmp/" in (
+        result.message
+    ), (
+        "AC1: a survivable write-deny must surface a reason the pilot can "
+        "adapt to, not the generic default-deny message"
+    )
+
+    unassigned_control = asyncio.run(
+        handler(
+            "Bash",
+            {"command": "cat >\"$T/log\" <<'EOF'\nx\nEOF"},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(unassigned_control, PermissionResultDeny)
+    assert unassigned_control.interrupt is True, (
+        "the SAME target shape, without a same-command mktemp assignment, "
+        "stays terminal"
+    )
+
+
+def test_cpp201_non_reopening_cpp195_cpp154_ac4(tmp_path: Path) -> None:
+    """Non-reopening smoke: cpp#195/#196's /tmp git-show-redirect carve-out
+    and cpp#154 AC4's sanctioned `bash-cat-heredoc-tmp` shape are untouched
+    by this ticket — both are decided by entirely different code paths
+    (`_destination_veto_reason`'s /tmp-prefix branch and
+    `_is_sanctioned_pure_heredoc`'s whole-command shortcut, respectively),
+    neither of which this ticket's `for_lethality`/mktemp-scratch changes
+    touch. Full suites for cpp#128/#151/#154/#155/#166/#176/#195/#196 are
+    unmodified and pass unchanged (see the plan doc's full-suite run)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash",
+            {
+                "command": (
+                    "git show origin/main:crates/mika-common/src/home.rs "
+                    "> /tmp/ck_home_main.rs 2>/dev/null || true"
+                )
+            },
+            wt,
+        )
+        is False
+    )
+    # cpp#154 AC4: the sanctioned literal-/tmp heredoc is an ALLOW (not a
+    # deny at all), so `_destination_veto_reason` returns `None` for it —
+    # unaffected by anything cpp#201 touches.
+    assert (
+        permissions_module._destination_veto_reason(
+            "cat > /tmp/x <<'EOF'\nhello\nEOF", wt
+        )
+        is None
+    )

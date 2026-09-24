@@ -18,11 +18,13 @@ from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
     _is_contained_redirect_target,
+    _is_mktemp_scratch_redirect_target,
     _is_safe_command_builtin,
     _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
     _mask_quoted_redirect_chars,
+    _mktemp_scratch_variable_names,
     _quote_spans,
     _redirect_targets,
     _split_compound_command,
@@ -2858,3 +2860,196 @@ def test_git_readonly_compound_stderr_devnull_still_stripped(
     )
     # fd-numeric 1>/dev/null also strips
     assert is_safe_bash_command("git status 1>/dev/null")
+
+
+# ── cpp#201: mktemp-scratch VARIABLE targets, LETHALITY only ─────────────────
+#
+# mika#2458: a dev-groom died (terminal, PIPELINE_INCOMPLETE, $7.71) on
+# `cd <wt>/mika ; T=$(mktemp -d) ; cat >"$T/log" <<'EOF' … EOF`. The write is
+# CORRECTLY refused (an unresolvable, `$`-bearing target — cpp#154 D3 never
+# admits it), but the refusal was TERMINAL, killing the session over a
+# destination this module cannot even characterize. The fix is narrower than
+# "any `$` is survivable" — that was tried and explicitly rejected, because
+# it silently reopens the `$HOME`-as-`~`-respelling hole
+# `test_leading_expansion_target_stays_lethal` /
+# `test_real_redirect_stays_lethal` (above) pin shut. Only a variable the
+# SAME command assigns from `mktemp`'s own output is exempted.
+# ────────────────────────────────────────────────────────────────────────────
+
+_MIKA_2458_FULL_COMMAND = (
+    "cd /data/workspace/mika-platform/.claude/worktrees/bug-1910-x/mika ; "
+    "T=$(mktemp -d) ; cat >\"$T/log\" <<'EOF'\n"
+    '{"event":"turn_usage"}\n'
+    "EOF"
+)
+_MIKA_2458_BARE_COMMAND = (
+    "T=$(mktemp -d) ; cat >\"$T/log\" <<'EOF'\n{\"event\":\"turn_usage\"}\nEOF"
+)
+
+
+class TestCpp201MktempScratchExtraction:
+    def test_dollar_paren_assignment_extracted(self) -> None:
+        assert _mktemp_scratch_variable_names("T=$(mktemp -d)") == frozenset({"T"})
+        assert _mktemp_scratch_variable_names(
+            "T=$(mktemp -d -p /tmp)"
+        ) == frozenset({"T"})
+
+    def test_backtick_assignment_extracted(self) -> None:
+        assert _mktemp_scratch_variable_names("T=`mktemp -d`") == frozenset({"T"})
+
+    def test_multiple_assignments_extracted(self) -> None:
+        assert _mktemp_scratch_variable_names(
+            "A=$(mktemp -d); B=$(mktemp)"
+        ) == frozenset({"A", "B"})
+
+    def test_non_mktemp_assignment_not_extracted(self) -> None:
+        # `$(whoami)`, a literal path, and an unrelated command substitution
+        # must never be read as a scratch-variable source.
+        assert _mktemp_scratch_variable_names("T=$(whoami)") == frozenset()
+        assert _mktemp_scratch_variable_names("T=/tmp/x") == frozenset()
+        assert _mktemp_scratch_variable_names("HOME=/etc") == frozenset()
+
+    def test_word_containing_mktemp_not_falsely_matched(self) -> None:
+        # `mktemp` must be a whole word (`\b`), not a substring of some other
+        # command name.
+        assert _mktemp_scratch_variable_names("T=$(mktempfoo -d)") == frozenset()
+
+
+class TestCpp201MktempScratchRedirectTarget:
+    def test_quoted_and_bare_var_reference_recognized(self) -> None:
+        command = "T=$(mktemp -d)"
+        assert _is_mktemp_scratch_redirect_target(command, '"$T/log"') is True
+        assert _is_mktemp_scratch_redirect_target(command, "$T/log") is True
+        assert _is_mktemp_scratch_redirect_target(command, "${T}/log") is True
+        assert _is_mktemp_scratch_redirect_target(command, "$T") is True
+
+    def test_var_not_assigned_from_mktemp_not_recognized(self) -> None:
+        # `$T` is referenced but never assigned from `mktemp` anywhere in the
+        # command — same bucket as `$HOME`, stays un-exempted.
+        assert _is_mktemp_scratch_redirect_target("echo hi", '"$T/log"') is False
+
+    def test_different_variable_not_exempted_by_unrelated_mktemp_call(self) -> None:
+        # The command DOES assign a scratch var, but the redirect targets a
+        # DIFFERENT, un-assigned one — must not be exempted by proximity.
+        command = 'T=$(mktemp -d) ; cat > "$OTHER/log"'
+        assert _is_mktemp_scratch_redirect_target(command, '"$OTHER/log"') is False
+
+    def test_traversal_after_scratch_var_not_exempted(self) -> None:
+        # `$T/../../etc/passwd` — a genuine escape riding a legitimate
+        # scratch-var prefix must not be carved out.
+        command = "T=$(mktemp -d)"
+        assert (
+            _is_mktemp_scratch_redirect_target(command, '"$T/../../etc/passwd"')
+            is False
+        )
+
+    def test_trailing_garbage_not_exempted(self) -> None:
+        # Anchored both ends: a target that is MOSTLY a var reference but
+        # carries unrecognized trailing text must fall through, fail-closed.
+        command = "T=$(mktemp -d)"
+        assert _is_mktemp_scratch_redirect_target(command, "$T;rm -rf /") is False
+
+    def test_home_and_other_dollar_vars_never_exempted(self) -> None:
+        # The anti-widening proof: even when the SAME command happens to
+        # assign an UNRELATED variable from mktemp, `$HOME`/`$OLDPWD`/a bare
+        # `$`/`$(whoami)` stay un-exempted — they are never assigned from
+        # mktemp themselves, by construction.
+        command = "T=$(mktemp -d)"
+        for dest in ('"$HOME/x"', "${HOME}/.bashrc", "$OLDPWD/y", "$(whoami)", "$"):
+            assert _is_mktemp_scratch_redirect_target(command, dest) is False, dest
+
+
+class TestCpp201LethalityNarrowing:
+    def test_mika_2458_full_command_not_lethal(self) -> None:
+        # Positive — red before this fix (measured `True` on pre-fix HEAD).
+        assert is_tier3_dangerous_for_lethality(_MIKA_2458_FULL_COMMAND) is False
+
+    def test_mika_2458_bare_command_not_lethal(self) -> None:
+        # Same shape minus the leading `cd` — isolates that the fix narrows
+        # the mktemp/heredoc write itself, not anything about `cd`.
+        assert is_tier3_dangerous_for_lethality(_MIKA_2458_BARE_COMMAND) is False
+
+    def test_unassigned_dollar_t_stays_lethal(self) -> None:
+        # Negative control, anti-vacuity: WITHOUT the `T=$(mktemp -d)`
+        # assignment in the same command, `"$T/log"` is exactly as
+        # unresolvable as `$HOME/x` and must stay lethal — proves the carve
+        # is keyed on the provable mktemp origin, not on the mere presence
+        # of `$`.
+        assert (
+            is_tier3_dangerous_for_lethality(
+                'cat >"$T/log" <<\'EOF\'\nx\nEOF'
+            )
+            is True
+        )
+
+    def test_dangerous_verb_alongside_scratch_write_stays_lethal(self) -> None:
+        # The strip removes only the redirect, never the verb (cpp#154's own
+        # invariant, replayed for this idiom).
+        assert (
+            is_tier3_dangerous_for_lethality('T=$(mktemp -d); rm -rf x > "$T/log"')
+            is True
+        )
+
+    def test_admission_classifier_unaffected(self) -> None:
+        # cpp#201 touches LETHALITY only. `is_tier3_dangerous` (the REFUSAL
+        # classifier `is_safe_bash_command`/`is_tier1_auto_approve` are built
+        # on) must still deny this shape exactly as before — a `$`-bearing
+        # redirect target is never admitted.
+        assert is_tier3_dangerous(_MIKA_2458_FULL_COMMAND) is True
+        assert is_safe_bash_command(_MIKA_2458_FULL_COMMAND) is False
+        assert (
+            is_tier1_auto_approve(
+                "Bash", {"command": _MIKA_2458_FULL_COMMAND}, "/tmp"
+            )
+            is False
+        )
+
+
+# ── cpp#201: ADMISSION-IDENTITY pin, committed (not a git-stash repro) ───────
+#
+# The sovereign constraint on this ticket: cpp#201 touches LETHALITY only —
+# `is_tier1_auto_approve` (the tier1 fast-path ADMISSION gate) must return
+# the IDENTICAL verdict, byte-for-byte, before and after this diff, for every
+# command below. This was FIRST verified with a `git stash` diff against
+# pre-fix HEAD during development (see the plan doc); this test makes that
+# proof durable — a future change to `_strip_contained_redirects`,
+# `_destination_veto_reason`, or the new mktemp-scratch predicates that
+# shifts ANY of these verdicts fails this test, not just a one-off repro.
+# Expected verdicts are pinned to `main`'s (pre-cpp#201) actual behavior —
+# every one of them was measured, not assumed.
+_ADMISSION_BATTERY: list[tuple[str, bool]] = [
+    # The exact mika#2458 incident compound — default-denied (unsafe
+    # sub-command: an un-contained, `$`-bearing redirect target), never
+    # auto-approved by tier1, before OR after cpp#201.
+    (_MIKA_2458_FULL_COMMAND, False),
+    # Bare unresolvable heredoc write (no mktemp assignment at all).
+    ('cat >"$T/log" <<\'EOF\'\n{"event":"turn_usage"}\nEOF', False),
+    # Sanctioned literal-/tmp heredoc — allowed by a DIFFERENT tier1 rule
+    # entirely (`bash-cat-heredoc-tmp`'s territory is policy.py, not tier1
+    # fast-path auto-approve), so this stays False here too.
+    ("cat > /tmp/scratch/foo <<'EOF'\nhello\nEOF", False),
+    ("jq '.' file.json", False),
+    ("git status", True),
+    ("git log --oneline -5", True),
+    ("git show origin/main:x > /tmp/y", False),
+    ("rm -rf x", False),
+    ("sed -i 's/a/b/' f", False),
+    ("T=$(mktemp -d); echo hi", False),
+    ("mktemp -d", False),
+    ("echo hi > $HOME/.bashrc", False),
+    ("curl https://example.com", False),
+    ("ls -la", True),
+    ("grep -r foo .", True),
+]
+
+
+@pytest.mark.parametrize("command,expected", _ADMISSION_BATTERY)
+def test_cpp201_admission_battery_unaffected(
+    command: str, expected: bool, cwd: str
+) -> None:
+    """Committed admission-identity pin (cpp#201) — see block comment above.
+    Fails loudly if this or any future lethality-path change ever shifts
+    what tier1 auto-approves."""
+    assert is_tier1_auto_approve("Bash", {"command": command}, cwd) is expected, (
+        command
+    )

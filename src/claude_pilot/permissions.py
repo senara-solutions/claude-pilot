@@ -29,6 +29,7 @@ from .policy import Policy, evaluate, load_policy
 from .tier1 import (
     _is_contained_redirect_target,
     _is_lexically_disqualified_redirect_target,
+    _is_mktemp_scratch_redirect_target,
     _mask_quoted_redirect_chars,
     _redirect_targets,
     _split_compound_command,
@@ -805,7 +806,21 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # for redirect targets specifically. Order mirrors `_destination_veto_reason`.
     if _redirect_destination_veto_reason(command, cwd) is not None:
         return True
-    return _destination_veto_reason(command, cwd) is not None
+    # cpp#201: `for_lethality=True` narrows exactly one case — a redirect
+    # target rooted at a variable the SAME command assigns from `mktemp`'s
+    # own output (`tier1._is_mktemp_scratch_redirect_target`) is not, on its
+    # own, grounds to end the session; every other veto reason (proven
+    # out-of-worktree, control-plane, `~`, `..`, `$HOME`/`$OLDPWD`/`$(...)`/a
+    # bare `$`, or any other malformed/unrecognized operand) is unaffected
+    # and still returns True here — see `tier1._is_mktemp_scratch_redirect_
+    # target`'s block comment for why the cut is drawn this narrowly rather
+    # than on the mere presence of `$` (a wider cut regresses the ratified
+    # `$HOME`-stays-terminal invariant, cpp#154 D3 / cpp#157). The write
+    # stays refused either way — this call's `False` sibling (used
+    # everywhere else `_destination_veto_reason` is called) still vetoes it
+    # for the REFUSAL. See `_destination_veto_reason`'s own docstring and its
+    # per-target loop for the mechanism.
+    return _destination_veto_reason(command, cwd, for_lethality=True) is not None
 
 
 # ── Destination validation for write-capable structural rules (cpp#38, cpp#42) ─
@@ -1103,7 +1118,9 @@ def _is_sanctioned_tmp_scratch(dest: str) -> bool:
     return bool(dest) and _TMP_SCRATCH_MKDIR_RE.match(dest) is not None
 
 
-def _destination_veto_reason(command: str, cwd: str) -> str | None:
+def _destination_veto_reason(
+    command: str, cwd: str, *, for_lethality: bool = False
+) -> str | None:
     """Veto reason if any write-capable segment's destination escapes the
     worktree (cpp#38) or lands on the agent control plane (cpp#42); else ``None``.
 
@@ -1132,6 +1149,28 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
     `/tmp/(?!.*\\.\\.)[\\w./-]+`) and nothing executable after the terminator, so
     there is no second real command hiding in a command this predicate accepts
     — the shortcut is provably safe, not merely convenient.
+
+    ``for_lethality`` (cpp#201, default ``False``): every existing caller of
+    this function wants the REFUSAL question — every disqualified operand is
+    vetoed alike, mktemp-rooted or not — and gets it unchanged. The single
+    caller that wants the LETHALITY question (``_denial_is_terminal``)
+    passes ``True``, which additionally lets a disqualified target that is
+    rooted at a variable THIS SAME COMMAND assigned from `mktemp`'s own
+    output (``_is_mktemp_scratch_redirect_target``, `tier1.py`) fall through
+    as non-veto: that one named idiom is a known-scratch write, so a
+    write that is still refused fail-closed (this function's ``False``
+    behavior is what actually denies it, via `policy.evaluate`'s
+    default-deny reaching this decision at all — this flag never changes
+    whether the string is returned to a REFUSAL caller, only whether
+    `_denial_is_terminal` treats it as fatal) must not also end the session
+    over it. A target disqualified for any OTHER reason — `~`, `..`, a bad
+    charset, or a `$`-bearing operand NOT traced to a same-command `mktemp`
+    assignment (`$HOME`, `${HOME}`, `$OLDPWD`, `$(whoami)`, a bare `$`) — is
+    unaffected by the flag and keeps vetoing under both questions; a blanket
+    "any `$`" carve-out was tried and rejected because it regresses the
+    ratified `$HOME`-stays-terminal invariant (cpp#154 D3 / cpp#157) — see
+    `_is_mktemp_scratch_redirect_target`'s block comment in `tier1.py` for
+    the full boundary.
     """
     if not isinstance(command, str) or not command:
         return None
@@ -1196,7 +1235,37 @@ def _destination_veto_reason(command: str, cwd: str) -> str | None:
                     # as contained — exactly the class bash itself would
                     # expand to the real home directory or an unpredictable
                     # value. Failing closed here, before `is_within_project`
-                    # ever runs, is what keeps `> ~/x` and `> $VAR/x` vetoed.
+                    # ever runs, is what keeps `> ~/x` and `> $VAR/x` vetoed
+                    # — for the REFUSAL, i.e. whenever ``for_lethality`` is
+                    # ``False`` (every pre-existing caller): unconditional.
+                    #
+                    # cpp#201: when the ONLY caller that asks the LETHALITY
+                    # question (`_denial_is_terminal`, via `for_lethality=
+                    # True`) reaches an operand disqualified specifically
+                    # because it is rooted at a variable THIS SAME COMMAND
+                    # assigned from `mktemp`'s own output
+                    # (`_is_mktemp_scratch_redirect_target`, `tier1.py` —
+                    # same predicate `is_tier3_dangerous_for_lethality`'s own
+                    # redirect-stripping now uses, so the two cannot drift),
+                    # this segment's write is not treated as an independent
+                    # lethality veto: `mktemp`'s own contract makes this one
+                    # named idiom a known-scratch write. The REFUSAL is
+                    # untouched — `policy.evaluate`'s default-deny already
+                    # denied the command before this function ever runs, and
+                    # every other caller keeps getting the string. A target
+                    # disqualified for any OTHER reason — `~`, `..`, bad
+                    # charset, or a `$`-bearing operand NOT traced to a
+                    # same-command `mktemp` assignment (`$HOME`, `${HOME}`,
+                    # `$OLDPWD`, `$(whoami)`, a bare `$`) — still returns the
+                    # veto reason under `for_lethality=True` too; a blanket
+                    # "any `$`" exemption was tried and rejected because it
+                    # regresses the ratified `$HOME`-stays-terminal invariant
+                    # (cpp#154 D3 / cpp#157) — see
+                    # `_is_mktemp_scratch_redirect_target`'s block comment.
+                    if for_lethality and _is_mktemp_scratch_redirect_target(
+                        command, dest
+                    ):
+                        continue
                     return (
                         f"redirect destination {dest!r} is not a literal "
                         "contained path — not lexically under /tmp/ or "
@@ -1628,6 +1697,32 @@ def create_permission_handler(
                         ctx=ctx,
                     )
                 deny_terminal = _denial_is_terminal(tool_name, tool_input, cwd)
+                # cpp#201 AC1: a SURVIVABLE destination-veto deny (the new
+                # class this ticket creates — see `_denial_is_terminal`) gets
+                # a message the pilot can actually act on, instead of the
+                # generic `pd.reason` ("no matching policy rule — denied by
+                # default"), which names no destination and gives it nothing
+                # to adapt. Reuses `_destination_veto_reason`'s existing
+                # reason string VERBATIM (the task's own preference) rather
+                # than inventing new wording — the same string a REFUSAL
+                # caller already gets, just surfaced here too.
+                #
+                # Scoped tightly so nothing else changes: only Bash, only
+                # when the command is ALREADY known non-terminal, and only
+                # when `_destination_veto_reason` (the REFUSAL-facing
+                # default, `for_lethality=False`) actually has something to
+                # say. Before cpp#201, "non-terminal AND destination-veto
+                # non-None" was unreachable — every destination veto was
+                # unconditionally terminal — so this branch cannot affect any
+                # pre-existing deny's message; it only ever fires for the
+                # exact class cpp#201 makes survivable.
+                deny_message = pd.reason
+                if tool_name == "Bash" and not deny_terminal:
+                    _cmd = tool_input.get("command")
+                    if isinstance(_cmd, str):
+                        _veto_reason = _destination_veto_reason(_cmd, cwd)
+                        if _veto_reason is not None:
+                            deny_message = _veto_reason
                 log_policy_deny(tool_name, detail, pd.rule_id, terminal=deny_terminal)
                 # cpp#151 B0/B1: mark the session when — and only when — the
                 # refusal is survivable. This is the site the ticket's eight
@@ -1652,7 +1747,7 @@ def create_permission_handler(
                     guardrails.note_operator_question_denied(detail)
                 return _record_decision(
                     PermissionResultDeny(
-                        message=pd.reason,
+                        message=deny_message,
                         interrupt=deny_terminal,
                     ),
                     tool_name=tool_name,
