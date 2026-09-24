@@ -352,6 +352,106 @@ def _is_lexically_disqualified_redirect_target(dest: str) -> bool:
     return False
 
 
+# ── mktemp-scratch VARIABLE targets, for LETHALITY only (cpp#201) ────────────
+#
+# `_is_lexically_disqualified_redirect_target` (just above) answers ONE
+# question — "never a write destination this module will accept" — and that
+# answer is correct and UNCHANGED for the REFUSAL: `~`, `..`, a bad charset,
+# and any `$`-bearing operand are all denied fail-closed alike, because none
+# of them can be proven safe. This block does NOT touch that predicate.
+#
+# The temptation (rejected, kept here as a named non-choice so it is not
+# re-attempted) was to read ANY `$`-bearing disqualified target as merely
+# "cannot be proven ANYTHING, therefore not worth killing the session over".
+# That reading is WRONG and was caught by the test suite itself:
+# `test_cpp154_home_expansion_target_stays_terminal` /
+# `test_leading_expansion_target_stays_lethal` /
+# `test_real_redirect_stays_lethal` (cpp#154 D3, cpp#157 AC replay) pin
+# `$HOME/x`, `${HOME}/x`, `$OLDPWD/y`, `$(whoami)` and a bare `$` as staying
+# TERMINAL, on purpose: "`$HOME/x` names the same destination as `~/x`;
+# admitting it would make the `~` rejection one respelling away from
+# useless." A blanket `$`-means-survivable rule silently reopens exactly
+# that hole — an actual regression on a ratified invariant, not a
+# conservative-but-safe widening. Confirmed by running that batch: it fails
+# 5 pre-existing tests, none of which this ticket's incident touches.
+#
+# The actual incident (mika#2458: `T=$(mktemp -d); cat >"$T/log"`) is a
+# NARROWER and qualitatively different shape than `$HOME`: `T` is not an
+# ambient environment variable an attacker (or a confused pilot) can alias
+# to an arbitrary path — it is assigned, in the SAME command, from the
+# literal output of `mktemp`, a fixed system utility with a well-known
+# contract (a fresh path under `$TMPDIR`/`/tmp` unless a template argument
+# says otherwise, which the ticket's shape never supplies). That is provable
+# LEXICALLY, without resolving anything on disk (cpp#143's rule holds: never
+# resolve to GRANT — this doesn't; it recognizes a fixed textual idiom, the
+# same way `_is_sanctioned_pure_heredoc` recognizes the `bash-cat-heredoc-tmp`
+# idiom). So the cut actually drawn is: a redirect target whose disqualified
+# form is `$VAR`/`"$VAR"`/`${VAR}` (optionally followed by a safe, `..`-free
+# relative tail) is treated as a `/tmp`-scratch carve-out for LETHALITY ONLY
+# when the SAME command assigns `VAR` from `$(mktemp …)` or `` `mktemp …` ``
+# — never for any other variable, however spelled. `$HOME`, `${HOME}`,
+# `$OLDPWD`, `$(whoami)`, a bare `$` all fail the "assigned from mktemp
+# here" test and stay exactly as lethal as before — the 5 tests above are
+# unmodified and pass unchanged.
+_MKTEMP_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w$])([A-Za-z_][A-Za-z0-9_]*)="
+    r"(?:\$\(\s*mktemp\b[^)]*\)|`\s*mktemp\b[^`]*`)"
+)
+
+# The target-side match: an (already-disqualified) operand whose ENTIRE text
+# is an optional leading quote, a `$VAR`/`${VAR}` reference, and a safe
+# relative tail — no `..` segment anywhere in the tail (a traversal out of
+# the mktemp directory is never carved out, even if `VAR` itself is
+# legitimate), and no further `$`/other metacharacter, mirroring the same
+# fail-closed charset discipline `_CONTAINED_REDIRECT_TARGET_RE` already
+# applies. Anchored both ends — a target that is MOSTLY a var reference but
+# has trailing garbage does not match and falls through to the ordinary
+# "stays fatal" path.
+_MKTEMP_SCRATCH_TARGET_RE = re.compile(
+    r'^"?\$\{?(?P<var>[A-Za-z_][A-Za-z0-9_]*)\}?(?P<tail>[\w./-]*)"?$'
+)
+
+
+def _mktemp_scratch_variable_names(command: str) -> frozenset[str]:
+    """Every variable name the command assigns, anywhere in its raw text, from
+    `$(mktemp …)` or `` `mktemp …` `` (cpp#201).
+
+    Scans the WHOLE command text rather than per-segment: the assignment and
+    the redirect that consumes it are almost always different
+    `_split_compound_command` segments (`T=$(mktemp -d)` then, later,
+    `cat >"$T/log"`), so a per-segment view would never see both at once.
+    Deliberately does not try to tell an assignment that executes from one
+    that merely appears as inert heredoc BODY text — the worst case of that
+    imprecision is a slightly-too-generous LETHALITY carve-out on a command
+    that is, either way, still fully REFUSED (this function is never
+    consulted by anything that grants an allow); bounded and named here
+    rather than solved, matching this ticket's scope.
+    """
+    return frozenset(m.group(1) for m in _MKTEMP_ASSIGNMENT_RE.finditer(command))
+
+
+def _is_mktemp_scratch_redirect_target(command: str, dest: str) -> bool:
+    """Whether the (already-disqualified) redirect target ``dest`` is rooted at
+    a variable that ``command`` itself assigns from `mktemp`'s own output
+    (cpp#201) — see the block comment above for the full boundary and why it
+    is drawn this way rather than on the mere presence of ``$``.
+
+    Requires the caller to have already established
+    ``_is_lexically_disqualified_redirect_target(dest)`` — mirrors every
+    other helper in this module, which never re-derives a precondition its
+    caller already holds. Consulted ONLY for LETHALITY (cpp#201); the
+    REFUSAL keeps denying every disqualified operand alike, mktemp-rooted or
+    not — see `permissions._destination_veto_reason`'s per-target loop and
+    `is_tier3_dangerous`, neither of which calls this.
+    """
+    m = _MKTEMP_SCRATCH_TARGET_RE.match(dest)
+    if m is None:
+        return False
+    if ".." in m.group("tail"):
+        return False
+    return m.group("var") in _mktemp_scratch_variable_names(command)
+
+
 def _is_contained_redirect_target(dest: str) -> bool:
     """Whether a LITERAL redirect target text is contained: in-worktree (relative)
     or under ``/tmp`` (cpp#154).
@@ -397,8 +497,28 @@ def _redirect_targets(command: str) -> list[str] | None:
 
 
 def _strip_contained_redirects(command: str) -> str:
-    """Blank out each redirect whose target is contained; leave every other
-    redirect in place so the generic ``>`` pattern keeps matching (cpp#154)."""
+    """Blank out each redirect whose target is contained OR a mktemp-scratch
+    variable this same command assigned (cpp#201); leave every other
+    redirect in place so the generic ``>`` pattern keeps matching (cpp#154).
+
+    The ``or _is_mktemp_scratch_redirect_target(command, target)`` arm is
+    cpp#201, scoped NARROWLY — see that predicate's block comment for the
+    full boundary and for why a blanket "any `$` is survivable" rule was
+    tried and rejected (it silently reopens the `$HOME`-as-`~`-respelling
+    hole cpp#154 D3 closed; pinned by
+    `test_leading_expansion_target_stays_lethal` /
+    `test_real_redirect_stays_lethal` in `tests/test_tier1.py` and
+    `test_cpp154_home_expansion_target_stays_terminal` /
+    `test_cpp157_a_real_redirect_still_ends_the_run` in
+    `tests/test_policy_devpilot.py`, none of which this arm touches). Only a
+    target rooted at a variable the SAME command assigns from `mktemp`'s own
+    output is exempted; `$HOME`, `${HOME}`, `$OLDPWD`, `$(whoami)`, a bare
+    `$`, and any other variable stay exactly as lethal as before. The write
+    itself stays refused regardless (`is_tier3_dangerous`, the REFUSAL
+    classifier, is untouched; `permissions._destination_veto_reason` still
+    vetoes it fail-closed for the refusal question); only whether the
+    refusal ends the run changes, and only for this one named idiom.
+    """
     if _redirect_targets(command) is None:
         return command
 
@@ -406,7 +526,10 @@ def _strip_contained_redirects(command: str) -> str:
         if m.group("ignored") is not None:
             return m.group(0)
         target = m.group("target")
-        if target and _is_contained_redirect_target(target):
+        if target and (
+            _is_contained_redirect_target(target)
+            or _is_mktemp_scratch_redirect_target(command, target)
+        ):
             return " "
         return m.group(0)
 
