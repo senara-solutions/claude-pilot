@@ -5,8 +5,13 @@ external agent. Security principle: deny-list first, conservative default.
 When in doubt, return False (relay decides).
 
 Note: Bash shell commands do NOT get path-containment checks (unlike
-Write/Edit). Static analysis of shell redirect/copy targets is impractical;
-only commands with no write side effects are safe-listed.
+Write/Edit), with ONE named exception (cpp#207): `bash <p>` / `sh <p>` /
+`./<p>` is admitted only when `<p>` is a git-TRACKED, relative,
+worktree-contained script — see `is_safe_tracked_repo_script_invocation`
+below. Every other Bash shape still gets no path-containment check. Static
+analysis of shell redirect/copy targets remains impractical in general; only
+commands with no write side effects, or (for this one class) a git-reviewed
+script, are safe-listed.
 
 Quote-aware metacharacter scanning (mika#946, mika#944): backtick, ``$(`` and
 ``$'`` (ANSI-C quoting) rejection uses ``contains_unquoted_metacharacter()`` —
@@ -22,6 +27,8 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +92,7 @@ def is_tier1_auto_approve(tool_name: str, tool_input: dict[str, Any], cwd: str) 
         command = tool_input.get("command", "")
         if not isinstance(command, str) or not command.strip():
             return False
-        return is_safe_bash_command(command)
+        return is_safe_bash_command(command, cwd)
 
     if tool_name in ("Write", "Edit"):
         file_path = tool_input.get("file_path", "")
@@ -1264,7 +1271,7 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     return False
 
 
-def is_safe_bash_command(command: str) -> bool:
+def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
     # a legitimate multi-line compound (for-loop + if + $()) that stalls the
     # standard classifier BUT is bounded by containment when
@@ -1291,10 +1298,10 @@ def is_safe_bash_command(command: str) -> bool:
     if not sub_commands:
         return False
 
-    return all(_is_safe_sub_command(sub) for sub in sub_commands)
+    return all(_is_safe_sub_command(sub, cwd) for sub in sub_commands)
 
 
-def _is_safe_sub_command(sub: str) -> bool:
+def _is_safe_sub_command(sub: str, cwd: str | None = None) -> bool:
     return (
         is_safe_git_command(sub)
         or is_safe_build_command(sub)
@@ -1308,6 +1315,16 @@ def _is_safe_sub_command(sub: str) -> bool:
         # excluded there, cpp#27); this is its own narrow, self-contained
         # closed-world predicate. See `_is_safe_sed_print_only` above.
         or _is_safe_sed_print_only(sub)
+        # cpp#207 (RATIFIED admission widening, Prime + Vincent 2026-09-26):
+        # `bash <p>` / `sh <p>` / `./<p>` where `<p>` is a git-TRACKED,
+        # worktree-relative script. `cwd` is None for every call site that
+        # predates this ticket (`permissions._bash_allow_is_chain_safe` at
+        # `permissions.py:659`, and every direct unit-test call) — None
+        # fails CLOSED here unconditionally, so those callers' behavior is
+        # byte-identical to before this ticket. Only `is_tier1_auto_approve`
+        # (the Tier-1 admission fast path, which already threads `cwd`
+        # through today) can ever pass a real cwd and reach this class.
+        or is_safe_tracked_repo_script_invocation(sub, cwd)
     )
 
 
@@ -1363,6 +1380,225 @@ def is_safe_exec_when_contained(sub: str) -> bool:
     if _PYTHON3_EXEC_RE.match(sub):
         return True
     return False
+
+
+# ── Tracked-repo-script invocation (admission widening, cpp#207) ────────────
+#
+# RATIFIED (Prime + Vincent, 2026-09-26, cpp#207 comment "RATIFIÉ — spec
+# implémentable"): the FIRST admission-widening of the series — every prior
+# fix in this ticket's ancestry (#154 D3, #176, #196, #201, #203, #205) was
+# LETHALITY-only (narrowing what ends a session on refusal); none of them
+# widened what tier1 auto-approves. This one does, to exactly one named,
+# bounded class.
+#
+# Founding case (replayed here, mika#2054): a pilot dispatch needs to run a
+# repo-committed helper script (`scripts/verify-egress-no-log.sh`) as part of
+# its own verification pipeline. Pre-cpp#207, `bash <script>` had no tier1
+# predicate at all (see `is_safe_exec_when_contained`'s own "Not covered here"
+# note above — `bash <script>` was explicitly left to "its own compound
+# checker path", which never materialized) — every such invocation, however
+# innocuous, escalated to the relay.
+#
+# The rule, ALL FOUR conditions required (spec's Q1=(a) tracked-git,
+# Q2=args inherit path restrictions):
+#
+#   1. `<p>` is LEXICALLY relative: no leading `/`, no `~`, no leading/bare
+#      `$`, no `..`-escape anywhere. Reuses the SAME lexical disqualifier
+#      set `_is_lexically_disqualified_redirect_target` already enforces
+#      for redirect targets (cpp#154/#176), plus an explicit leading-`/`
+#      reject: unlike a redirect target (where an absolute `/tmp/...` is a
+#      carved-out exception, cpp#154), a script-invocation path admits NO
+#      absolute form at all — the ratified spec names "relative" outright.
+#   2. `<p>` RESOLVES under the worktree: `is_within_project(<p>, cwd)` —
+#      the SAME cwd/fs-aware mechanism the Write/Edit tier1 path already
+#      uses (cpp#38). Not a new mechanism; reused as specified.
+#   3. `<p>` is TRACKED by git in the `cwd` worktree: exactly one
+#      `git -C <cwd> ls-files --error-unmatch -- <p>` query
+#      (`_is_tracked_repo_script`). A pilot-written, uncommitted file is NOT
+#      tracked → refused. THIS is the anti-bypass proof the spec calls out
+#      by name: an attacker (or a confused pilot) who writes their own
+#      script to disk cannot ride this rule by also naming it in a `bash`
+#      invocation — only a script some human already committed and pushed
+#      through review qualifies. FAIL-CLOSED on any git error (missing
+#      binary, `cwd` not inside a repo, non-zero exit) — never auto-approved
+#      by default when the query cannot prove tracked status.
+#   4. Every ARGUMENT inherits the same path restriction (Q2):
+#      `_is_out_of_worktree_arg_path` refuses any operand that is `~`-
+#      rooted, contains a `..` segment, or is an absolute path that does not
+#      itself resolve inside the worktree. We cannot inspect what the
+#      script DOES with an argument, so an argument that is merely a flag or
+#      an opaque value is never flagged (it might not be a path at all) —
+#      only a SPELLING that is provably an escaping path is refused.
+#
+# This is a NEW mechanism in ONE respect only: it is the first tier1
+# predicate that shells out to `git` (a subprocess call) rather than staying
+# a pure, filesystem-free text/regex classifier. It is deliberately the
+# single narrowest possible form of that — one `git ls-files
+# --error-unmatch` invocation, list-form argv (no shell interpolation), a
+# bounded timeout so a wedged git process cannot stall admission
+# indefinitely, and a `--` separator so a script path that happens to look
+# like a git flag is never mis-parsed. `is_within_project` was already
+# cwd/fs-aware (cpp#38); this is the same posture extended to git's own
+# index.
+#
+# Double control (AC5, doctrine graved cpp#205/#207 — "admission never
+# reopens without (1) survivability closed [cpp#205] AND (2) double control
+# orthogonal"): this classifier (tracked-git) and the pilot's bwrap sandbox
+# (`--unshare-net` / tmpfs, dispatch-lib.sh Phase 2b) are TWO INDEPENDENT
+# boundaries. A tracked script has already been reviewed at the repository
+# (this classifier's own contribution); even in the residual case where a
+# tracked script turns out to misbehave, its blast radius is still the
+# sandbox's — net cut, fs writes confined to tmpfs/worktree. Neither
+# boundary is "the" safety property on its own; this rule only ever narrows
+# admission to commands where BOTH hold.
+#
+# Explicitly NOT covered (falls through to every other predicate, which all
+# deny it, so the whole command is refused, same as before this ticket):
+#   * `bash -c '<inline>'` / `sh -c '<inline>'` / `eval …` — already TIER3,
+#     matched on the WHOLE command in `is_tier3_dangerous` BEFORE
+#     `_is_safe_sub_command` is ever reached (`is_safe_bash_command`'s
+#     ordering). This predicate is never even consulted for those shapes.
+#   * `curl … | sh` / `wget … | bash` — the interpreter token is not the
+#     FIRST word of its own compound segment (`_split_compound_command`
+#     splits on `|`), so `_tracked_script_invocation_path("bash")` (no path
+#     operand) returns `None` here, and `curl …` fails every other
+#     predicate independently. Remote code never reaches this rule at all.
+#   * a script OUT of the worktree (absolute, `/tmp/x.sh`, a `..`-escape) —
+#     condition 1 or 2 refuses it.
+#   * flags before the path (`bash -x scripts/x.sh`) — the flag token is
+#     what gets checked as "the path" (this predicate does not special-case
+#     flags), and `-x` is never `is_within_project`/git-tracked → refused,
+#     fail-closed by construction, not by an explicit flag denylist.
+
+_TRACKED_SCRIPT_INTERPRETERS: frozenset[str] = frozenset({"bash", "sh"})
+
+
+def _tracked_script_invocation_path(sub: str) -> tuple[str, list[str]] | None:
+    """Split a sub-command into ``(script_path, args)`` iff it is shaped like
+    ``bash <p> [args...]`` / ``sh <p> [args...]`` / ``./<p> [args...]``, else
+    ``None``.
+
+    Pure syntax — no filesystem or git access here; that happens in the
+    caller once this shape is confirmed. Fails closed (returns ``None``) on
+    an unparseable (unbalanced-quote) sub, exactly like
+    ``permissions._shlex_operands``.
+    """
+    try:
+        tokens = shlex.split(sub)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+
+    head = tokens[0]
+    if head in _TRACKED_SCRIPT_INTERPRETERS:
+        if len(tokens) < 2:
+            return None
+        return tokens[1], tokens[2:]
+    if head.startswith("./"):
+        return head, tokens[1:]
+    return None
+
+
+def _is_lexically_disqualified_script_path(p: str) -> bool:
+    """Condition 1: whether ``p`` fails the "relative, no `..`-escape" test.
+
+    Reuses `_is_lexically_disqualified_redirect_target` (the SAME `~`/`$`/
+    `..`/charset disqualifiers already enforced for redirect targets), plus
+    an explicit leading-`/` reject: a redirect target may carve out an
+    absolute `/tmp/...` exception (cpp#154); a script-invocation path never
+    does — the ratified spec says "relative", full stop.
+    """
+    if p.startswith("/"):
+        return True
+    return _is_lexically_disqualified_redirect_target(p)
+
+
+def _is_tracked_repo_script(script_path: str, cwd: str) -> bool:
+    """Condition 3: whether ``script_path`` is TRACKED by git in the
+    worktree rooted at ``cwd``.
+
+    FAIL-CLOSED on any of: git binary missing, ``cwd`` not inside a git
+    repository, the query timing out, or any other non-zero exit —
+    including the actual "not tracked" case. This is the ONE subprocess call
+    in the tier1 admission path; a single `git ls-files --error-unmatch`
+    invocation, list-form argv (never a shell string — no interpolation
+    risk), `--` before the path (so a path that lexically matches the
+    redirect-target charset but starts with `-` is never mis-parsed as a git
+    flag), and a short timeout so a wedged git process cannot stall
+    admission indefinitely.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "ls-files", "--error-unmatch", "--", script_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _is_out_of_worktree_arg_path(arg: str, cwd: str) -> bool:
+    """Condition 4 (Q2): whether ``arg`` is a path that escapes the worktree.
+
+    We cannot inspect what the script does with its arguments, so this is
+    deliberately narrow: a `..`-bearing or `~`-rooted operand is refused
+    outright (lexical, never resolved — same discipline as
+    `_is_lexically_disqualified_redirect_target`); an ABSOLUTE operand is
+    checked against the worktree via `is_within_project` (an absolute
+    spelling CAN legitimately resolve inside the worktree); a plain relative
+    operand with no `..` cannot escape by construction and is never flagged
+    — it might not even be a path (a bare flag, an opaque value), and this
+    predicate only refuses a spelling that IS provably an escaping path.
+    """
+    if not arg:
+        return False
+    if ".." in arg:
+        return True
+    if arg.startswith("~"):
+        return True
+    if arg.startswith("/"):
+        return not is_within_project(arg, cwd)
+    return False
+
+
+def is_safe_tracked_repo_script_invocation(sub: str, cwd: str | None) -> bool:
+    """ADMISSION rule (cpp#207): allow ``bash <p>`` / ``sh <p>`` / ``./<p>``
+    (with args) as a tier1 auto-approve IFF ALL of:
+
+      1. ``<p>`` is lexically relative (no leading ``/``, ``~``, ``$``, or
+         ``..``-escape) — `_is_lexically_disqualified_script_path`.
+      2. ``<p>`` resolves UNDER the worktree — `is_within_project`.
+      3. ``<p>`` is git-TRACKED in the worktree — `_is_tracked_repo_script`.
+         The anti-bypass proof: an untracked, pilot-written script never
+         qualifies no matter how it got onto disk.
+      4. Every argument passes `_is_out_of_worktree_arg_path`'s inherited
+         path restriction.
+
+    ``cwd is None`` means the caller predates cpp#207 (every call site
+    except `is_tier1_auto_approve`, which already threads a real `cwd`
+    through today) — fails CLOSED unconditionally, so those callers'
+    behavior never changes. See the module-level comment block above this
+    function for the full rationale, the double-control note (AC5), and
+    what stays explicitly refused.
+    """
+    if cwd is None:
+        return False
+    parsed = _tracked_script_invocation_path(sub)
+    if parsed is None:
+        return False
+    script_path, args = parsed
+    if _is_lexically_disqualified_script_path(script_path):
+        return False
+    if not is_within_project(script_path, cwd):
+        return False
+    if not _is_tracked_repo_script(script_path, cwd):
+        return False
+    if any(_is_out_of_worktree_arg_path(a, cwd) for a in args):
+        return False
+    return True
 
 
 # ── ce-work Setup preamble compound (Exec-si-contenu specific case) ──────────
