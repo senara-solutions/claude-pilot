@@ -240,6 +240,62 @@ def is_tier3_dangerous(command: str) -> bool:
 _STDOUT_DEVNULL_RE = re.compile(r"\d*>{1,2}\s*/dev/null(?![/\w.])")
 
 
+# ── cpp#203: `sed -i` targeting the inert /dev/null sink is not lethal ───────
+#
+# mika#1686 comment 5844642872 (deny-death instance #1, mika#2532 impl): the
+# incident command
+#     sed -i 's/.../ X/' /dev/null; grep -n "created_by_session" crates/m.rs
+# measures `policy=allow(rule_id=bash-grep)` (first-match on the innocent
+# `grep`, which would run) but `_denial_is_terminal=True` — the `sed -i`
+# segment alone kills the session. TIER3_PATTERNS' `sed -i` entry (`:172`)
+# matches on the FLAG alone, regardless of target — correct for the REFUSAL
+# (`sed -i` is not an allow-listed idiom, so the command must stay denied)
+# but wrong for LETHALITY when the target writes nowhere.
+#
+# Unlike cpp#130's `>/dev/null` just above, `/dev/null` here is NOT a shell
+# redirect target — it is sed's own in-place-edit FILE ARGUMENT, a different
+# grammar position entirely. No `<`/`>` character appears anywhere in
+# `sed -i 's/a/b/' /dev/null`, so none of `_STDOUT_DEVNULL_RE`,
+# `_strip_contained_redirects`, or the `_REDIRECT_RE` extraction they rest on
+# ever see it. This is therefore a NEW narrowing, not a reapplication of the
+# redirect-stripping machinery — but it reuses cpp#130's exact /dev/null
+# RECOGNITION: the same literal target text and the same trailing-boundary
+# lookahead `(?![/\w.])`, so `/dev/null.txt`, `/dev/nullified`, and
+# `/dev/null/../etc/passwd` stay exactly as fatal as cpp#130 already keeps
+# them for redirects (no new recognition invented, per cpp#203 scope B).
+#
+# Scoped deliberately narrow — lethality only, no admission change:
+#   - Only the bare flag shape `TIER3_PATTERNS` itself matches (`-\w*i|
+#     -i\w*`, same alternation) — so this narrowing can never fire on a
+#     command the flag pattern would not have matched anyway. NARROWER than
+#     that shape in one respect: whitespace is required immediately after
+#     the flag, so a backup-suffix flag glued to `-i` (`-i.bak`, `-i_orig`)
+#     does not match here and stays lethal — an intentional, undemonstrated
+#     shape, not the mika#1686 incident, left on the fail-closed side.
+#   - At most ONE script/expression argument between the flag and the
+#     target — single-quoted, double-quoted, or one bare token (no
+#     separator characters). A second flag, a second script argument, or
+#     anything else between the flag and `/dev/null` is not this shape and
+#     is left untouched: the regex fails to match and the command stays
+#     lethal (fail-closed).
+#   - `/dev/null` must be the LAST token before a compound-command
+#     separator (`;`, `&`, `|`, `)`) or end-of-string — i.e. `/dev/null` is
+#     the ONLY file operand `sed -i` receives on this segment. A SECOND,
+#     real target — `sed -i 's/a/b/' /dev/null realfile.rs` — does NOT
+#     match: the lookahead after `/dev/null` fails on the trailing
+#     `realfile.rs`, so the whole match fails and the command stays lethal.
+# A dangerous verb elsewhere in the same or a later compound segment is
+# unaffected — this narrowing only ever blanks the exact `sed -i <script>?
+# /dev/null` text it matched, exactly as `_STDOUT_DEVNULL_RE.sub(" ", …)`
+# does for its own match, never anything outside it.
+_SED_I_DEVNULL_RE = re.compile(
+    r"\bsed\s+(?:-\w*i|-i\w*)\b"
+    r"(?:\s+(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|[^\s;&|]+))?"
+    r"\s+/dev/null(?![/\w.])"
+    r"(?=\s*(?:[;&|)]|$))"
+)
+
+
 # ── Contained redirect targets are not on their own session-fatal (cpp#154) ───
 #
 # cpp#130 (just above) removed ONE redirect target from the lethality class: the
@@ -660,23 +716,32 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
     its own session-fatal — while staying REFUSED, unchanged, since
     `is_tier3_dangerous` is not touched.
 
-    ORDER IS LOAD-BEARING, now across three narrowings: quoted `<`/`>` masked
-    FIRST (cpp#157), /dev/null second (cpp#130), contained targets third
-    (cpp#154). The mask must come first because the two later strips extract
-    redirect TARGETS, and a quoted `>` fabricates a phantom one: on `main`,
+    cpp#203 adds a fourth, independent narrowing: `sed -i <script>? /dev/null`
+    (`_SED_I_DEVNULL_RE`, above) — `sed -i`'s own in-place-edit FILE ARGUMENT,
+    not a shell redirect target, so it shares no character (`<`/`>`) with the
+    other three narrowings and its ORDER relative to them does not matter; it
+    is applied here between the quote mask and the /dev/null-redirect strip
+    purely for readability, next to the constant it pairs with.
+
+    ORDER IS LOAD-BEARING for the other three: quoted `<`/`>` masked FIRST
+    (cpp#157), /dev/null second (cpp#130), contained targets third (cpp#154).
+    The mask must come first because the two later strips extract redirect
+    TARGETS, and a quoted `>` fabricates a phantom one: on `main`,
     `_redirect_targets("echo 'a>b'")` yields `["b'"]`, which
     `_is_contained_redirect_target`'s charset rejects only by the accident of the
     trailing quote. Masking first removes the phantom target outright instead of
     relying on that accident. The relative order of cpp#130 and cpp#154 is
     unchanged, so their edge cases (`/dev/nullified`, `/dev/null.txt`,
-    `/dev/null/../etc/passwd`) keep their own behaviour. All three live in this
+    `/dev/null/../etc/passwd`) keep their own behaviour. All four live in this
     one function, and `_denial_is_terminal` is the single consumer — cpp#151 B0
     collapsed three separate lethality computations into one precisely so two
-    notions of "fatal" could not drift apart.
+    notions of "fatal" could not drift apart; cpp#203 keeps that invariant.
     """
     return is_tier3_dangerous(
         _strip_contained_redirects(
-            _STDOUT_DEVNULL_RE.sub(" ", _mask_quoted_redirect_chars(command))
+            _STDOUT_DEVNULL_RE.sub(
+                " ", _SED_I_DEVNULL_RE.sub(" ", _mask_quoted_redirect_chars(command))
+            )
         )
     )
 
