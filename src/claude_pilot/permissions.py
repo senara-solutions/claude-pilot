@@ -1350,6 +1350,56 @@ def _destination_veto_reason(
                 # absolute-but-in-worktree target was vetoed here, above,
                 # fail-closed, without ever reaching that check (PR#173/
                 # cpp#155 regression, claude-pilot#176).
+            # cpp#209: extends cpp#201's mktemp-scratch carve-out (write-kind
+            # `bash-redirect`) to the cp/mv DESTINATION-ARGUMENT write-kind
+            # (`bash-cp-mv`) — the residual class cpp#201 named but did not
+            # close (cpp#201 scoped to redirects only). LETHALITY ONLY, gated
+            # tightly on ``for_lethality`` so the REFUSAL question (every
+            # other caller, `for_lethality=False`) is completely unaffected —
+            # this whole branch is a no-op unless ``for_lethality`` is
+            # ``True``, and even then it only ever turns a would-be veto into
+            # a non-veto for the ONE named idiom cpp#201 already recognizes:
+            # a `bash-cp-mv` destination rooted at a variable THIS SAME
+            # COMMAND assigned from `mktemp`'s own output
+            # (`_is_mktemp_scratch_redirect_target`, `tier1.py` — reused
+            # verbatim, not reimplemented). `$HOME`, `${HOME}`, `$OLDPWD`,
+            # `$(whoami)`, a bare `$`, `~`, and a traversal riding a
+            # legitimate scratch-var prefix (a `..` in the tail) all fail
+            # `_is_mktemp_scratch_redirect_target` and fall straight through
+            # to the unmodified `is_within_project` check below, exactly as
+            # before — cpp#154 D3's anti-respelling invariant is not touched.
+            #
+            # Why this is checked BEFORE `is_within_project` rather than
+            # folded into the `bash-redirect`/`bash-git-show-redirect` branch
+            # above: unlike a redirect target, `_extract_cp_mv_destination`
+            # already shlex-stripped any quotes, and — measured at HEAD
+            # `8877dd6` (see the cpp#209 plan doc) — `is_within_project`
+            # itself is what decides this destination's fate for `bash-cp-mv`
+            # (there is no cwd-independent, always-terminal trigger for
+            # cp/mv the way `is_tier3_dangerous_for_lethality`'s bare-`>`
+            # pattern is for redirects): when `cwd` resolves, a clean
+            # (non-traversing) `$VAR`-rooted relative destination is ALREADY
+            # (accidentally) treated as contained by `is_within_project`
+            # (Python does no shell expansion, so `"$D/"` reads as an
+            # ordinary same-named subdirectory) and never reaches a veto at
+            # all; when `cwd` does NOT resolve (`Path(cwd).resolve(strict=
+            # True)` raising, e.g. a worktree torn down mid-session — the
+            # exact fail-closed branch `is_within_project`'s own docstring
+            # names), it returns `False` UNCONDITIONALLY, for every
+            # destination alike, and `_denial_is_terminal` returns `True` —
+            # this is the reproducible, non-vacuous trigger the cpp#209 plan
+            # doc's red-before/green-after tests use (mirroring the mika#2054
+            # incident: a worktree that stopped resolving mid-run). Checking
+            # the mktemp-scratch idiom BEFORE `is_within_project` makes the
+            # lethality verdict for this one named idiom independent of
+            # whether `cwd` happens to resolve at all, rather than leaving it
+            # to that accident either way.
+            if (
+                for_lethality
+                and kind == "bash-cp-mv"
+                and _is_mktemp_scratch_redirect_target(command, dest)
+            ):
+                continue
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "

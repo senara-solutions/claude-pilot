@@ -2353,3 +2353,269 @@ def test_cpp205_handler_end_to_end_new_verbs_still_denied_but_survivable(
     assert result.interrupt is True, (
         "chmod -R is the NEW proven-danger verb set (case a) — terminal"
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#209 — cp/mv DESTINATION-ARGUMENT write-kind (`bash-cp-mv`) mktemp-scratch
+# carve-out: the residual class cpp#201 named but did not close.
+#
+# cpp#201 carved the mktemp-scratch idiom (`VAR=$(mktemp …)` … `> "$VAR/…"`)
+# out of LETHALITY for write-kind `bash-redirect` only. The SAME idiom applied
+# to a `cp`/`mv` DESTINATION ARGUMENT (write-kind `bash-cp-mv`) never got the
+# carve — named as the cause of pilot 1b6c4d70's death on mika#2054 (cpp#209
+# body).
+#
+# Established at source (probed on this branch's HEAD, matching the ticket's
+# cited 8877dd6 — cpp#207, in between, touches only tier1 admission and is
+# disjoint from this code path): unlike a redirect, `bash-cp-mv`'s
+# containment question has NO cwd-independent, always-terminal trigger —
+# `is_tier3_dangerous_for_lethality`'s bare-`>` pattern has no cp/mv analog.
+# The ONLY terminal trigger for `bash-cp-mv` is `is_within_project`'s
+# cwd-dependent resolve: measured on an EXISTING worktree, a clean
+# (non-traversing) `$VAR`-rooted cp/mv destination is ALREADY (accidentally)
+# treated as contained by `is_within_project` (Python does no shell
+# expansion, so `"$D/"` reads as an ordinary same-named subdirectory) and
+# never reaches a veto at all — `_denial_is_terminal` measures `False` on
+# THIS class even on unfixed `main`, when `cwd` resolves. When `cwd` does
+# NOT resolve — `Path(cwd).resolve(strict=True)` raising, e.g. a worktree
+# torn down mid-session, the exact shape of the mika#2054 incident window —
+# `is_within_project` fails closed to `False` UNCONDITIONALLY, for every
+# destination alike (its own documented fail-closed branch), and
+# `_denial_is_terminal` returns `True`. THAT is the reproducible,
+# non-vacuous red-before/green-after trigger every positive test below
+# uses; the existing-worktree world is covered separately (as an
+# already-non-terminal sanity check and as the world every negative case
+# must also stay terminal in). See the cpp#209 plan doc's "Cause established
+# at source" section for the full measurement in both cwd worlds, before and
+# after this fix.
+# ────────────────────────────────────────────────────────────────────────────
+
+_MIKA_2054_FULL_COMMAND = (
+    'D=$(mktemp -d) ; cp crates/mika-agent/src/*.rs "$D/" ; '
+    "printf '{\"event\":\"turn_usage\"}' >> \"$D/mod.rs\" ; "
+    'bash scripts/verify.sh "$D"'
+)
+_MIKA_2054_CP_ALONE = 'D=$(mktemp -d) ; cp crates/mika-agent/src/*.rs "$D/"'
+_MIKA_2054_MV_ALONE = 'D=$(mktemp -d) ; mv crates/mika-agent/src/lib.rs "$D/"'
+
+
+def _torn_down_worktree(tmp_path: Path) -> str:
+    """A worktree path that existed and was removed — `Path(cwd).resolve(
+    strict=True)` raises `OSError`, so `is_within_project` fails closed to
+    `False` for EVERY destination (its own documented fail-closed branch),
+    reproducing the mika#2054 incident window (a worktree that stopped
+    resolving mid-session) without depending on the accident that a clean
+    `$VAR`-rooted cp/mv destination is otherwise (wrongly) read as contained
+    by `is_within_project` when `cwd` DOES resolve — see this section's
+    header comment."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir(parents=True)
+    shutil.rmtree(worktree)
+    return str(worktree)
+
+
+def test_cpp209_denial_is_terminal_mika_2054_replay_survivable(
+    tmp_path: Path,
+) -> None:
+    """Positive — the exact mika#2054 incident shape (cp to a same-command
+    mktemp-scratch dir, followed by the redirect append cpp#201 already
+    covers, followed by the tracked-script invocation cpp#207 covers). Must
+    become NON-terminal. Red-before this fix (measured `True` on pre-fix
+    HEAD — see the plan doc)."""
+    wt = _torn_down_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2054_FULL_COMMAND}, wt
+        )
+        is False
+    )
+
+
+def test_cpp209_denial_is_terminal_cp_mv_alone_survivable(tmp_path: Path) -> None:
+    """Positive — `cp x "$D/"` and `mv x "$D/"` alone (AC1's explicit ask),
+    isolating that the fix is about the cp/mv destination itself, not about
+    the compound shape or the trailing redirect cpp#201 already carves."""
+    wt = _torn_down_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2054_CP_ALONE}, wt
+        )
+        is False
+    )
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2054_MV_ALONE}, wt
+        )
+        is False
+    )
+
+
+def test_cpp209_unassigned_dollar_var_stays_terminal(tmp_path: Path) -> None:
+    """Anti-vacuity negative: WITHOUT the `D=$(mktemp -d)` assignment
+    anywhere in the command, `"$D/"` is exactly as unresolvable as `$HOME/x`
+    and must stay terminal — proves the carve-out is keyed on the provable
+    mktemp origin, not on the mere presence of `$` (mirrors cpp#201's own
+    `test_cpp201_unassigned_dollar_var_stays_terminal`)."""
+    wt = _torn_down_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": 'cp crates/mika-agent/src/lib.rs "$D/"'}, wt
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Resolvable, proven out-of-worktree, non-mktemp — stays terminal,
+        # in BOTH cwd worlds (AC2).
+        "cp crates/mika-agent/src/lib.rs /etc/y",
+        "cp crates/mika-agent/src/lib.rs /var/outside/x",
+        # Genuinely dangerous verbs — unrelated to this write-destination
+        # class, unaffected.
+        "rm -rf x",
+        "sed -i 's/a/b/' /etc/f",
+        "git push --force origin main",
+        # cpp#154 D3 — the ratified `$HOME`-as-`~`-respelling protection
+        # (via `mv`, this ticket's own verb pair) — must NOT flip.
+        'mv crates/mika-agent/src/lib.rs "$HOME/z"',
+        # A DIFFERENT variable than the one assigned from mktemp — proximity
+        # must not exempt it.
+        'D=$(mktemp -d) ; cp crates/mika-agent/src/lib.rs "$OTHER/log"',
+        # A traversal riding a legitimate scratch-var prefix.
+        'D=$(mktemp -d) ; cp crates/mika-agent/src/lib.rs "$D/../../etc/passwd"',
+    ],
+)
+def test_cpp209_negative_stays_terminal_torn_down_cwd(
+    cmd: str, tmp_path: Path
+) -> None:
+    """Negative, torn-down-worktree world — both-directions proof. Nothing
+    that was terminal before this fix stops being terminal in the SAME cwd
+    world the positive tests use."""
+    wt = _torn_down_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cp crates/mika-agent/src/lib.rs /etc/y",
+        "cp crates/mika-agent/src/lib.rs /var/outside/x",
+        "rm -rf x",
+        'D=$(mktemp -d) ; cp crates/mika-agent/src/lib.rs "$D/../../etc/passwd"',
+    ],
+)
+def test_cpp209_negative_stays_terminal_existing_cwd(
+    cmd: str, tmp_path: Path
+) -> None:
+    """Same negatives, EXISTING-worktree world — this fix must not change
+    the verdict in the cwd world where cp/mv containment already worked
+    (the traversal case is vetoed by `is_within_project` itself there, not
+    by this ticket's carve — see the header comment)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp209_handler_end_to_end_still_denied_but_survivable(
+    tmp_path: Path,
+) -> None:
+    """Handler-level proof: the mika#2054 cp/mv-alone shape is REFUSED
+    (never executed) AND non-terminal through the real `can_use_tool`
+    callback — not merely at the unit level. Uses the SAME torn-down-worktree
+    cwd the unit-level positive tests use (a worktree that stopped resolving
+    is the reproducible trigger — see this section's header comment)."""
+    wt = _torn_down_worktree(tmp_path)
+    handler = _bundled_handler(cwd=wt)
+
+    result = asyncio.run(handler("Bash", {"command": _MIKA_2054_CP_ALONE}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (
+        "the cp/mv-to-mktemp-scratch write must STILL be refused — no "
+        "widening of what is admitted"
+    )
+    assert result.interrupt is False, (
+        "the refusal must be survivable — this is the mika#2054 incident "
+        "shape"
+    )
+
+    unassigned_control = asyncio.run(
+        handler(
+            "Bash",
+            {"command": 'cp crates/mika-agent/src/lib.rs "$D/"'},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(unassigned_control, PermissionResultDeny)
+    assert unassigned_control.interrupt is True, (
+        "the SAME target shape, without a same-command mktemp assignment, "
+        "stays terminal"
+    )
+
+
+def test_cpp209_admission_unaffected_for_lethality_false(tmp_path: Path) -> None:
+    """Admission-identity: the REFUSAL question (`for_lethality=False`,
+    every caller other than `_denial_is_terminal`) is byte-identical before
+    and after this fix — the new branch is gated entirely on
+    `for_lethality=True`, so a disqualified cp/mv destination is vetoed
+    exactly as `is_within_project` alone (unmodified) would decide, in both
+    cwd worlds."""
+    wt_gone = _torn_down_worktree(tmp_path)
+    worktree = tmp_path / "wt2"
+    (worktree / ".git").mkdir(parents=True)
+    wt_here = str(worktree)
+
+    reason_gone = permissions_module._destination_veto_reason(
+        _MIKA_2054_CP_ALONE, wt_gone, for_lethality=False
+    )
+    assert reason_gone == (
+        "destination '$D/' resolves outside the worktree "
+        "(cpp#38 symlink-traversal containment)"
+    )
+
+    reason_here = permissions_module._destination_veto_reason(
+        _MIKA_2054_CP_ALONE, wt_here, for_lethality=False
+    )
+    assert reason_here is None
+
+
+def test_cpp209_non_reopening_154d3_176_195_196_201_203_205(
+    tmp_path: Path,
+) -> None:
+    """Non-reopening smoke, existing-worktree world (mirrors
+    `test_cpp205_non_reopening_154d3_176_195_196_201_203`, unmodified
+    cases). cpp#207 is not replayed here — it is an admission-only
+    (`is_tier1_auto_approve`/tier1.py) change, structurally disjoint from
+    `_denial_is_terminal`/`_destination_veto_reason` (permissions.py), which
+    this ticket's diff is entirely confined to."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    cases: list[tuple[str, bool]] = [
+        # cpp#154 D3.
+        ("echo hi > $HOME/.ssh/authorized_keys", True),
+        # cpp#176 (absolute target resolving inside the worktree).
+        (f"cp README.md {wt}/copy.md", False),
+        # cpp#195/#196 (git-show /tmp carve-out).
+        (
+            "git show origin/main:crates/mika-common/src/home.rs "
+            "> /tmp/ck_home_main.rs 2>/dev/null",
+            False,
+        ),
+        # cpp#201 (mktemp-scratch heredoc carve-out).
+        ('T=$(mktemp -d) ; cat >"$T/log" <<\'EOF\'\nx\nEOF', False),
+        # cpp#203 (sed -i /dev/null carve-out).
+        ("sed -i 's/a/b/' /dev/null; grep -n foo bar.rs", False),
+        # cpp#205 (proven-danger verb set, case a).
+        ("chmod -R 777 /etc", True),
+    ]
+    for cmd, expected in cases:
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is expected
+        ), cmd
