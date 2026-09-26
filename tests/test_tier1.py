@@ -14,6 +14,7 @@ from typing import ClassVar
 
 import pytest
 
+from claude_pilot import permissions as permissions_module
 from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
@@ -1314,17 +1315,40 @@ class TestTier3DevnullRedirectLethality:
         assert is_tier3_dangerous_for_lethality("grep -c a b > /dev/null") is False
         assert is_tier3_dangerous_for_lethality("mika ask >> /dev/null") is False
 
-    def test_real_write_target_stays_lethal(self) -> None:
+    def test_real_write_target_stays_lethal(self, tmp_path: Path) -> None:
         # A redirect to an arbitrary path OUTSIDE the contained set is a genuine
-        # escape and stays fatal in both classifiers.
+        # escape and stays fatal — AT THE AGGREGATE (`_denial_is_terminal`)
+        # LEVEL, cpp#205 forward.
         #
         # cpp#154 migrated one assertion out of this method: `mika ask >
         # /tmp/exfil` was asserted lethal here, and `/tmp` is now a contained
         # working-file destination. The inverted assertion lives in
         # `TestTier3ContainedRedirectLethality` below, where its change of
         # verdict is visible; nothing else in this cpp#130 class is touched.
-        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is True
-        assert is_tier3_dangerous_for_lethality("echo hi >/etc/passwd") is True
+        #
+        # cpp#205 LEGITIMATE FLIP (not a proven-danger regression — verified
+        # empirically, `_denial_is_terminal` still `True` for both, unchanged):
+        # `is_tier3_dangerous_for_lethality` no longer decides redirect-target
+        # escape at all — that responsibility moved entirely to the cwd-aware
+        # `_redirect_destination_veto_reason` / `_destination_veto_reason`
+        # calls in `_denial_is_terminal` (see `tier1._TIER3_VERB_PATTERNS_
+        # FOR_LETHALITY`'s block comment for why: this function is the wrong
+        # place to resolve a real escape, since it is deliberately cwd-free).
+        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is False
+        assert is_tier3_dangerous_for_lethality("echo hi >/etc/passwd") is False
+        wt = str(tmp_path)
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo hi > /etc/passwd"}, wt
+            )
+            is True
+        )
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo hi >/etc/passwd"}, wt
+            )
+            is True
+        )
 
     def test_danger_alongside_devnull_stays_lethal(self) -> None:
         # The strip removes only the /dev/null sink; a dangerous verb chained
@@ -1335,11 +1359,29 @@ class TestTier3DevnullRedirectLethality:
             is True
         )
 
-    def test_devnull_lookalike_escape_stays_lethal(self) -> None:
-        # Trailing-boundary lookahead: a path that only starts with /dev/null does
-        # NOT strip, so the bare-`>` pattern still fires and it stays fatal.
-        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is True
-        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
+    def test_devnull_lookalike_escape_stays_lethal(self, tmp_path: Path) -> None:
+        # Trailing-boundary lookahead: a path that only starts with /dev/null
+        # does NOT strip. cpp#205 LEGITIMATE FLIP: the bare-`>` pattern that
+        # used to catch this here is gone from `is_tier3_dangerous_for_
+        # lethality` (deferred to the destination-veto calls); the target
+        # (`/dev/null/../etc/passwd`, `/dev/nullified`) is a genuine
+        # out-of-worktree escape either way, so `_denial_is_terminal` still
+        # returns `True` — verified below, no proven-danger regression.
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is False
+        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is False
+        wt = str(tmp_path)
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "ls >/dev/null/../etc/passwd"}, wt
+            )
+            is True
+        )
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "ls >/dev/nullified"}, wt
+            )
+            is True
+        )
 
 
 class TestTier3SedIDevnullLethality:
@@ -1488,15 +1530,35 @@ class TestTier3ContainedRedirectLethality:
         # cpp#154 migrated from `test_real_write_target_stays_lethal` (cpp#130).
         assert is_tier3_dangerous_for_lethality("mika ask > /tmp/exfil") is False
 
-    def test_leading_expansion_target_stays_lethal(self) -> None:
+    def test_leading_expansion_target_stays_lethal(self, tmp_path: Path) -> None:
         # `$HOME/x` names the same destination as `~/x`; admitting it would make
         # the `~` rejection one respelling away from useless. A `$` that is not
         # the head of a parameter name fails closed for the same reason.
-        assert is_tier3_dangerous_for_lethality("echo hi > $HOME/x") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > ${HOME}/.bashrc") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > $OLDPWD/y") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > $(whoami)") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > $") is True
+        #
+        # cpp#205 LEGITIMATE FLIP, ratified non-reopening of cpp#154 D3: this
+        # function no longer decides redirect-target escape (see
+        # `test_real_write_target_stays_lethal` above for the mechanism). The
+        # `~`-respelling invariant itself is UNCHANGED and pinned at the
+        # `_denial_is_terminal` layer below — `_is_lexically_disqualified_
+        # redirect_target` (unmodified by cpp#205) still rejects every one of
+        # these outright, and `_destination_veto_reason` still vetoes them.
+        assert is_tier3_dangerous_for_lethality("echo hi > $HOME/x") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > ${HOME}/.bashrc") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > $OLDPWD/y") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > $(whoami)") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > $") is False
+        wt = str(tmp_path)
+        for cmd in (
+            "echo hi > $HOME/x",
+            "echo hi > ${HOME}/.bashrc",
+            "echo hi > $OLDPWD/y",
+            "echo hi > $(whoami)",
+            "echo hi > $",
+        ):
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
         # Control: a MID-PATH expansion stays contained (D3) — undoing this
         # would undo AC3, whose two `mkdir` deaths write `/tmp/.../$n.md`.
         assert is_tier3_dangerous_for_lethality("cmd > /tmp/b/$n.md") is False
@@ -1513,28 +1575,67 @@ class TestTier3ContainedRedirectLethality:
         # closed rather than reaching across the newline.
         assert _redirect_targets("echo done >\nbash -c 'id'") is None
 
-    def test_tmp_prefix_boundary(self) -> None:
+    def test_tmp_prefix_boundary(self, tmp_path: Path) -> None:
         # The direct analogue of cpp#130's `/dev/nullified` / `/dev/null.txt`
         # boundary tests one class above: only a literal `/tmp/` prefix counts.
-        assert is_tier3_dangerous_for_lethality("echo hi > /tmpfoo/x") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > /tmpevil") is True
+        #
+        # cpp#205 LEGITIMATE FLIP: same mechanism shift as above — the
+        # out-of-worktree escape is real either way, now proven by
+        # `_denial_is_terminal`'s destination-veto calls instead of this
+        # function's own lexical pattern.
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmpfoo/x") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmpevil") is False
         assert is_tier3_dangerous_for_lethality("echo hi > /tmp/ok") is False
+        wt = str(tmp_path)
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo hi > /tmpfoo/x"}, wt
+            )
+            is True
+        )
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo hi > /tmpevil"}, wt
+            )
+            is True
+        )
 
-    def test_uncontained_redirect_stays_lethal(self) -> None:
+    def test_uncontained_redirect_stays_lethal(self, tmp_path: Path) -> None:
         # Absolute outside /tmp, `..` anywhere, and `~` are each disqualifying.
-        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > ../x") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/../etc/x") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > ~/x") is True
-        assert is_tier3_dangerous_for_lethality("echo hi > /tmp") is True
+        #
+        # cpp#205 LEGITIMATE FLIP: `is_tier3_dangerous_for_lethality` no
+        # longer decides ANY redirect-target question — see
+        # `test_real_write_target_stays_lethal`'s note. The disqualification
+        # itself (`_is_lexically_disqualified_redirect_target`) is untouched;
+        # `_denial_is_terminal` proves every one of these still terminal below.
+        assert is_tier3_dangerous_for_lethality("echo hi > /etc/passwd") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > ../x") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/../etc/x") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > ~/x") is False
+        assert is_tier3_dangerous_for_lethality("echo hi > /tmp") is False
         # A quoted target falls outside the charset — fail-closed, so lethal.
         # `_redirect_targets` is NOT quote-aware: it hands the quote characters
         # through and the charset rejects them. This trio pins that coupling, so
         # a future widening of the charset cannot silently exempt a quoted
-        # target without one of these going red.
-        assert is_tier3_dangerous_for_lethality('echo hi > "/tmp/a b.md"') is True
-        assert is_tier3_dangerous_for_lethality("echo hi > '/tmp/a b.md'") is True
+        # target without one of these going red — now at the `_denial_is_
+        # terminal` layer, see below.
+        assert is_tier3_dangerous_for_lethality('echo hi > "/tmp/a b.md"') is False
+        assert is_tier3_dangerous_for_lethality("echo hi > '/tmp/a b.md'") is False
         assert _redirect_targets('echo hi > "/tmp/a') == ['"/tmp/a']
+        wt = str(tmp_path)
+        for cmd in (
+            "echo hi > /etc/passwd",
+            "echo hi > ../x",
+            "echo hi > /tmp/../etc/x",
+            "echo hi > ~/x",
+            "echo hi > /tmp",
+            'echo hi > "/tmp/a b.md"',
+            "echo hi > '/tmp/a b.md'",
+        ):
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
 
     def test_danger_alongside_contained_redirect_stays_lethal(self) -> None:
         # AC2: the strip removes the REDIRECT, never the dangerous verb.
@@ -1546,7 +1647,7 @@ class TestTier3ContainedRedirectLethality:
         assert is_tier3_dangerous_for_lethality("sed -i s/a/b/ f > notes.txt") is True
         assert is_tier3_dangerous_for_lethality('bash -c "id" > notes.txt') is True
 
-    def test_non_file_redirect_forms(self) -> None:
+    def test_non_file_redirect_forms(self, tmp_path: Path) -> None:
         # `2>&1` names no file: ignored by the extractor, and already exempt
         # upstream via the `(?!\(|&[\d-])` lookahead. This is the idiom cpp#130
         # names as the survivor of its "two-character life-or-death gap".
@@ -1558,27 +1659,53 @@ class TestTier3ContainedRedirectLethality:
         # silently treated as an fd-manipulation form.
         assert is_tier3_dangerous_for_lethality("cmd &> /tmp/log") is False
         assert is_tier3_dangerous_for_lethality("cmd &>> /tmp/log") is False
-        assert is_tier3_dangerous_for_lethality("cmd &> /etc/log") is True
-        assert is_tier3_dangerous_for_lethality("cmd &>> /etc/log") is True
+        # cpp#205 LEGITIMATE FLIP: `&>`/`2>>` to a real out-of-worktree target
+        # is no longer decided by this function (see `test_real_write_target_
+        # stays_lethal`'s note) — `_denial_is_terminal` proves it below.
+        assert is_tier3_dangerous_for_lethality("cmd &> /etc/log") is False
+        assert is_tier3_dangerous_for_lethality("cmd &>> /etc/log") is False
         # `N>>` is an extracted form too — the last of the six to get coverage.
         assert is_tier3_dangerous_for_lethality("cmd 2>> /tmp/log") is False
-        assert is_tier3_dangerous_for_lethality("cmd 2>> /etc/log") is True
+        assert is_tier3_dangerous_for_lethality("cmd 2>> /etc/log") is False
+        wt = str(tmp_path)
+        for cmd in ("cmd &> /etc/log", "cmd &>> /etc/log", "cmd 2>> /etc/log"):
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
         # Process substitution keeps its own `>\(` / `<\(` patterns,
-        # independent of the strip — `_REDIRECT_RE` never even matches `<(`.
+        # independent of the strip AND UNTOUCHED by cpp#205 (still part of
+        # `_TIER3_VERB_PATTERNS_FOR_LETHALITY` — an unprovable escape vector,
+        # not a target-provable redirect) — `_REDIRECT_RE` never even matches
+        # `<(`.
         assert is_tier3_dangerous_for_lethality("cmd > >(tee f)") is True
         assert is_tier3_dangerous_for_lethality("cmd < <(foo)") is True
 
-    def test_devnull_edges_of_cpp130_unchanged(self) -> None:
+    def test_devnull_edges_of_cpp130_unchanged(self, tmp_path: Path) -> None:
         # R3: the two strips live in one function in a load-bearing order.
         # cpp#130's trailing-boundary edges must stay exactly as they were —
         # `/dev/null...` is absolute and outside `/tmp/`, so the cpp#154 strip
         # does not reach them either.
+        #
+        # cpp#205 LEGITIMATE FLIP for the three lookalikes: same mechanism
+        # shift as `test_devnull_lookalike_escape_stays_lethal` above — proven
+        # unchanged at the `_denial_is_terminal` layer.
         assert is_tier3_dangerous_for_lethality("grep -c a b >/dev/null") is False
-        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is True
-        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
-        assert is_tier3_dangerous_for_lethality("ls >/dev/null.txt") is True
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null/../etc/passwd") is False
+        assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is False
+        assert is_tier3_dangerous_for_lethality("ls >/dev/null.txt") is False
+        wt = str(tmp_path)
+        for cmd in (
+            "ls >/dev/null/../etc/passwd",
+            "ls >/dev/nullified",
+            "ls >/dev/null.txt",
+        ):
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
 
-    def test_extractor_fails_closed(self) -> None:
+    def test_extractor_fails_closed(self, tmp_path: Path) -> None:
         # A redirect with no extractable operand yields `None`, and the caller
         # then strips nothing at all — `main`'s behaviour, i.e. lethal.
         assert _redirect_targets("echo hi > /tmp/a.md") == ["/tmp/a.md"]
@@ -1586,8 +1713,22 @@ class TestTier3ContainedRedirectLethality:
         assert _redirect_targets("cmd 2>&1") == []
         assert _redirect_targets("cmd >") is None
         assert _redirect_targets("cmd > | tail") is None
-        # One un-extractable redirect blocks the strip for the whole command.
-        assert is_tier3_dangerous_for_lethality("echo hi > /tmp/a.md; cmd >") is True
+        # cpp#205 LEGITIMATE FLIP: one un-extractable redirect used to block
+        # the strip for the WHOLE command inside this function, which then
+        # left the (contained) first redirect matching the removed generic
+        # `>` pattern too. That responsibility is now `_destination_veto_
+        # reason`'s: it fails closed on the unparseable `cmd >` SEGMENT (its
+        # own, independent fail-closed branch, "destination could not be
+        # parsed"), so `_denial_is_terminal` is still `True` — verified below.
+        assert (
+            is_tier3_dangerous_for_lethality("echo hi > /tmp/a.md; cmd >") is False
+        )
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo hi > /tmp/a.md; cmd >"}, str(tmp_path)
+            )
+            is True
+        )
 
     def test_contained_predicate_unit(self) -> None:
         assert _is_contained_redirect_target("/tmp/a.md") is True
@@ -1635,9 +1776,15 @@ class TestTier3QuotedRedirectCharLethality:
         assert is_tier3_dangerous_for_lethality('echo "a>b"') is False
         assert is_tier3_dangerous_for_lethality("echo 'x <(id)'") is False
 
-    def test_real_redirect_stays_lethal(self) -> None:
-        # AC3 replay 2 — the DISCRIMINANT: `True` BEFORE AND AFTER the fix. A fix
-        # that turns any of these `False` is wrong, and this is what catches it.
+    def test_real_redirect_stays_lethal(self, tmp_path: Path) -> None:
+        # AC3 replay 2 — the DISCRIMINANT, ORIGINALLY: `True` BEFORE AND AFTER
+        # the cpp#157 fix. A fix that turns any of these `False` was wrong.
+        #
+        # cpp#205 LEGITIMATE FLIP (a different fix, a different layer): this
+        # function no longer decides ANY redirect-target-escape question at
+        # all (see `test_real_write_target_stays_lethal`'s note) — the
+        # discriminant now lives at `_denial_is_terminal`, verified below,
+        # still `True` for every one of these unchanged.
         #
         # The two examples the ticket body originally named — `cmd >> fichier`
         # and `grep x > /tmp/out` — were measured `False` on `main` already:
@@ -1645,11 +1792,21 @@ class TestTier3QuotedRedirectCharLethality:
         # from the lethal class, so neither exercised the control it claimed to.
         # Substituted for five that DO, all measured `True` on `main`. The
         # intention of AC2/AC3 is unchanged; only the examples are.
-        assert is_tier3_dangerous_for_lethality("grep x > /etc/y") is True
-        assert is_tier3_dangerous_for_lethality("echo a > $HOME/z") is True
-        assert is_tier3_dangerous_for_lethality("echo a > ~/x") is True
-        assert is_tier3_dangerous_for_lethality("echo a > ../x") is True
-        assert is_tier3_dangerous_for_lethality("echo 'a>b' > /etc/passwd") is True
+        cmds = (
+            "grep x > /etc/y",
+            "echo a > $HOME/z",
+            "echo a > ~/x",
+            "echo a > ../x",
+            "echo 'a>b' > /etc/passwd",
+        )
+        for cmd in cmds:
+            assert is_tier3_dangerous_for_lethality(cmd) is False, cmd
+        wt = str(tmp_path)
+        for cmd in cmds:
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
 
     def test_mask_blanks_two_characters_never_a_verb(self) -> None:
         # D1, the control that distinguishes the two possible masks. Blanking the
@@ -1660,36 +1817,65 @@ class TestTier3QuotedRedirectCharLethality:
         assert is_tier3_dangerous_for_lethality("bash -c 'id'") is True
         assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/'") is True
 
-    def test_unterminated_quote_stays_lethal(self) -> None:
+    def test_unterminated_quote_stays_lethal(self, tmp_path: Path) -> None:
         # D5: fail-closed, and in the INVERSE direction from the two allow-path
         # scanners — they treat the remainder as inside the quote (their
         # fail-closed is "refuse"); this one refuses to EXEMPT.
-        assert (
-            is_tier3_dangerous_for_lethality('echo "unterminated > /etc/passwd')
-            is True
+        #
+        # cpp#205 LEGITIMATE FLIP: the redirect-target question this used to
+        # pin here now lives at `_denial_is_terminal` — verified below, still
+        # `True` unchanged.
+        cmds = (
+            'echo "unterminated > /etc/passwd',
+            "echo 'unterminated > /etc/passwd",
         )
-        assert (
-            is_tier3_dangerous_for_lethality("echo 'unterminated > /etc/passwd")
-            is True
-        )
+        for cmd in cmds:
+            assert is_tier3_dangerous_for_lethality(cmd) is False, cmd
+        wt = str(tmp_path)
+        for cmd in cmds:
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
 
-    def test_escaped_quote_outside_quotes_opens_no_region(self) -> None:
+    def test_escaped_quote_outside_quotes_opens_no_region(
+        self, tmp_path: Path
+    ) -> None:
         # Review finding, caught before merge: a backslash OUTSIDE quotes escapes
         # the next character, so `\\'` is a literal apostrophe and opens nothing.
         # Without that guard, the two escaped quotes below bracket a REAL
         # redirect, the mask blanks it, and `> /etc/passwd` becomes survivable —
-        # the exact class AC2 forbids. `True` on `main`, and `True` here.
-        assert is_tier3_dangerous_for_lethality("echo \\' > /etc/passwd \\'") is True
-        assert is_tier3_dangerous_for_lethality('echo \\" > /etc/passwd \\"') is True
+        # the exact class AC2 forbids.
+        #
+        # cpp#205 LEGITIMATE FLIP: `True` on `main` pre-cpp#205 via this
+        # function's own (now-removed) generic-redirect pattern; `_denial_is_
+        # terminal` proves the SAME commands still terminal below, via the
+        # (unmodified) destination-veto extraction, which is just as
+        # escape-blind as `_REDIRECT_RE` for text outside quotes and so sees
+        # the exact same phantom-turned-real `/etc/passwd` target.
+        wt = str(tmp_path)
+        for cmd in ("echo \\' > /etc/passwd \\'", 'echo \\" > /etc/passwd \\"'):
+            assert is_tier3_dangerous_for_lethality(cmd) is False, cmd
+            assert (
+                permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+                is True
+            ), cmd
         assert _mask_quoted_redirect_chars("echo \\' > /etc/passwd \\'") == (
             "echo \\' > /etc/passwd \\'"
         )
         # The escaped char is consumed but never masked, so `\\>` — a literal `>`
-        # to bash — stays visible to the pattern and stays lethal (fail-closed).
+        # to bash — stays visible to the extractor and stays lethal (fail-closed,
+        # now proven by `_denial_is_terminal` rather than this function).
         # Target `/etc/passwd`, not a relative one: `echo a \\> b` measures False
         # on `main` ALREADY, because cpp#154 strips a contained target — nothing
         # to do with this mask, and it would pin the wrong mechanism.
-        assert is_tier3_dangerous_for_lethality("echo a \\> /etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("echo a \\> /etc/passwd") is False
+        assert (
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": "echo a \\> /etc/passwd"}, wt
+            )
+            is True
+        )
 
     def test_cpp130_and_cpp154_edges_are_named_not_rewritten(self) -> None:
         # L5.4: the mask preserves length and never touches a line ending, so the
@@ -3074,15 +3260,21 @@ class TestCpp201LethalityNarrowing:
         # the mktemp/heredoc write itself, not anything about `cd`.
         assert is_tier3_dangerous_for_lethality(_MIKA_2458_BARE_COMMAND) is False
 
-    def test_unassigned_dollar_t_stays_lethal(self) -> None:
+    def test_unassigned_dollar_t_stays_lethal(self, tmp_path: Path) -> None:
         # Negative control, anti-vacuity: WITHOUT the `T=$(mktemp -d)`
         # assignment in the same command, `"$T/log"` is exactly as
         # unresolvable as `$HOME/x` and must stay lethal — proves the carve
         # is keyed on the provable mktemp origin, not on the mere presence
         # of `$`.
+        #
+        # cpp#205 LEGITIMATE FLIP: same mechanism shift as the `$HOME`-class
+        # tests above — this function no longer decides redirect-target
+        # escape; `_denial_is_terminal` proves it below, unchanged.
+        cmd = 'cat >"$T/log" <<\'EOF\'\nx\nEOF'
+        assert is_tier3_dangerous_for_lethality(cmd) is False
         assert (
-            is_tier3_dangerous_for_lethality(
-                'cat >"$T/log" <<\'EOF\'\nx\nEOF'
+            permissions_module._denial_is_terminal(
+                "Bash", {"command": cmd}, str(tmp_path)
             )
             is True
         )
@@ -3158,3 +3350,113 @@ def test_cpp201_admission_battery_unaffected(
     assert is_tier1_auto_approve("Bash", {"command": command}, cwd) is expected, (
         command
     )
+
+
+# ── cpp#205 (mika#1686 generalization, case a): proven-danger VERBS ─────────
+#
+# Two independent moves, both LETHALITY-only (see the block comment above
+# `tier1._TIER3_VERB_PATTERNS_FOR_LETHALITY` for the full reasoning):
+#
+#   (1) `is_tier3_dangerous_for_lethality`'s own trailing generic-redirect
+#       pattern is REMOVED from what THIS function proves — every "cpp#205
+#       LEGITIMATE FLIP" comment earlier in this file pins that the AGGREGATE
+#       verdict (`_denial_is_terminal`, proven in test_permissions.py) is
+#       unchanged; only this function's own, narrower, isolated contract
+#       shifts.
+#   (2) A NEW, narrowly-enumerated verb set is ADDED — `chmod -R`/`chown -R`/
+#       `dd`/`mkfs`/`truncate`/a fork bomb — measured ALREADY non-terminal
+#       pre-cpp#205 (none of them ever matched `TIER3_PATTERNS`), an
+#       under-terminal gap case (a) closes on purpose.
+class TestCpp205ProvenDangerVerbLethality:
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "chmod -R 777 /etc",
+            "chmod -R 777 x",  # even a RELATIVE/in-worktree target — verb-only, "regardless of target" (case a)
+            "chmod --recursive 777 /etc",
+            "chown -R nobody /etc",
+            "chown --recursive nobody:nobody x",
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=x",
+            "mkfs.ext4 /dev/sda1",
+            "mkfs /dev/sda1",
+            "truncate -s 0 /etc/passwd",
+            "truncate -s 0 x",
+            ":(){ :|:& };:",
+            ":() { :|:& };:",  # whitespace-tolerant variant
+            ": () { : | : & } ; :",  # more whitespace
+        ],
+    )
+    def test_new_verbs_are_lethal_regardless_of_target(self, cmd: str) -> None:
+        assert is_tier3_dangerous_for_lethality(cmd) is True, cmd
+
+    def test_lowercase_r_flag_is_a_documented_miss(self) -> None:
+        # `chmod`/`chown` have no `-r` short flag (only `-R`/`--recursive`);
+        # the case-sensitive `R` in the pattern is deliberate, not an
+        # oversight — a lowercase `-r` is not a valid recursive invocation at
+        # all, so under-matching it costs nothing (the write stays refused
+        # regardless; only survivable instead of terminal).
+        assert is_tier3_dangerous_for_lethality("chmod -rv 777 x") is False
+
+    def test_new_verbs_were_already_survivable_pre_cpp205(self) -> None:
+        """Audit anchor: none of the new verbs ever matched `TIER3_PATTERNS`
+        — `is_tier3_dangerous` (the REFUSAL, untouched by cpp#205) is `False`
+        for every one of them, proving the new lethality set widens NOTHING
+        about admission — these commands were denied by ordinary tier1/
+        policy default-deny before AND after cpp#205; only the LETHALITY of
+        that pre-existing denial changes."""
+        for cmd in (
+            "chmod -R 777 /etc",
+            "chown -R nobody /etc",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sda1",
+            "truncate -s 0 /etc/passwd",
+            ":(){ :|:& };:",
+        ):
+            assert is_tier3_dangerous(cmd) is False, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # Non-recursive chmod/chown: cpp#205's own audit named `chmod 000
+            # x` as an example ALREADY correctly survivable — case (a) is
+            # scoped to the RECURSIVE form; deliberately unchanged.
+            "chmod 000 x",
+            "chmod 755 /etc/passwd",
+            "chown nobody x",
+            # Substring/word-boundary negatives for `dd`.
+            "add x",
+            "middle",
+        ],
+    )
+    def test_non_matching_shapes_stay_non_lethal(self, cmd: str) -> None:
+        assert is_tier3_dangerous_for_lethality(cmd) is False, cmd
+
+
+# Extends `_ADMISSION_BATTERY` (cpp#201) with the cpp#205 proven-danger verbs:
+# same sovereign constraint — `is_tier1_auto_approve` must return the
+# IDENTICAL verdict, byte-for-byte, before and after cpp#205, for every
+# command below. None of these verbs is in `SAFE_SHELL_COMMANDS` or any YAML
+# allow rule, so every one is `False` (never tier1-auto-approved) both before
+# and after — cpp#205 adds a NEW lethality-only verb set, it does not touch
+# `is_tier1_auto_approve`, `is_safe_bash_command`, or any YAML.
+_CPP205_ADMISSION_BATTERY: list[str] = [
+    "chmod -R 777 /etc",
+    "chmod -R 777 x",
+    "chown -R nobody /etc",
+    "dd if=/dev/zero of=/dev/sda",
+    "mkfs.ext4 /dev/sda1",
+    "truncate -s 0 /etc/passwd",
+    ":(){ :|:& };:",
+    "chmod 000 x",
+]
+
+
+@pytest.mark.parametrize("command", _CPP205_ADMISSION_BATTERY)
+def test_cpp205_admission_identity_unaffected(command: str, cwd: str) -> None:
+    """Committed admission-identity pin (cpp#205) — see block comment above.
+    Every command here was, and remains, `False` (denied, not auto-approved)
+    through `is_tier1_auto_approve`, and `is_tier3_dangerous` (the REFUSAL
+    classifier) is unaffected by the new lethality-only verb set."""
+    assert is_tier1_auto_approve("Bash", {"command": command}, cwd) is False, command
+    assert is_safe_bash_command(command) is False, command

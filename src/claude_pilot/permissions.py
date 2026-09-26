@@ -763,22 +763,73 @@ def _bash_allow_is_chain_safe(
 # (`cli.py`) can zero the other three but not it. A pilot that adapts to a
 # refusal is not a dishonest pilot; a pilot that never stops would be, and
 # `maxTurns` is what actually stands in the way.
+#
+# cpp#205 (mika#1686 generalization, Prime + Vincent ratified "Oui. A",
+# 2026-09-26): the shape below was ALREADY "default False, terminal only on
+# an enumerated True-path" — cpp#128 built it that way from the start. What
+# cpp#205 changes is which True-paths are trusted. Audited (full truth table
+# in `docs/plans/2026-09-26-…-fix-205-default-survivable-lethality-plan.md`):
+#
+#   * `is_tier3_dangerous_for_lethality` — RETARGETED. Its final pattern match
+#     no longer includes `TIER3_PATTERNS`' own trailing generic bare-`>`/`>>`
+#     catch-all (deferred to the two destination-veto calls below, which can
+#     actually prove a redirect target safe or unsafe against `cwd` — that
+#     entry could not, and measurably over-refused an absolute-but-in-worktree
+#     redirect target for ANY verb, the mika#1719/cpp#176 shape generalized
+#     beyond the four write-kinds cpp#176 already fixed). It gained the new,
+#     narrowly-enumerated verb set `tier1._PROVEN_DANGEROUS_VERB_PATTERNS_
+#     CPP205` (`chmod -R`/`chown -R`/`dd`/`mkfs`/`truncate`/fork-bomb) — verbs
+#     whose blast radius matches `rm -rf` but that never matched any
+#     `TIER3_PATTERNS` entry and were measurably ALREADY non-terminal, an
+#     under-terminal gap this closes on purpose. See `tier1.py`'s
+#     `_TIER3_VERB_PATTERNS_FOR_LETHALITY` / `_PROVEN_DANGEROUS_VERB_PATTERNS_
+#     CPP205` block comments for the full reasoning and the audit measurement.
+#   * `_redirect_destination_veto_reason` and `_destination_veto_reason(...,
+#     for_lethality=True)` — UNCHANGED. Every existing carve-out they grant
+#     (cpp#143/#154/#155/#157/#176/#195/#196/#201) is preserved verbatim; they
+#     are what now ALSO decides redirect-target lethality that used to be
+#     decided (less precisely) by the removed catch-all.
+#
+# PROVEN-DANGER SET (stays terminal, case a) — the complete enumeration this
+# function's True-paths reduce to after the retargeting above:
+#   1. Destructive verbs regardless of target: `rm -rf`/`-fr`, `git push
+#      --force`/`-f`/to main/master, `git reset --hard`, `git branch -D`,
+#      `DROP TABLE`, `DELETE FROM`, `cargo publish`, `sed -i` (unless its ONLY
+#      target is the inert `/dev/null` sink, cpp#203), `gh label delete/edit`,
+#      `bash -c`/`sh -c`/`eval`, process substitution (`<(`/`>(`) — the
+#      pre-existing `TIER3_PATTERNS` set minus its own trailing catch-all —
+#      PLUS the new `chmod -R`/`chown -R`/`dd`/`mkfs`/`truncate`/fork-bomb.
+#   2. A redirect target that resolves outside the worktree (cpp#38) or onto
+#      the control plane (cpp#42) — including the `~`/`$HOME`/`${HOME}`/
+#      `$OLDPWD` respelling class (cpp#154 D3) and any other disqualified or
+#      unparseable operand, all fail-closed via `_destination_veto_reason`.
+#   3. No parseable `command` at all (missing key or non-string value).
+# Everything else — including an absolute redirect target that actually
+# resolves INSIDE the worktree, and the new `_PROVEN_DANGEROUS_VERB_PATTERNS_
+# CPP205` verbs' NON-recursive forms — defaults to survivable.
 
 
 def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) -> bool:
-    """Whether a policy denial must also abort the SDK agent loop (cpp#128).
+    """Whether a policy denial must also abort the SDK agent loop (cpp#128;
+    default inverted to SURVIVABLE and the proven-danger set enumerated by
+    cpp#205 — see the doctrine block above this function).
 
-    ``False`` — the refusal is surfaced to the model as a ``tool_result`` error
-    and the run continues — for every tool other than Bash, and for a Bash
-    command that is neither tier3-dangerous nor a containment escape.
+    ``False`` (survivable, the DEFAULT) — the refusal is surfaced to the model
+    as a ``tool_result`` error and the run continues — for every tool other
+    than Bash, and for a Bash command that matches neither the proven-danger
+    verb set nor a proven containment/control-plane escape.
 
-    ``True`` for a tier3-dangerous Bash command, for a Bash command whose write
-    destination — including a REDIRECT target (cpp#154) — escapes ``cwd`` or
-    lands on the control plane, and for a Bash
+    ``True`` (terminal) ONLY for: a Bash command matching the proven-danger
+    verb set (``tier1.is_tier3_dangerous_for_lethality``, cpp#205); a Bash
+    command whose write destination — including a REDIRECT target (cpp#154)
+    — is PROVEN to escape ``cwd`` or land on the control plane; and a Bash
     request that carries no parseable ``command`` at all — a missing key and a
     non-string value are the same condition and must classify the same way, so
     both fail closed. An explicitly EMPTY string is a parseable command and is
-    not dangerous, so it stays non-terminal.
+    not dangerous, so it stays non-terminal. Every other Bash denial —
+    including one a syntactic classifier merely COULD NOT PARSE OR PROVE, the
+    over-refusal class mika#1686 named — defaults to survivable, unconditionally,
+    with no per-shape carve-out required.
 
     ``_destination_veto_reason`` is defined below; it is total (``None`` for a
     non-string or empty command, segments classified structurally by their

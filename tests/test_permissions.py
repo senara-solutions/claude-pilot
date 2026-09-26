@@ -10,6 +10,8 @@ for events that are equivalent to TIER 1.5 in
 from __future__ import annotations
 
 import asyncio
+import shutil
+import uuid
 from pathlib import Path
 
 import pytest
@@ -2001,4 +2003,353 @@ def test_cpp203_non_reopening_cpp154_d3_cpp196_cpp201(tmp_path: Path) -> None:
             wt,
         )
         is False
+    )
+
+
+# ── cpp#205 (mika#1686 generalization, case a): default SURVIVABLE ─────────
+#
+# Prime + Vincent ratified "Oui. A" (2026-09-26). `_denial_is_terminal` was
+# ALREADY built as "default False (survivable), terminal only on an
+# enumerated True-path" — cpp#128's own construction. cpp#205 retargets WHICH
+# True-paths are trusted:
+#
+#   * REMOVED: `is_tier3_dangerous_for_lethality`'s own trailing generic
+#     bare-`>`/`>>` catch-all. It named a FILE TARGET, which the cwd-aware
+#     destination-veto calls below can PROVE safe or unsafe — the purely
+#     lexical, cwd-free check could not, and measurably over-refused an
+#     ABSOLUTE-BUT-IN-WORKTREE redirect target for ANY verb (the
+#     mika#1719/cpp#176 shape, generalized beyond the four write-kinds
+#     cpp#176 already fixed for cp/mv/mkdir/git-show).
+#   * ADDED: `chmod -R`/`chown -R`/`dd`/`mkfs`/`truncate`/a fork bomb —
+#     measured ALREADY non-terminal pre-cpp#205 (an under-terminal gap; see
+#     `tests/test_tier1.py::TestCpp205ProvenDangerVerbLethality`).
+#
+# This module's tests exercise the AGGREGATE (`_denial_is_terminal`);
+# `tests/test_tier1.py` exercises the underlying `is_tier3_dangerous_for_
+# lethality` retargeting in isolation, including every "cpp#205 LEGITIMATE
+# FLIP" non-regression pin for the redirect-target cases this file's
+# cpp#154/#176/#195/#196/#201/#203 tests already covered end-to-end.
+
+
+def _cpp205_wt(tmp_path: Path) -> str:
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    return str(worktree)
+
+
+# The four mika#1686 comment 5844642872 deny-death instances, replayed
+# verbatim against `_denial_is_terminal`.
+_MIKA_1686_INSTANCE_1_SED_I_DEVNULL_GREP = (
+    "sed -i 's/.../ X/' /dev/null; grep -n \"created_by_session\" crates/m.rs"
+)
+_MIKA_1686_INSTANCE_4_FOR_LOOP = (
+    "for t in test_a test_b; do printf '%s\\n' \"$t\"; done"
+)
+
+
+def _mika_1686_instance_2_3_cwd_probe(wt: str) -> str:
+    return (
+        f"cd /tmp && rm -rf {wt}-probe && mkdir {wt}-probe2 && "
+        f"chmod 000 {wt}-probe2 && sh -c 'echo hi'"
+    )
+
+
+def test_cpp205_mika1686_instance1_sed_i_devnull_grep_survivable(
+    tmp_path: Path,
+) -> None:
+    """#1 — sed -i /dev/null (no-op) followed by an innocent grep. Must be
+    SURVIVABLE (non-terminal); the command stays DENIED (sed -i is not
+    admitted). Already fixed by cpp#203; this ticket must not reopen it."""
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_1686_INSTANCE_1_SED_I_DEVNULL_GREP}, wt
+        )
+        is False
+    )
+
+
+def test_cpp205_mika1686_instance4_for_loop_survivable_or_allowed(
+    tmp_path: Path,
+) -> None:
+    """#4 — a plain read-only for-loop. Already allow/survivable on this
+    HEAD (not a class this ticket needed to touch); pinned so a future
+    change cannot silently regress it."""
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_1686_INSTANCE_4_FOR_LOOP}, wt
+        )
+        is False
+    )
+
+
+def test_cpp205_mika1686_instance2_3_cwd_probe_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    """#2/#3 — `cd /tmp && rm -rf <probe> && mkdir <probe2> && chmod 000
+    <probe2> && sh -c '...'`. MUST STAY TERMINAL (case a): the `rm -rf` and
+    `sh -c` destructive/unprovable verbs, and the `chmod 000` compound also
+    resolves outside the worktree (a separate, independent proven-danger
+    path). This is the accepted cost case (a) names explicitly: a few
+    legitimate reformulations traded against zero undetected escapes."""
+    wt = _cpp205_wt(tmp_path)
+    cmd = _mika_1686_instance_2_3_cwd_probe(wt)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    )
+
+
+# ── Both-directions battery ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "rm -rf x",
+        "rm -fr /etc",
+        "chmod -R 777 /etc",
+        "chmod --recursive 777 x",  # even an in-worktree target — case (a), regardless of target
+        "chown -R nobody /etc",
+        "dd if=/dev/zero of=/dev/sda",
+        "mkfs.ext4 /dev/sda1",
+        "truncate -s 0 /etc/passwd",
+        ":(){ :|:& };:",
+        "sed -i 's/a/b/' /etc/passwd",  # sed -i on a REAL out-of-worktree target
+        "bash -c 'id'",
+        "sh -c 'id'",
+        "eval 'id'",
+        "git push --force origin main",
+        "git reset --hard",
+    ],
+)
+def test_cpp205_proven_danger_stays_terminal_both_worlds(
+    cmd: str, tmp_path: Path
+) -> None:
+    """Proven-danger battery — destructive verbs, regardless of target."""
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "> /etc/passwd",
+        "echo hi > /etc/passwd",
+    ],
+)
+def test_cpp205_resolvable_redirect_out_of_worktree_stays_terminal(
+    cmd: str, tmp_path: Path
+) -> None:
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp205_out_of_worktree_write_stays_terminal(tmp_path: Path) -> None:
+    wt = _cpp205_wt(tmp_path)
+    outside = str(tmp_path / "outside")
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": f"cp README.md {outside}/x"}, wt
+        )
+        is True
+    )
+
+
+def test_cpp205_control_plane_path_stays_terminal(tmp_path: Path) -> None:
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "echo hi > .git/hooks/pre-commit"}, wt
+        )
+        is True
+    )
+
+
+def test_cpp205_home_respelling_stays_terminal_d3_non_reopening(
+    tmp_path: Path,
+) -> None:
+    """cpp#154 D3: `$HOME`/`${HOME}`/`$OLDPWD` respellings of `~` stay
+    terminal — non-reopening, explicit."""
+    wt = _cpp205_wt(tmp_path)
+    for cmd in (
+        "echo hi > $HOME/x",
+        "echo hi > ${HOME}/.bashrc",
+        "echo hi > $OLDPWD/y",
+    ):
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is True
+        ), cmd
+
+
+def test_cpp205_sed_i_on_real_out_of_worktree_file_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    """Exact battery item named by the dispatch: `sed -i` on a real
+    out-of-worktree file stays terminal (only the /dev/null no-op is
+    survivable, cpp#203 unchanged)."""
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed -i 's/a/b/' /etc/passwd"}, wt
+        )
+        is True
+    )
+
+
+# Survivable battery — the non-destructive syntactic over-refusals.
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Read chains / diagnostics.
+        'echo "label"; grep -rn foo .',
+        "for d in a b c; do echo \"=== $d ===\"; done",
+        # No-op sed -i /dev/null, composed with an innocent read (cpp#203).
+        "sed -i 's/a/b/' /dev/null; grep -n foo bar.rs",
+        # Composed research pipes.
+        "some_script.sh | tail && git status",
+        "cat notes.txt | grep foo",
+    ],
+)
+def test_cpp205_syntactic_overrefusals_default_survivable(
+    cmd: str, tmp_path: Path
+) -> None:
+    wt = _cpp205_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is False
+    ), cmd
+
+
+# ── The mika#1719/cpp#176-class fix, generalized beyond cp/mv/mkdir/git-show ─
+
+
+def _non_tmp_worktree() -> Path:
+    """A real, existing worktree directory whose OWN absolute path does NOT
+    start with the literal text `/tmp/` — load-bearing for the two tests
+    below. `tmp_path` (pytest's own fixture) resolves under the system temp
+    dir, which on this platform IS `/tmp`, so `f"{tmp_path}/out"` would
+    ALREADY be exempted by the pre-existing, unrelated `/tmp/`-prefix carve
+    (cpp#143/#154) regardless of this ticket's fix — not a discriminating
+    test. `/var/tmp` is a different literal path (the codebase's `/tmp/`
+    carve is a literal-text check, not a semantic "is a scratch dir" check),
+    so a worktree rooted there exercises the ACTUAL cpp#176-class bug this
+    ticket fixes: an absolute, non-`/tmp/`-prefixed target that nonetheless
+    resolves inside the worktree."""
+    wt = Path("/var/tmp") / f"cpp205-wt-{uuid.uuid4().hex[:12]}"
+    (wt / ".git").mkdir(parents=True)
+    return wt
+
+
+def test_cpp205_absolute_in_worktree_redirect_now_survivable_any_verb() -> None:
+    """THE actual bug cpp#205's audit found: an absolute redirect target that
+    resolves INSIDE the worktree, from a GENERIC verb (`/usr/bin/time`, not
+    one of cp/mv/mkdir/git-show, which cpp#176 already covered), was
+    incorrectly terminal via `is_tier3_dangerous_for_lethality`'s own
+    (purely lexical, cwd-free) generic bare-`>` pattern — even though the
+    write never left the worktree. Red on pre-cpp#205 HEAD (measured `True`);
+    green after."""
+    wt = _non_tmp_worktree()
+    try:
+        cmd = (
+            "/usr/bin/time -v cargo build --release --features telemetry "
+            f"--bin mika-spirit > {wt}/out"
+        )
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, str(wt))
+            is False
+        )
+    finally:
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+def test_cpp205_absolute_out_of_worktree_redirect_any_verb_stays_terminal() -> None:
+    """Negative control for the fix above: an absolute redirect target that
+    does NOT resolve inside the worktree, from the same generic verb, stays
+    terminal — the fix is containment-aware, not a blanket exemption for
+    absolute paths."""
+    wt = _non_tmp_worktree()
+    try:
+        cmd = "/usr/bin/time -v cargo build --release > /var/outside-cpp205/out"
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, str(wt))
+            is True
+        )
+    finally:
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+# ── Explicit default-survivable pin ──────────────────────────────────────────
+
+
+def test_cpp205_unrecognized_denied_shape_defaults_survivable(
+    tmp_path: Path,
+) -> None:
+    """The DEFAULT, pinned directly: an arbitrary, never-enumerated command
+    shape that policy denies (unknown verb, no redirect, no escape) is
+    survivable with NO per-shape carve-out required — this is the fall-
+    through branch's own behavior, not a lookup table."""
+    wt = _cpp205_wt(tmp_path)
+    for cmd in (
+        "some-tool-nobody-allow-listed --flag value",
+        "curl https://example.com/api",
+        "npm run some-arbitrary-script",
+    ):
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is False
+        ), cmd
+
+
+# ── Non-reopening smoke: cpp#154 D3 / #176 / #195 / #196 / #201 / #203 ──────
+
+
+def test_cpp205_non_reopening_154d3_176_195_196_201_203(tmp_path: Path) -> None:
+    wt = _cpp205_wt(tmp_path)
+    cases: list[tuple[str, bool]] = [
+        # cpp#154 D3.
+        ("echo hi > $HOME/.ssh/authorized_keys", True),
+        # cpp#176 (absolute target resolving inside the worktree, cp/mv/mkdir/
+        # git-show write-kinds specifically).
+        (f"cp README.md {wt}/copy.md", False),
+        # cpp#195/#196 (git-show /tmp carve-out).
+        (
+            "git show origin/main:crates/mika-common/src/home.rs "
+            "> /tmp/ck_home_main.rs 2>/dev/null",
+            False,
+        ),
+        # cpp#201 (mktemp-scratch heredoc carve-out).
+        ('T=$(mktemp -d) ; cat >"$T/log" <<\'EOF\'\nx\nEOF', False),
+        # cpp#203 (sed -i /dev/null carve-out).
+        ("sed -i 's/a/b/' /dev/null; grep -n foo bar.rs", False),
+    ]
+    for cmd, expected in cases:
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is expected
+        ), cmd
+
+
+def test_cpp205_handler_end_to_end_new_verbs_still_denied_but_survivable(
+    tmp_path: Path,
+) -> None:
+    """Handler-level proof for the NEW verb set: `chmod -R` is REFUSED (never
+    executed — admission is untouched) AND survivable (session continues)
+    through the real `can_use_tool` callback."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    result = asyncio.run(
+        handler("Bash", {"command": "chmod -R 777 /etc"}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny), (
+        "chmod -R must still be refused — no widening of admission"
+    )
+    assert result.interrupt is True, (
+        "chmod -R is the NEW proven-danger verb set (case a) — terminal"
     )

@@ -202,6 +202,106 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+# ── cpp#205: proven-danger VERBS for LETHALITY (case a generalization) ──────
+#
+# mika#1686 comment 5844642872 named a class cpp#130/#154/#155/#157/#196/#201/
+# #203 had each carved an exemption from one shape at a time: a policy denial
+# whose cause is pure FORM (a classifier that could not parse/prove a target
+# safe) was ending the run, not merely refusing the command. cpp#205 is the
+# doctrine-level generalization Prime + Vincent ratified ("Oui. A", 2026-09-26):
+# invert `_denial_is_terminal`'s DEFAULT to SURVIVABLE, terminal only for a
+# named, enumerated PROVEN-DANGER set (case a) — a syntactic classifier cannot
+# prove a target safe for these VERBS, so the verb itself stays lethal
+# regardless of what it is pointed at, exactly the reasoning TIER3_PATTERNS'
+# own `rm -rf` entry already embodies.
+#
+# TIER3_PATTERNS' OWN TRAILING ENTRY — the generic bare `>`/`>>` catch-all —
+# is the ONE entry in that tuple that is NOT this kind of unprovable verb: it
+# names a FILE TARGET, and a file target is exactly what
+# `_redirect_destination_veto_reason` / `permissions._destination_veto_reason`
+# (called with `for_lethality=True`) CAN prove safe or unsafe by resolving it
+# against `cwd` (cpp#38/#42/#154/#155/#176/#195/#201). Excluding only that one
+# trailing entry here, and letting `_denial_is_terminal`'s cwd-aware
+# destination-veto calls decide redirect-target lethality instead, fixes a
+# real over-refusal, measured on this HEAD (cpp#205 plan doc audit table): the
+# purely lexical, cwd-free `_is_contained_redirect_target` (below) only ever
+# exempts a target that is worktree-RELATIVE or lexically under `/tmp/` — it
+# has no way to see that an ABSOLUTE path actually RESOLVES inside the
+# worktree. `_destination_veto_reason` already got that fallthrough (cpp#176's
+# own fix, for the REFUSAL question, via its `is_within_project` resolution)
+# but this purely-lexical function never did — cpp#154 D1 deliberately keeps
+# it cwd-free. A generic-verb command redirecting to its own absolute worktree
+# path (the exact mika#1719/cpp#176 shape — `/usr/bin/time -v cargo build …
+# > /data/workspace/.../worktrees/.../out`, reproduced here for ANY verb, not
+# only `cp`/`mv`/`mkdir`/`git show` which cpp#176 already fixed) matched this
+# trailing entry and stayed terminal even though the write never left the
+# worktree.
+#
+# Removing it from the verb-only set does NOT weaken any existing terminal
+# case: `_destination_veto_reason` is a documented, pre-existing STRICT
+# SUPERSET of what a redirect target needs for the REFUSAL question — every
+# out-of-worktree, control-plane, `~`/`$`/`..`-disqualified, or unparseable
+# redirect target this trailing entry used to catch is independently proven
+# dangerous by that function too (verified case by case in the cpp#205 plan
+# doc's audit table) — this was already true before cpp#205 (that function's
+# own docstring already claimed the superset) and is unaffected by this change.
+_TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = TIER3_PATTERNS[:-1]
+
+# NEW verb patterns, LETHALITY-ONLY. NOT added to `TIER3_PATTERNS`, NEVER
+# consulted by `is_tier3_dangerous` (the REFUSAL) or by `is_safe_bash_command`/
+# `is_tier1_auto_approve`/any YAML rule — admission is completely untouched.
+# A command matching one of these is ALREADY refused today via the ordinary
+# tier1/policy default-deny path (none of these verbs is in
+# `SAFE_SHELL_COMMANDS` or admitted by any YAML allow rule); what changes is
+# only whether that refusal also ends the run.
+#
+# Measured on this HEAD (cpp#205 plan doc audit table): before this change,
+# `chmod -R`/`chown -R`/`dd`/`mkfs`/`truncate`/a fork bomb were, in fact,
+# ALREADY non-terminal — none of them ever matched any existing
+# `TIER3_PATTERNS` entry, so `is_tier3_dangerous_for_lethality` returned
+# `False` for every one of them and `_denial_is_terminal` fell through to
+# `False` (survivable) by the pre-cpp#205 default's own construction. This is
+# a genuine UNDER-terminal gap the ticket's case (a) closes on purpose: their
+# blast radius (a recursive permission/ownership change, a raw block-device
+# write, filesystem creation, file truncation, a fork bomb) is the same class
+# `rm -rf` already names in `TIER3_PATTERNS`, just never enumerated there. A
+# bare, non-recursive `chmod`/`chown` (a single-file mode change) is
+# deliberately NOT included — cpp#205's own audit named `chmod 000 x` as an
+# example of a denial ALREADY correctly survivable, and this ticket's mandate
+# is case (a), "regardless of target," which applies to the RECURSIVE form
+# specifically (a classifier cannot prove a recursive target's blast radius
+# safe); the non-recursive form is an ordinary single-file write, exactly the
+# kind of target a destination veto (not a verb ban) already governs when the
+# command also redirects, and stays covered by that path unchanged.
+_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bchmod\s+(?:-\w*R\w*|--recursive\b)"),  # chmod -R / --recursive
+    re.compile(r"\bchown\s+(?:-\w*R\w*|--recursive\b)"),  # chown -R / --recursive
+    re.compile(r"\bdd\b"),                                 # dd (raw block-device copy)
+    re.compile(r"\bmkfs(?:\.\w+)?\b"),                     # mkfs / mkfs.ext4 / …
+    re.compile(r"\btruncate\b"),                           # truncate -s …
+    # Classic fork bomb, whitespace-tolerant: :(){ :|:& };:
+    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&?\s*\}\s*;\s*:"),
+)
+
+
+def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
+    """Whether *stripped_command* — already put through
+    `is_tier3_dangerous_for_lethality`'s quote-mask / `/dev/null` / contained-
+    redirect strips — matches a verb this module proves dangerous regardless
+    of its target (cpp#205 case a): the union of every `TIER3_PATTERNS` entry
+    EXCEPT its own trailing generic-redirect catch-all
+    (`_TIER3_VERB_PATTERNS_FOR_LETHALITY`), plus the new verbs enumerated in
+    `_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205`. Never consulted by the REFUSAL
+    path (`is_tier3_dangerous`); LETHALITY only."""
+    return any(
+        p.search(stripped_command)
+        for p in (
+            *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
+            *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+        )
+    )
+
+
 # DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
 #
 # Applies per senara-solutions/mika @
@@ -736,8 +836,28 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
     one function, and `_denial_is_terminal` is the single consumer — cpp#151 B0
     collapsed three separate lethality computations into one precisely so two
     notions of "fatal" could not drift apart; cpp#203 keeps that invariant.
+
+    cpp#205 (case a): the FINAL pattern-match step no longer runs
+    `is_tier3_dangerous` (the full `TIER3_PATTERNS`, refusal-facing) on the
+    stripped text. It runs `_matches_proven_dangerous_lethality_verb`
+    instead — `TIER3_PATTERNS` MINUS its own trailing generic-redirect
+    catch-all (deferred to the cwd-aware destination-veto calls in
+    `_denial_is_terminal`, which can actually prove a redirect target safe or
+    unsafe — see `_TIER3_VERB_PATTERNS_FOR_LETHALITY`'s block comment) PLUS the
+    new verbs enumerated in `_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205`
+    (`chmod -R`/`chown -R`/`dd`/`mkfs`/`truncate`/fork-bomb — measured
+    ALREADY non-terminal pre-cpp#205, an under-terminal gap this closes). The
+    four strips above are unchanged and still run unconditionally: they are
+    inert for the new verb patterns (none of them contains `<`/`>`, `/dev/
+    null`, or a redirect target) and remain load-bearing for `sed -i`
+    (cpp#203) and for the verb-only patterns that DO carry `<`/`>` characters
+    (`<(`, `>(`, still quote-masked per cpp#157). This function's name and
+    signature (`(command: str) -> bool`, no `cwd`) are unchanged; only what it
+    proves at the end is retargeted from "the full tier3 denylist minus two
+    narrow target carve-outs" to "the proven-danger verb set minus the one
+    entry that names a provable target."
     """
-    return is_tier3_dangerous(
+    return _matches_proven_dangerous_lethality_verb(
         _strip_contained_redirects(
             _STDOUT_DEVNULL_RE.sub(
                 " ", _SED_I_DEVNULL_RE.sub(" ", _mask_quoted_redirect_chars(command))
