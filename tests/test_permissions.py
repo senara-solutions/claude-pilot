@@ -1812,3 +1812,193 @@ def test_cpp201_non_reopening_cpp195_cpp154_ac4(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#203 — `sed -i` targeting the inert /dev/null sink: SURVIVABLE, not
+# terminal (scope B residue of mika#1686 comment 5844642872)
+#
+# mika#1686's dossier of 4 deny-deaths named instance #1 (pilot session
+# b669ac5c, mika#2532 impl) as the ONE still-terminal residue on HEAD 9ab3c13:
+#     sed -i 's/.../ X/' /dev/null; grep -n "created_by_session" crates/m.rs
+# Probe: `policy.evaluate` = allow(rule_id=bash-grep) — the grep is innocent
+# and first-matches — but `_denial_is_terminal` = True. The `sed -i` segment
+# alone, targeting a no-op device, kills the session (error_during_execution:
+# after_deny, turn 62). Scope B, lethality only: the command stays REFUSED;
+# only whether the refusal ends the run changes, and only for `sed -i` (or
+# any tier3-lethal write-verb `is_tier3_dangerous_for_lethality` flags)
+# against a PROVEN-HARMLESS target (`/dev/null`, cpp#130's existing
+# recognition, reused verbatim — no new admission, no YAML change).
+# ────────────────────────────────────────────────────────────────────────────
+
+_MIKA_2532_EXACT_INCIDENT = (
+    'sed -i \'s/.../ X/\' /dev/null; grep -n "created_by_session" crates/m.rs'
+)
+
+
+def test_cpp203_denial_is_terminal_mika_2532_replay_survivable(
+    tmp_path: Path,
+) -> None:
+    """Positive — the exact mika#1686/mika#2532 incident command, verbatim.
+    Must become NON-terminal (survivable): the pilot receives the deny and
+    the session continues, free to drop the no-op and keep the grep. Red-
+    before this fix (measured `True` on pre-fix HEAD 9ab3c13)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2532_EXACT_INCIDENT}, wt
+        )
+        is False
+    )
+
+
+def test_cpp203_denial_is_terminal_sed_i_devnull_alone_survivable(
+    tmp_path: Path,
+) -> None:
+    """Positive — the `sed -i` segment alone, isolating the fix from the
+    trailing innocent `grep`: `sed -i 's/a/b/' /dev/null` on its own must be
+    survivable."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed -i 's/a/b/' /dev/null"}, wt
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Real, out-of-worktree target — a genuine write, stays terminal.
+        "sed -i 's/a/b/' /etc/passwd",
+        # Real in-worktree target — also a genuine write, stays terminal.
+        "sed -i 's/a/b/' realfile.rs",
+        # cpp#154 D3 non-reopening: $HOME-as-~-respelling must NOT flip just
+        # because this ticket touches the same lethality path.
+        "sed -i 's/a/b/' $HOME/.bashrc",
+        # A second, real target alongside /dev/null is a genuine write.
+        "sed -i 's/a/b/' /dev/null realfile.rs",
+        # /dev/null lookalikes stay fatal (cpp#130's own trailing-boundary
+        # edges, reused verbatim).
+        "sed -i 's/a/b/' /dev/nullified",
+        "sed -i 's/a/b/' /dev/null/../etc/passwd",
+        # Unrelated tier3-dangerous verbs, unaffected by this narrow carve.
+        # (`chmod` is not itself a TIER3_PATTERNS/write-kind entry on this
+        # HEAD — measured `False` pre-fix too — so it is not a valid negative
+        # here and is intentionally not included.)
+        "rm -rf x",
+        "git push --force origin main",
+        "bash -c 'id'",
+    ],
+)
+def test_cpp203_negative_stays_terminal(cmd: str, tmp_path: Path) -> None:
+    """Negative — both-directions proof. Nothing that was terminal before
+    this fix stops being terminal: no widening of admission, no widening of
+    the /dev/null recognition, and the class of tier3-dangerous commands
+    this ticket does not touch is unaffected."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp203_handler_end_to_end_still_denied_but_survivable(
+    tmp_path: Path,
+) -> None:
+    """Handler-level proof, mirroring
+    `test_cpp201_handler_end_to_end_still_denied_but_survivable`: the exact
+    mika#1686/mika#2532 incident command is REFUSED (never executed) AND
+    non-terminal through the real `can_use_tool` callback — not merely at
+    the unit level. A real-target control on the SAME `sed -i` verb stays
+    refused AND terminal, proving the fix narrows lethality only, not
+    admission."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = _bundled_handler(cwd=str(worktree))
+
+    result = asyncio.run(
+        handler("Bash", {"command": _MIKA_2532_EXACT_INCIDENT}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny), (
+        "the sed -i /dev/null must STILL be refused — no widening of what "
+        "is admitted"
+    )
+    assert result.interrupt is False, (
+        "the refusal must be survivable — this is the real mika#1686/"
+        "mika#2532 incident command, replayed verbatim"
+    )
+
+    real_target_control = asyncio.run(
+        handler(
+            "Bash",
+            {"command": "sed -i 's/a/b/' /etc/passwd"},
+            _mock_ctx(),
+        )
+    )
+    assert isinstance(real_target_control, PermissionResultDeny)
+    assert real_target_control.interrupt is True, (
+        "the SAME verb, against a REAL target instead of /dev/null, stays "
+        "terminal"
+    )
+
+
+def test_cpp203_non_reopening_cpp154_d3_cpp196_cpp201(tmp_path: Path) -> None:
+    """Non-reopening smoke: cpp#154 D3's `$HOME`-as-`~`-respelling invariant,
+    cpp#196's /tmp git-show-redirect carve-out, and cpp#201's mktemp-scratch
+    carve-out are untouched by this ticket — `_SED_I_DEVNULL_RE` is a new,
+    independent narrowing keyed on `sed -i`'s own file argument (no `<`/`>`
+    character involved at all), disjoint from every redirect-based check
+    those three tickets touch. Full suites for cpp#128/#130/#151/#154/#155/
+    #157/#166/#176/#195/#196/#201 are unmodified and pass unchanged (see the
+    plan doc's full-suite run)."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    # cpp#154 D3: $HOME/$OLDPWD/$(...)/bare-$ respellings of `~` stay
+    # terminal — unaffected by anything this ticket's sed-i carve touches.
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "echo hi > $HOME/.ssh/authorized_keys"}, wt
+        )
+        is True
+    )
+    # cpp#196: the /tmp git-show-redirect carve-out is still non-terminal.
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash",
+            {
+                "command": (
+                    "git show origin/main:crates/mika-common/src/home.rs "
+                    "> /tmp/ck_home_main.rs 2>/dev/null || true"
+                )
+            },
+            wt,
+        )
+        is False
+    )
+    # cpp#201: the mktemp-scratch heredoc/redirect carve-out is still
+    # non-terminal.
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash",
+            {
+                "command": (
+                    'T=$(mktemp -d) ; cat >"$T/log" <<\'EOF\'\n'
+                    '{"event":"turn_usage"}\nEOF'
+                )
+            },
+            wt,
+        )
+        is False
+    )

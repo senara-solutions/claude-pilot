@@ -1342,6 +1342,111 @@ class TestTier3DevnullRedirectLethality:
         assert is_tier3_dangerous_for_lethality("ls >/dev/nullified") is True
 
 
+class TestTier3SedIDevnullLethality:
+    """cpp#203 (mika#1686 comment 5844642872, deny-death instance #1): `sed -i`
+    against the inert /dev/null sink stays REFUSED but is no longer session-
+    fatal. `is_tier3_dangerous` (the refusal classifier) is unchanged;
+    `is_tier3_dangerous_for_lethality` (consulted only by `_denial_is_terminal`)
+    drops a `sed -i <script>? /dev/null` invocation before the pattern check —
+    a NEW narrowing, distinct from cpp#130's redirect-target strip: `/dev/null`
+    here is `sed -i`'s own file argument, not a shell redirect target, so no
+    `<`/`>` character is involved at all.
+    """
+
+    _EXACT_INCIDENT = (
+        "sed -i 's/.../ X/' /dev/null; grep -n \"created_by_session\" crates/m.rs"
+    )
+
+    def test_exact_incident_replay_still_refused(self) -> None:
+        # Invariant kept: the REFUSAL classifier is untouched. cpp#203 does not
+        # widen any allow-list — the command stays tier3-dangerous.
+        assert is_tier3_dangerous(self._EXACT_INCIDENT) is True
+        assert is_tier3_dangerous("sed -i 's/a/b/' /dev/null") is True
+
+    def test_exact_incident_replay_not_lethal(self) -> None:
+        # Positive, red-before-this-fix: the exact mika#1686/mika#2532 incident
+        # command — `sed -i` to /dev/null followed by an innocent grep — must
+        # stop being session-fatal. Measured `True` on pre-fix HEAD.
+        assert is_tier3_dangerous_for_lethality(self._EXACT_INCIDENT) is False
+
+    def test_sed_i_devnull_alone_not_lethal(self) -> None:
+        # Positive, isolating the `sed -i` segment itself from the trailing
+        # `grep` — the narrowing is keyed on `sed -i`'s own target, not on
+        # anything downstream in the chain.
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/null") is False
+        assert is_tier3_dangerous_for_lethality("sed -i s/a/b/ /dev/null") is False
+        assert is_tier3_dangerous_for_lethality('sed -i "s/a/b/" /dev/null') is False
+
+    def test_real_target_stays_lethal(self) -> None:
+        # Negative, both directions: a `sed -i` against a REAL file — in the
+        # worktree, under /tmp, or truly out-of-worktree — is a genuine write
+        # and stays fatal. Nothing about the write DESTINATION here is proven
+        # harmless, unlike /dev/null.
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /etc/passwd") is True
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' realfile.rs") is True
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /tmp/x") is True
+        # cpp#154 D3 non-reopening: $HOME-as-~-respelling stays terminal.
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i 's/a/b/' $HOME/.bashrc") is True
+        )
+
+    def test_second_real_target_stays_lethal(self) -> None:
+        # A second, real file operand alongside /dev/null is a genuine write —
+        # the carve requires /dev/null to be the ONLY target sed -i receives.
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/null realfile.rs")
+            is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i 's/a/b/' realfile.rs /dev/null")
+            is True
+        )
+
+    def test_devnull_lookalike_escape_stays_lethal(self) -> None:
+        # Same trailing-boundary lookahead cpp#130 already uses for redirects,
+        # reused verbatim (no new /dev/null recognition invented, per scope B).
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/nullified")
+            is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/null.txt")
+            is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality(
+                "sed -i 's/a/b/' /dev/null/../etc/passwd"
+            )
+            is True
+        )
+
+    def test_danger_alongside_sed_i_devnull_stays_lethal(self) -> None:
+        # The strip removes only the `sed -i … /dev/null` text it matched; a
+        # dangerous verb elsewhere in the same compound command still matches
+        # and stays fatal.
+        assert (
+            is_tier3_dangerous_for_lethality(
+                "sed -i 's/a/b/' /dev/null && rm -rf /tmp/y"
+            )
+            is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality(
+                "rm -rf /tmp/y; sed -i 's/a/b/' /dev/null"
+            )
+            is True
+        )
+
+    def test_backup_suffix_glued_to_flag_stays_lethal(self) -> None:
+        # Documented scope limit: a backup-suffix flag glued directly to `-i`
+        # (`-i.bak`) has no whitespace before the script/target, so this
+        # narrowing's shape does not match it — fails closed, stays lethal.
+        # Not the mika#1686 incident shape; left un-widened deliberately.
+        assert (
+            is_tier3_dangerous_for_lethality("sed -i.bak 's/a/b/' /dev/null") is True
+        )
+
+
 class TestTier3ContainedRedirectLethality:
     """cpp#154: a redirect whose LITERAL target is contained — under `/tmp/` or
     relative to the worktree — stays REFUSED but is no longer session-fatal.
