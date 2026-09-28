@@ -1154,9 +1154,17 @@ async def test_cpp177_text_only_turn_with_no_tool_result_still_dies_at_idle_time
 
 @pytest.mark.asyncio
 async def test_returning_to_idle_restores_the_tighter_idle_budget() -> None:
-    """A session that leaves a wait must go back onto the 300s budget, not stay
-    on the generous ceiling. Without this, a session stuck in AWAITING_MODEL
-    would look identical to a healthy one for fifteen minutes."""
+    """A session that leaves a wait must go back onto the tighter idle budget,
+    not stay on the generous ceiling. Without this, a session stuck in
+    AWAITING_MODEL would look identical to a healthy one for fifteen minutes.
+
+    cpp#219: what the budget-restoration is asserted THROUGH changed. The next
+    turn began (`message_start`) and then froze before `message_stop` — a turn
+    still OPEN — so the reason is now `stream_stalled`, not `idle_timeout`. The
+    invariant this test exists for is the TIMING: it dies at the ~40ms idle
+    budget (well inside the 2.0s wait), not at the 10s model ceiling. The idle
+    budget was restored; only the classification of the resulting death is more
+    precise (a mid-turn stall, not a genuine idle)."""
     guardrails = SessionGuardrails(
         _idle_config(idle_ms=40, tool_ceiling_ms=10_000, model_ceiling_ms=10_000)
     )
@@ -1169,9 +1177,198 @@ async def test_returning_to_idle_restores_the_tighter_idle_budget() -> None:
 
     reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
 
-    assert reason.guardrail == "idle_timeout", (
-        "back in IDLE, silence is silence again and the 300s budget applies"
+    # cpp#219: the turn is OPEN (message_start, no message_stop) → a mid-turn
+    # stall. Dying inside the 2.0s wait proves the tight idle budget applies
+    # again, not the 10s model ceiling — the point of this test.
+    assert reason.guardrail == "stream_stalled", (
+        "back in IDLE with the turn still open, a freeze is a mid-turn stall at "
+        "the same idle budget — not the generous model ceiling"
     )
+    guardrails.dispose()
+
+
+# ── cpp#219 volet 1: mid-turn stall classified `stream_stalled`, not idle ────
+#
+# The IDLE state (`_wait_state`) conflated two populations: a turn that CLOSED
+# with nobody outstanding (genuine idle) and a turn still OPEN (`message_start`
+# seen, no `message_stop`) that froze mid-generation. Both reached the idle
+# watchdog as IDLE and both aborted `idle_timeout`, laundering four measured
+# mid-turn deaths (incl. the 2026-09-27 10:13Z silent death) into a reason
+# indistinguishable from a real idle. Volet 1 splits ONLY the reason and the
+# surfaced detail — the TIMING is unchanged (both fire at `idleTimeoutMs`), no
+# new ceiling — and is fail-safe: only a clearly-open turn is reclassified.
+
+
+@pytest.mark.asyncio
+async def test_ac1_mid_turn_stall_aborts_as_stream_stalled_not_idle_timeout() -> None:
+    """AC1: a turn OPENS (`message_start`) and its first content block starts
+    (`content_block_start`), then NO `message_stop` arrives and the session goes
+    silent past `idleTimeoutMs` with nobody outstanding. That is a hung
+    generation, not idleness — abort `stream_stalled`, NOT `idle_timeout`."""
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=10_000, model_ceiling_ms=10_000)
+    )
+    guardrails.note_stream_activity("message_start")
+    guardrails.note_stream_activity("content_block_start")
+    # No message_stop; the turn is still open.
+    assert guardrails._wait_state is _WaitState.IDLE
+    assert guardrails._turn_open is True
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "stream_stalled", (
+        "an open turn that froze mid-generation is a mid-turn stall, not idle"
+    )
+    assert reason.api_error_status is None
+    # The detail must NAME it a mid-turn stall so it is not silent (cpp#219).
+    assert "Mid-turn stall" in reason.detail
+    assert "turn still OPEN" in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac2_genuine_idle_turn_closed_by_message_stop_is_idle_timeout() -> None:
+    """AC2, direction 1: a turn that CLOSED — last event is `message_stop` — with
+    nobody outstanding is a genuine idle. Abort `idle_timeout`, unchanged. This
+    is the negative control that proves the split does not over-reclassify: the
+    same silence, but the turn is closed, so the reason must stay `idle_timeout`.
+    """
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=10_000, model_ceiling_ms=10_000)
+    )
+    guardrails.note_stream_activity("message_start")
+    guardrails.note_stream_activity("content_block_start")
+    guardrails.note_stream_activity("content_block_stop")
+    guardrails.note_stream_activity("message_stop")  # the turn ENDED
+    assert guardrails._wait_state is _WaitState.IDLE
+    assert guardrails._turn_open is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout", (
+        "a closed turn with nobody outstanding is a genuine idle, unchanged"
+    )
+    assert "Mid-turn stall" not in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac2_genuine_idle_nothing_since_start_is_idle_timeout() -> None:
+    """AC2, direction 2: nothing was ever observed — no `message_start` at all —
+    so no turn is open. A genuine idle, aborts `idle_timeout` unchanged."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    assert guardrails._turn_open is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert "Mid-turn stall" not in reason.detail
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_open_turn_awaiting_tool_stays_on_tool_ceiling_not_reclassified() -> None:
+    """AC3 (non-regression): a stall while a tool is outstanding must die on the
+    TOOL ceiling as `awaiting_tool`, never reclassified `stream_stalled` —
+    even though the turn is open. `_wait_state` is AWAITING_TOOL, so the IDLE
+    branch (where the split lives) is never reached."""
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=20, model_ceiling_ms=10_000)
+    )
+    guardrails.note_stream_activity("message_start")  # turn open
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    assert guardrails._turn_open is True
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_tool", (
+        "an outstanding tool owns the silence — its own ceiling, its own reason"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac3_open_turn_awaiting_model_stays_on_model_ceiling_not_reclassified() -> None:
+    """AC3 (non-regression): a stall while awaiting the next turn's first token
+    dies on the MODEL ceiling as `awaiting_model`, not `stream_stalled`."""
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=40, tool_ceiling_ms=10_000, model_ceiling_ms=20)
+    )
+    guardrails.note_stream_activity("message_start")  # turn open
+    guardrails.on_assistant_message([_tool(name="Edit")], message_id="msg_1")
+    guardrails.note_activity()  # tool result → opens the model-wait window
+    assert guardrails._wait_state is _WaitState.AWAITING_MODEL
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "awaiting_model"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac4_stream_stalled_fires_at_the_same_idle_deadline_no_new_ceiling() -> None:
+    """AC4: TIMING unchanged. `stream_stalled` fires at the SAME `idleTimeoutMs`
+    deadline a genuine idle would — this volet adds NO new ceiling. Proven two
+    ways: (1) the mid-turn stall survives a fraction of the idle budget just as
+    idle does (not killed instantly), and (2) generous tool/model ceilings (10s)
+    do NOT hold it — it dies inside the ~40ms idle budget, so the deadline it
+    fired at was the idle one, not some new or borrowed ceiling."""
+    idle_ms = 60
+    guardrails = SessionGuardrails(
+        _idle_config(idle_ms=idle_ms, tool_ceiling_ms=10_000, model_ceiling_ms=10_000)
+    )
+    guardrails.note_stream_activity("message_start")  # turn open, frozen
+
+    # (1) still alive at half the idle budget — same shape as a genuine idle.
+    await asyncio.sleep(idle_ms / 1000.0 / 2)
+    assert guardrails.aborted is False, (
+        "stream_stalled must not fire early — it waits the full idle budget, "
+        "exactly as idle_timeout does"
+    )
+
+    # (2) dies at the idle deadline despite the 10s tool/model ceilings.
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+    assert reason.guardrail == "stream_stalled"
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_failsafe_content_deltas_without_message_start_fall_back_to_idle() -> None:
+    """AC5 (fail-safe): the turn-open signal is keyed STRICTLY on the
+    `message_start`↔`message_stop` boundary. If content deltas arrive but no
+    `message_start` was ever observed (a missed/unrelayed boundary — an
+    ambiguous turn state), the classifier must NOT guess `stream_stalled`; it
+    falls back to `idle_timeout` (the prior behaviour). A death is never MISSED,
+    only a CLEARLY open turn is reclassified."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    # Deltas without a message_start: turn-open was never established.
+    guardrails.note_stream_activity("content_block_delta")
+    guardrails.note_stream_activity("content_block_delta")
+    assert guardrails._turn_open is False, "no message_start ⇒ turn-open unknown"
+    assert guardrails._wait_state is _WaitState.IDLE
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout", (
+        "ambiguous turn state falls back to idle_timeout — never a missed death"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ac5_failsafe_None_event_type_does_not_open_a_turn() -> None:
+    """AC5 (fail-safe): an older caller passing `None` (no SSE name) is treated
+    as production for the model-wait window but must NOT open a turn — the
+    turn-open signal requires the explicit `message_start` name. A later stall
+    stays `idle_timeout`, unchanged."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+    guardrails.note_stream_activity()  # None event_type — legacy caller
+    assert guardrails._turn_open is False
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
     guardrails.dispose()
 
 
