@@ -334,6 +334,18 @@ class SessionGuardrails:
         # mika#2029 take six rounds to read.
         self._last_signal: str | None = None
         self._window_stream_count: int = 0
+        # cpp#219 (volet 1): is a turn OPEN right now? A turn is open between its
+        # `message_start` and its `message_stop`. Keyed on the message boundary
+        # (robust to multiple content blocks within a turn), NOT on
+        # content_block events, and set ONLY by those two raw SSE names in
+        # `note_stream_activity`. Read by `_idle_watchdog`: when the idle budget
+        # expires in the IDLE state, an OPEN turn means the generation froze
+        # mid-turn (`stream_stalled`) rather than the session going genuinely
+        # idle (`idle_timeout`). Same timing either way — this only splits the
+        # reason. False until a `message_start` is observed (fail-safe: a state
+        # that is not clearly open falls back to `idle_timeout`, so a death is
+        # never missed, only a clear stall is renamed).
+        self._turn_open: bool = False
         # cpp#185 D1: cache usage for the CURRENT (in-progress) turn. Unlike
         # `_current_turn_text_len` these do NOT accumulate across
         # continuation blocks — `cache_read_input_tokens` /
@@ -540,6 +552,18 @@ class SessionGuardrails:
             # on. Outstanding tools are untouched: they are counted, not stated.
             self._awaiting_model = False
             self._model_wait_started_at = None
+        # cpp#219 (volet 1): track whether a turn is OPEN, keyed on the turn
+        # boundary (`message_start` opens it, `message_stop` closes it), not on
+        # content_block events — so it is robust to a turn with several content
+        # blocks. Only these two raw SSE names move it; every other event
+        # (`content_block_*`, `message_delta`, or `None` from an older caller)
+        # leaves it as-is. This is the signal that lets `_idle_watchdog`
+        # separate a mid-turn stall (turn open, frozen) from a genuine idle
+        # (turn closed) WITHOUT changing when either aborts.
+        if event_type == "message_start":
+            self._turn_open = True
+        elif event_type == "message_stop":
+            self._turn_open = False
         self._bump_idle_deadline()
 
     def note_activity(self, tool_results: int = 1) -> None:
@@ -1069,6 +1093,29 @@ class SessionGuardrails:
         session_total = (
             f"{self._stream_activity_count} content stream events this session"
         )
+        # cpp#219 (volet 1): the IDLE state conflated two populations — a turn
+        # that CLOSED (nobody outstanding, genuinely idle) and a turn still OPEN
+        # (`message_start` seen, no `message_stop`) that froze mid-generation.
+        # Same idle budget expired here for both; split only the NAME and the
+        # detail so a mid-turn stall stops laundering into `idle_timeout` (the
+        # reason the 2026-09-27 10:13Z death was indistinguishable from a real
+        # idle). TIMING IS UNCHANGED: this branch is reached at exactly the same
+        # `idleTimeoutMs` deadline as `idle_timeout`; no new ceiling. Fail-safe:
+        # only a CLEARLY open turn is reclassified — any other state falls back
+        # to `idle_timeout` (the prior behaviour), so a death is never missed.
+        if self._turn_open:
+            detail = (
+                f"Mid-turn stall: silent for {secs}s with the turn still OPEN "
+                f"(a content block left open — `message_start` seen, no "
+                f"`message_stop`), only pings on the wire "
+                f"(progress=False, excluded from the deadline reset) since the "
+                f"last {self._last_signal or 'stream event'}; nobody outstanding "
+                f"(waiting: none) — {self._window_stream_count} content stream "
+                f"events in this window, {session_total}. This is a hung "
+                f"generation, not idleness (cpp#219)."
+            )
+            self._abort("stream_stalled", detail)
+            return
         if self._last_signal is None:
             detail = f"No meaningful progress for {secs}s: nothing observed since the session started ({session_total})"
         else:
@@ -1185,6 +1232,9 @@ class SessionGuardrails:
             # cpp#185 D1: the prompt cache is dead — see the module docstring
             # above `PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS`.
             "prompt_cache_dead",
+            # cpp#219: a mid-turn stall (turn OPEN, frozen mid-generation).
+            # Same idle budget as `idle_timeout`; see `_idle_watchdog`.
+            "stream_stalled",
         ],
         detail: str,
     ) -> None:

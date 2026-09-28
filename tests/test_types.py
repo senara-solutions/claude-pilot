@@ -113,8 +113,11 @@ def test_guardrail_config_wait_ceiling_bounds() -> None:
 def test_guardrail_abort_reason_accepts_the_wait_vocabulary() -> None:
     """cpp#145: `awaiting_tool` / `awaiting_model` are part of the wire
     vocabulary that reaches `ResultJson.subtype`. Pinned so the two Literal
-    unions (here and in `SessionGuardrails._abort`) cannot drift apart."""
-    for reason in ("awaiting_tool", "awaiting_model"):
+    unions (here and in `SessionGuardrails._abort`) cannot drift apart.
+
+    cpp#219: `stream_stalled` (mid-turn stall) joins that vocabulary the same
+    way — it must parse, so a consumer reading `subtype` never rejects it."""
+    for reason in ("awaiting_tool", "awaiting_model", "stream_stalled"):
         parsed = GuardrailAbortReason.model_validate(
             {"guardrail": reason, "turns": 3, "detail": "d"}
         )

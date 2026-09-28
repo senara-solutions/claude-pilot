@@ -211,11 +211,15 @@ class ResultJson(BaseModel):
           first token, and the wait outlived its ceiling),
           "watchdog_error" (cpp#168 — the `_idle_watchdog` task itself raised
           an unexpected exception; see `GuardrailAbortReason.guardrail` below),
-          and "prompt_cache_dead" (cpp#185 D1 — 3 consecutive turns with
+          "prompt_cache_dead" (cpp#185 D1 — 3 consecutive turns with
           `cache_read_input_tokens==0` and a substantial
           `cache_creation_input_tokens`; defense-in-depth, kept even after
-          the #2313 root cause was fixed upstream). This list was absent
-          before cpp#145 and had been silently stale since cpp#119.
+          the #2313 root cause was fixed upstream), and "stream_stalled"
+          (cpp#219 — a MID-TURN stall: the idle budget expired with the turn
+          still OPEN, i.e. a hung generation, split out of `idle_timeout` at
+          the SAME budget so it stops laundering into a genuine idle). This
+          list was absent before cpp#145 and had been silently stale since
+          cpp#119.
         - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
           — see SDK_TERMINATION_SUBTYPES in agent.py.
         - "transport_message_too_large" (cpp#187) — the bundled SDK's line-
@@ -284,6 +288,23 @@ class GuardrailAbortReason(BaseModel):
     # operator response (a genuinely silent model vs. a bug in the watchdog
     # itself), and collapsing them back into `idle_timeout` would hide exactly
     # the population this hardening exists to make visible.
+    # cpp#219 (volet 1): `stream_stalled` splits a MID-TURN STALL out of
+    # `idle_timeout`, the same way `awaiting_tool`/`awaiting_model` split the
+    # two WAITING states out of it. The IDLE bucket conflated two populations:
+    # a turn that CLOSED with nobody outstanding (genuine idle) and a turn that
+    # is still OPEN (`message_start` seen, no `message_stop`) and froze
+    # mid-generation — a content block left open, only `progress=False` pings
+    # on the wire. Both reach the idle watchdog as IDLE, and both used to abort
+    # `idle_timeout`, which is what laundered four measured mid-turn deaths
+    # (incl. the 2026-09-27 10:13Z silent death) into a reason indistinguishable
+    # from a real idle. TIMING IS UNCHANGED: `stream_stalled` fires at the SAME
+    # `idleTimeoutMs` (480s post-cpp#214a) — this volet changes the NAME and the
+    # surfaced detail, not WHEN a session is killed, and adds no new ceiling.
+    # Fail-safe: only a clearly-open turn is reclassified; any ambiguity falls
+    # back to `idle_timeout` (the prior behaviour), so a death is never MISSED,
+    # only a clear stall is renamed. Additive in the same sense as the reasons
+    # above; the operator-facing severity-tiered surfacing (mika#1381) is a
+    # separate mika-side consumer of this reason.
     # cpp#185 D1: `prompt_cache_dead` — defense-in-depth for a sandboxed
     # session whose prompt cache stopped being read (`cache_read_input_tokens
     # == 0` for 3 consecutive turns each with a substantial
@@ -301,6 +322,7 @@ class GuardrailAbortReason(BaseModel):
         "awaiting_model",
         "watchdog_error",
         "prompt_cache_dead",
+        "stream_stalled",
     ]
     turns: int
     detail: str
