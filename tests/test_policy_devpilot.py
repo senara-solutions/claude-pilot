@@ -2690,3 +2690,47 @@ class TestCeScratchCanonicalPreambleLethality:
         result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
         assert isinstance(result, PermissionResultDeny)
         assert result.interrupt is True                   # last-wins → non-scratch → fatal
+
+
+# ── cpp#224: make the axis-A ADMISSION last-wins (TIGHTENING) ──────────────────
+#
+# Pre-existing defect (found during cpp#223): axis-A recognition
+# (`_ce_scratch_variable_names` → `_is_ce_scratch_variable_ref` →
+# `_is_sanctioned_tmp_scratch`) admitted a var if ANY same-command assignment
+# rooted at /tmp scratch — NOT last-wins. So `X=/tmp/ok; X=$HOME/evil; mkdir
+# "$X"` was ADMITTED (veto None) + SURVIVABLE, even though `$X`'s EFFECTIVE
+# (last) value is `$HOME/evil`. cpp#224 makes recognition last-wins: a var is
+# ce-scratch ONLY if its LAST same-command assignment roots at scratch. This
+# CLOSES an admission (tightening) — no new admission, no bearing. The LETHALITY
+# path (transitive carve, cpp#223) is untouched.
+class TestCpp224AxisAAdmissionLastWins:
+    def test_reassign_out_of_scratch_now_refused_and_terminal(self, tmp_path) -> None:
+        # THE point of cpp#224. `$X`'s last value is `$HOME/evil` → NOT recognized
+        # → cpp#218 `$`-rooted mkdir veto fires TERMINALLY.
+        cwd = str(tmp_path)
+        cmd = 'X=/tmp/ok; X=$HOME/evil; mkdir -p "$X"'
+        # refused (admission side, for_lethality=False)
+        assert _destination_veto_reason(cmd, cwd, for_lethality=False) is not None
+        # and terminal (lethality side) — the transitive carve does NOT rescue it
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is True
+
+    def test_scratch_to_scratch_reassign_still_admitted(self, tmp_path) -> None:
+        # last-wins must NOT over-tighten a scratch→scratch reassignment: `$X`'s
+        # last value is still /tmp scratch → recognized → not vetoed, survivable.
+        cwd = str(tmp_path)
+        cmd = 'X=/tmp/ok; X=/tmp/still-ok; mkdir "$X"'
+        assert _destination_veto_reason(cmd, cwd, for_lethality=False) is None
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)   # compound → default-deny
+        assert result.interrupt is False                  # but admitted → survivable
+
+    def test_single_scratch_assignment_stays_admitted(self, tmp_path) -> None:
+        # The kept POSITIVES: a single scratch assignment is unaffected.
+        cwd = str(tmp_path)
+        cmd = 'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
+        assert _destination_veto_reason(cmd, cwd, for_lethality=False) is None
+        assert _destination_veto_reason('S="/tmp/ce-$UID"; mkdir "$S"', cwd) is None
