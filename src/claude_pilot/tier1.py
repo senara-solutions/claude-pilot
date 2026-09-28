@@ -2643,3 +2643,149 @@ def is_within_project(file_path: str, cwd: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# ── cpp#213: designated `.pilot-scratch/` carve-out for rm/rmdir LETHALITY ───
+#
+# Sibling of the cpp#201/#209 mktemp lethality carve, applied to the `rm`/
+# `rmdir` VERB under one designated, dispatch-managed prefix. cpp#205 case (a)
+# ratified that destructive verbs stay TERMINAL "regardless of target" — which
+# is right for `rm -rf` pointed at an arbitrary path, but killed pilots that
+# `rm -rf`'d their OWN scratch directory inside the worktree (mika#2054 pilot
+# 83db3a82 `rm -rf verif-2054-redcheck`; mika#2544 pilot cbdd3f5b
+# `rm -rf .t2544 && git status`). Dispatch (mika#2548 / PR mika#2550) now
+# pre-creates a git-excluded `.pilot-scratch/` (emptied each run) and forbids
+# `rm` on it in the prompt; this is the classifier half. It flips the LETHALITY
+# of exactly that shape from terminal to survivable — the command is STILL
+# refused (admission is byte-identical: `is_tier3_dangerous`,
+# `is_tier1_auto_approve`, and every YAML rule are untouched, and none of these
+# functions is consulted by any of them), it just no longer ends the run, so
+# the pilot routes around the refusal instead of dying on it.
+#
+# The prefix is resolved fs-aware against the SESSION worktree (`cwd`), the SAME
+# way `is_within_project` resolves containment — NOT a substring match. Every
+# fail-closed direction below keeps the command TERMINAL, matching cpp#213's
+# hard boundary that this only ever flips terminal→survivable, never
+# refused→allowed.
+
+
+def is_within_pilot_scratch(target: str, cwd: str) -> bool:
+    """Whether *target* resolves strictly under ``<cwd>/.pilot-scratch/`` (or is
+    that directory itself), resolved symlink-aware exactly like
+    ``is_within_project`` (cpp#213).
+
+    Fail-CLOSED (returns ``False``, i.e. the caller keeps the command terminal)
+    for every operand cpp#213 must reject:
+
+    - an ABSOLUTE path — rejected outright before any resolve, even one that
+      happens to name the real scratch dir (the designated idiom is always a
+      worktree-relative operand);
+    - a ``..`` escape — ``Path.resolve`` collapses it, so ``.pilot-scratch/../src``
+      lands at ``<cwd>/src`` and fails ``relative_to`` the scratch root;
+    - an OUTBOUND symlink component — the scratch root is the LITERAL
+      ``<resolved_cwd>/.pilot-scratch`` (never itself resolved through a
+      symlink), while the target IS resolved (``strict=False`` follows symlinks
+      on existing components); a ``.pilot-scratch`` (or any component) that is a
+      symlink pointing outside therefore resolves away from the literal root and
+      fails ``relative_to``;
+    - anything outside the prefix (`src`, `/tmp/x`, `~/…`, `$HOME/…`);
+    - a ``cwd`` that cannot be resolved (git unavailable, cwd outside the repo) —
+      ``Path(cwd).resolve(strict=True)`` raises and we fail closed, the SAME
+      ``OSError`` guard ``is_within_project`` uses.
+
+    The directory itself IS accepted (``relative_to`` treats a path as under
+    itself), matching cpp#213's positive `rm -r .pilot-scratch` case.
+    """
+    if not target:
+        return False
+    if Path(target).is_absolute():
+        return False
+    try:
+        resolved_cwd = Path(cwd).resolve(strict=True)
+    except OSError:
+        return False
+    # LITERAL root — deliberately NOT `.resolve()`d, so a symlinked
+    # `.pilot-scratch` cannot fold an outbound target back under the prefix.
+    scratch_root = resolved_cwd / ".pilot-scratch"
+    resolved = (resolved_cwd / target).resolve(strict=False)
+    try:
+        resolved.relative_to(scratch_root)
+        return True
+    except ValueError:
+        return False
+
+
+_RM_VERBS: frozenset[str] = frozenset({"rm", "rmdir"})
+
+
+def _rm_segment_operands(segment: str) -> list[str] | None:
+    """The positional (non-flag) operands of a bare ``rm``/``rmdir`` *segment*,
+    or ``None`` when *segment* is not such a command or cannot be tokenized
+    (cpp#213).
+
+    ``None`` (fail-closed — the caller keeps the segment, so it stays terminal)
+    when: the segment does not tokenize (unbalanced quotes → ``shlex`` raises),
+    it is empty, or its leading word is not exactly ``rm``/``rmdir`` (a
+    path-qualified ``/bin/rm`` is deliberately not carved — it stays terminal).
+
+    Flags (``-rf``, ``-r``, ``--recursive``, …) are dropped; ``--`` ends option
+    parsing; a lone ``-`` is treated as a flag-like token and dropped. A shell
+    redirect operator that ``shlex`` surfaces as a bare ``>``/``<`` token becomes
+    an ordinary operand here — it is never under the scratch prefix, so the
+    segment is not carved and stays terminal (and `_denial_is_terminal`'s own
+    redirect/destination vetoes run on the full command regardless)."""
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] not in _RM_VERBS:
+        return None
+    operands: list[str] = []
+    end_of_opts = False
+    for tok in tokens[1:]:
+        if not end_of_opts and tok == "--":
+            end_of_opts = True
+            continue
+        if not end_of_opts and tok.startswith("-"):
+            continue
+        operands.append(tok)
+    return operands
+
+
+def rm_confined_to_pilot_scratch(command: str, cwd: str) -> bool:
+    """Whether *command*'s tier3-for-lethality danger is due SOLELY to
+    ``rm``/``rmdir`` segments whose EVERY operand resolves strictly under
+    ``<cwd>/.pilot-scratch/`` (cpp#213).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision. Never touches admission (`is_tier3_dangerous`,
+    `is_tier1_auto_approve`, YAML rules); the command stays refused either way.
+
+    Mechanism mirrors cpp#201's `_strip_contained_redirects`: each ``rm``/
+    ``rmdir`` segment that is FULLY confined to the prefix is removed, and the
+    remainder is re-checked with the unchanged `is_tier3_dangerous_for_lethality`.
+    That re-check is what makes every mixed/chained shape stay terminal without a
+    per-shape carve:
+
+    - a single ``rm`` with a mixed operand list (`rm -rf .pilot-scratch/x /etc/y`)
+      is not fully confined, so it is NOT removed and still matches `rm -rf`;
+    - a confined ``rm`` chained with another destructive verb
+      (`rm -rf .pilot-scratch/x && git reset --hard`) leaves that verb in the
+      remainder, which still fires;
+    - two ``rm``s, one confined one not (`… .pilot-scratch/x && rm -rf /etc`),
+      leaves the unconfined one, which still fires.
+
+    Returns ``False`` (stays terminal) when no segment was confined, or when the
+    remainder is still proven-dangerous. Fail-closed throughout via
+    `is_within_pilot_scratch` and `_rm_segment_operands`."""
+    survivors: list[str] = []
+    carved = False
+    for seg in _split_compound_command(command):
+        operands = _rm_segment_operands(seg)
+        if operands and all(is_within_pilot_scratch(op, cwd) for op in operands):
+            carved = True
+            continue
+        survivors.append(seg)
+    if not carved:
+        return False
+    return not is_tier3_dangerous_for_lethality("\n".join(survivors))

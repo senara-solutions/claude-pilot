@@ -38,6 +38,7 @@ from .tier1 import (
     is_tier3_dangerous,
     is_tier3_dangerous_for_lethality,
     is_within_project,
+    rm_confined_to_pilot_scratch,
 )
 from .transport import invoke_command
 from .types import (
@@ -847,7 +848,28 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # is simply not fatal on its own, because nothing is written and the model
     # can adapt. A genuinely dangerous VERB alongside the redirect stays fatal —
     # the strips remove the redirect, never the verb.
-    if is_tier3_dangerous_for_lethality(command):
+    # cpp#213: a proven-danger match whose ONLY cause is `rm`/`rmdir` segment(s)
+    # pointed WHOLLY under `<cwd>/.pilot-scratch/` — dispatch's pre-created,
+    # git-excluded per-run scratch dir (mika#2548) — is not, on its own, grounds
+    # to end the session. This is the exact sibling of the cpp#201/#209 mktemp
+    # lethality carve, applied to the rm/rmdir verb under a designated prefix.
+    # `rm_confined_to_pilot_scratch` re-runs the unchanged
+    # `is_tier3_dangerous_for_lethality` on the command with those confined
+    # segments removed, so any OTHER proven-danger cause — a mixed operand list
+    # (`rm -rf .pilot-scratch/x /etc/y`), a chained destructive verb
+    # (`… && git reset --hard`), a second unconfined `rm`, a `..` escape, an
+    # outbound symlink, an absolute path, or an unresolvable `cwd` — still
+    # returns True here and stays terminal (fail-closed). It is only consulted
+    # once the command is already proven-danger (short-circuit `and`), so the
+    # common non-dangerous path never pays for the segment scan. The command
+    # stays REFUSED regardless: admission is byte-identical to HEAD
+    # (`is_tier3_dangerous` / `is_tier1_auto_approve` / YAML rules never call
+    # this), only lethality flips. When the carve applies we fall THROUGH to the
+    # redirect/destination vetoes below, which still run on the FULL command, so
+    # a confined `rm` that ALSO redirects out of the worktree is re-armed there.
+    if is_tier3_dangerous_for_lethality(command) and not rm_confined_to_pilot_scratch(
+        command, cwd
+    ):
         return True
     # cpp#154: the narrowing above is deliberately cwd-free and lexical (plan
     # D1), so it cannot tell `> notes.txt` from `> .git/hooks/pre-commit` or

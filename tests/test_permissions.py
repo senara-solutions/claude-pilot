@@ -635,6 +635,120 @@ def test_denial_is_terminal_predicate(tmp_path: Path) -> None:
     assert f("Bash", {"command": ""}, wt) is False
 
 
+def test_cpp213_rm_under_pilot_scratch_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#213: an `rm`/`rmdir` whose operands ALL resolve under
+    ``<worktree>/.pilot-scratch/`` is a SURVIVABLE deny — `_denial_is_terminal`
+    returns ``False`` — while everything else stays terminal, unchanged.
+
+    Sibling of the cpp#201/#209 mktemp lethality carve. The command is still
+    REFUSED (admission is byte-identical — see
+    ``test_cpp213_admission_is_byte_identical_only_lethality_flips``); only the
+    lethality flips.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch" / "x").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    wt = str(worktree)
+
+    # Positive — proven-danger cause is SOLELY rm/rmdir wholly under the prefix,
+    # so the deny is non-terminal.
+    for cmd in (
+        "rm -rf .pilot-scratch/x",
+        "rmdir .pilot-scratch/x",
+        "rm -r .pilot-scratch",
+        "rm .pilot-scratch/f",
+        "rm -rf .pilot-scratch",  # the scratch root itself counts as under it
+        "rm -rf -- .pilot-scratch/x",  # `--` end-of-options
+        "echo hi && rm -rf .pilot-scratch/x",  # harmless prefix + confined rm
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # Negative — any operand outside the prefix, a mixed list, or another
+    # proven-danger cause keeps the deny TERMINAL.
+    for cmd in (
+        "rm -rf ../.pilot-scratch",  # `..` escape upward
+        "rm -rf .pilot-scratch/../src",  # `..` escape back into the worktree
+        "rm -rf /tmp/x",  # absolute path
+        "rm -rf src",  # elsewhere in the worktree
+        "rm -rf ~/.pilot-scratch",  # `~` respelling
+        "rm -rf .pilot-scratch/x /etc/y",  # mixed operands in one rm
+        "rm -rf .pilot-scratch/x && git reset --hard",  # chained destructive verb
+        "rm -rf .pilot-scratch/x && rm -rf /etc",  # a second, unconfined rm
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_cpp213_symlinked_pilot_scratch_pointing_outside_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    """cpp#213 fail-closed: a `.pilot-scratch` that is a symlink OUT of the
+    worktree must not launder an escape. The scratch root is the LITERAL
+    ``<cwd>/.pilot-scratch``, so a target resolved THROUGH the outbound symlink
+    lands outside it and stays terminal.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / ".pilot-scratch").symlink_to(outside, target_is_directory=True)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "rm -rf .pilot-scratch/x"}, str(worktree)
+        )
+        is True
+    )
+
+
+def test_cpp213_unresolvable_cwd_stays_terminal(tmp_path: Path) -> None:
+    """cpp#213 fail-closed: a `cwd` that cannot be resolved (git unavailable,
+    cwd outside the repo) makes the prefix un-computable, so the confined-rm
+    carve never applies and the deny stays terminal.
+    """
+    missing = str(tmp_path / "does-not-exist")
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "rm -rf .pilot-scratch/x"}, missing
+        )
+        is True
+    )
+
+
+def test_cpp213_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#213 sovereign boundary: the ADMISSION verdict for the confined-rm
+    case is byte-identical to HEAD — the command is STILL denied. `rm -rf` is
+    still tier3-dangerous (the REFUSAL classifier), never tier1-auto-approved,
+    and the policy still default-denies it. Only `_denial_is_terminal` flips
+    terminal→survivable. End-to-end the handler returns a non-terminal
+    ``PermissionResultDeny`` — never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch" / "x").mkdir(parents=True)
+    cmd = "rm -rf .pilot-scratch/x"
+
+    # Admission UNCHANGED — none of these consult the cpp#213 lethality carve.
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(
+        _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_containment_escape_is_lethal_on_the_default_deny_route(
     tmp_path: Path,
 ) -> None:
