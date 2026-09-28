@@ -29,6 +29,7 @@ from claude_pilot.tier1 import (
     _mktemp_scratch_variable_names,
     _quote_spans,
     _redirect_targets,
+    _rm_segment_operands,
     _split_compound_command,
     contains_unquoted_metacharacter,
     is_safe_bash_command,
@@ -40,7 +41,9 @@ from claude_pilot.tier1 import (
     is_tier1_auto_approve,
     is_tier3_dangerous,
     is_tier3_dangerous_for_lethality,
+    is_within_pilot_scratch,
     is_within_project,
+    rm_confined_to_pilot_scratch,
 )
 
 
@@ -3675,3 +3678,119 @@ def test_cpp207_admission_identity_unaffected(command: str, tracked_repo: Path) 
         f"cwd)={widened_verdict} — only the bash/sh/./  <tracked-script> class "
         "may ever differ (cpp#207 AC4)"
     )
+
+
+# ── cpp#213: designated `.pilot-scratch/` carve-out for rm/rmdir LETHALITY ────
+
+
+@pytest.fixture
+def scratch_worktree(tmp_path: Path) -> Path:
+    """A real git worktree with a pre-created `.pilot-scratch/` and a sibling
+    `src/`, matching dispatch's mika#2548 layout."""
+    wt = tmp_path / "wt"
+    (wt / ".git").mkdir(parents=True)
+    (wt / ".pilot-scratch" / "x").mkdir(parents=True)
+    (wt / "src").mkdir()
+    return wt
+
+
+class TestIsWithinPilotScratch:
+    def test_relative_target_under_prefix(self, scratch_worktree: Path) -> None:
+        assert is_within_pilot_scratch(".pilot-scratch/x", str(scratch_worktree))
+        assert is_within_pilot_scratch(".pilot-scratch/f", str(scratch_worktree))
+        # the directory itself counts as under itself
+        assert is_within_pilot_scratch(".pilot-scratch", str(scratch_worktree))
+
+    def test_nonexistent_tail_is_still_under_prefix(
+        self, scratch_worktree: Path
+    ) -> None:
+        # a path that does not exist yet still resolves textually under the root
+        assert is_within_pilot_scratch(".pilot-scratch/nope/deep", str(scratch_worktree))
+
+    def test_absolute_path_rejected_outright(self, scratch_worktree: Path) -> None:
+        real = str(scratch_worktree / ".pilot-scratch" / "x")
+        assert is_within_pilot_scratch(real, str(scratch_worktree)) is False
+        assert is_within_pilot_scratch("/tmp/x", str(scratch_worktree)) is False
+
+    def test_dotdot_escape_rejected(self, scratch_worktree: Path) -> None:
+        assert is_within_pilot_scratch("../.pilot-scratch", str(scratch_worktree)) is False
+        assert (
+            is_within_pilot_scratch(".pilot-scratch/../src", str(scratch_worktree))
+            is False
+        )
+
+    def test_elsewhere_in_worktree_rejected(self, scratch_worktree: Path) -> None:
+        assert is_within_pilot_scratch("src", str(scratch_worktree)) is False
+        assert is_within_pilot_scratch("src/foo", str(scratch_worktree)) is False
+
+    def test_tilde_and_empty_rejected(self, scratch_worktree: Path) -> None:
+        assert is_within_pilot_scratch("~/.pilot-scratch", str(scratch_worktree)) is False
+        assert is_within_pilot_scratch("", str(scratch_worktree)) is False
+
+    def test_outbound_symlink_component_rejected(self, tmp_path: Path) -> None:
+        wt = tmp_path / "wt"
+        (wt / ".git").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (wt / ".pilot-scratch").symlink_to(outside, target_is_directory=True)
+        assert is_within_pilot_scratch(".pilot-scratch/x", str(wt)) is False
+
+    def test_unresolvable_cwd_fails_closed(self, tmp_path: Path) -> None:
+        missing = str(tmp_path / "does-not-exist")
+        assert is_within_pilot_scratch(".pilot-scratch/x", missing) is False
+
+
+class TestRmSegmentOperands:
+    def test_rm_flags_stripped(self) -> None:
+        assert _rm_segment_operands("rm -rf .pilot-scratch/x") == [".pilot-scratch/x"]
+        assert _rm_segment_operands("rm -r -f a b") == ["a", "b"]
+        assert _rm_segment_operands("rmdir .pilot-scratch/x") == [".pilot-scratch/x"]
+
+    def test_end_of_options_marker(self) -> None:
+        assert _rm_segment_operands("rm -rf -- -weird") == ["-weird"]
+
+    def test_no_operands(self) -> None:
+        assert _rm_segment_operands("rm -rf") == []
+
+    def test_not_an_rm_command_returns_none(self) -> None:
+        assert _rm_segment_operands("git status") is None
+        assert _rm_segment_operands("echo rm -rf x") is None
+        # path-qualified rm is deliberately not recognized (stays terminal)
+        assert _rm_segment_operands("/bin/rm -rf x") is None
+
+    def test_untokenizable_fails_closed(self) -> None:
+        assert _rm_segment_operands("rm -rf 'unterminated") is None
+
+
+class TestRmConfinedToPilotScratch:
+    def test_confined_rm_is_carved(self, scratch_worktree: Path) -> None:
+        wt = str(scratch_worktree)
+        assert rm_confined_to_pilot_scratch("rm -rf .pilot-scratch/x", wt) is True
+        assert rm_confined_to_pilot_scratch("echo hi && rm -rf .pilot-scratch/x", wt)
+
+    def test_mixed_operands_not_carved(self, scratch_worktree: Path) -> None:
+        assert (
+            rm_confined_to_pilot_scratch(
+                "rm -rf .pilot-scratch/x /etc/y", str(scratch_worktree)
+            )
+            is False
+        )
+
+    def test_chained_danger_not_carved(self, scratch_worktree: Path) -> None:
+        wt = str(scratch_worktree)
+        assert (
+            rm_confined_to_pilot_scratch(
+                "rm -rf .pilot-scratch/x && git reset --hard", wt
+            )
+            is False
+        )
+        assert (
+            rm_confined_to_pilot_scratch(
+                "rm -rf .pilot-scratch/x && rm -rf /etc", wt
+            )
+            is False
+        )
+
+    def test_no_confined_rm_returns_false(self, scratch_worktree: Path) -> None:
+        # nothing to carve: not an rm-under-scratch command at all
+        assert rm_confined_to_pilot_scratch("rm -rf /etc", str(scratch_worktree)) is False
