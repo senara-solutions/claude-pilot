@@ -717,6 +717,122 @@ def test_cpp213_unresolvable_cwd_stays_terminal(tmp_path: Path) -> None:
     )
 
 
+def test_mika2565_sed_i_in_worktree_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """mika#2565 (case B): a `sed -i` substitution editing RELATIVE files that
+    all resolve inside the worktree is a SURVIVABLE deny — `_denial_is_terminal`
+    returns ``False`` — while every escape stays terminal, unchanged.
+
+    Sibling of the cpp#213 rm/.pilot-scratch carve. The command is still REFUSED
+    (admission byte-identical — see
+    ``test_mika2565_admission_is_byte_identical_only_lethality_flips``); only
+    lethality flips, so the pilot falls back to the Edit tool.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "crates" / "mika-agent" / "src" / "evidence").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    wt = str(worktree)
+
+    guards = "crates/mika-agent/src/evidence/guards.rs"
+    # The verbatim mika#2565 incident command (session 6d61c747).
+    incident = (
+        "sed -i '5870,5990s/classify_dependabot_verdict(/classify_2519(/' "
+        + guards
+        + ' && grep -n "classify_dependabot_verdict\\|classify_2519(" '
+        + guards
+    )
+
+    # Positive — proven-danger cause is SOLELY an in-worktree `sed -i` substitution.
+    for cmd in (
+        incident,
+        "sed -i 's/a/b/' " + guards,
+        "sed -i '5870,5990s/foo(/bar(/' " + guards,
+        "sed -i 's@a@b@g' src/x.rs",
+        "echo hi && sed -i 's/a/b/' src/x.rs",  # harmless prefix + confined sed -i
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # Negative — any escape, a write/exec script, a mixed list, or another
+    # proven-danger cause keeps the deny TERMINAL.
+    for cmd in (
+        "sed -i 's/a/b/' /etc/passwd",  # absolute, out of worktree
+        'sed -i "s/a/b/" "$HOME/x"',  # $-rooted respelling
+        "sed -i 's/a/b/' ~/x",  # ~-rooted respelling
+        "sed -i 's/a/b/' ../../etc/x",  # `..` escape
+        "sed -i 's/a/b/w /etc/evil' src/x.rs",  # `w` write flag in the script → rejected
+        "sed -i '/foo/d' src/x.rs",  # non-substitution (delete) script → fail closed
+        "sed -i 's/a/b/' src/x.rs /etc/passwd",  # mixed targets, one absolute
+        "sed -i 's/a/b/' src/x.rs && git reset --hard",  # chained destructive verb
+        "sed -i -e 's/a/b/' -e 's/c/d/' src/x.rs",  # `-e` multi-script → fail closed
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_mika2565_sed_i_symlink_escape_stays_terminal(tmp_path: Path) -> None:
+    """mika#2565 fail-closed: a `sed -i` target routed through an OUTBOUND
+    symlink resolves outside the worktree and stays terminal — `is_within_project`
+    resolves symlinks, so the containment verdict is not launderable.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / "esc").symlink_to(outside, target_is_directory=True)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed -i 's/a/b/' esc/x.rs"}, str(worktree)
+        )
+        is True
+    )
+
+
+def test_mika2565_unresolvable_cwd_stays_terminal(tmp_path: Path) -> None:
+    """mika#2565 fail-closed: an unresolvable `cwd` makes containment
+    un-computable, so the `sed -i` carve never applies and the deny stays
+    terminal.
+    """
+    missing = str(tmp_path / "does-not-exist")
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed -i 's/a/b/' src/x.rs"}, missing
+        )
+        is True
+    )
+
+
+def test_mika2565_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """mika#2565 sovereign boundary: admission for the in-worktree `sed -i` case
+    is byte-identical to HEAD — the command is STILL denied. `sed -i` is still
+    tier3-dangerous (the REFUSAL classifier), never tier1-auto-approved, and the
+    policy still default-denies it. Only `_denial_is_terminal` flips
+    terminal→survivable; end-to-end the handler returns a non-terminal
+    ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    cmd = "sed -i 's/a/b/' src/x.rs"
+
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    result = asyncio.run(
+        _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     tmp_path: Path,
 ) -> None:
@@ -1315,7 +1431,10 @@ def test_151_tier3_dangerous_deny_says_terminal_and_leaves_the_marker_clear(
         policy_path=policy_file,
     )
     result = asyncio.run(
-        handler("Bash", {"command": "sed -i 's/a/b/' notes.txt"}, _mock_ctx())
+        # mika#2565 carved the IN-WORKTREE `sed -i` case to survivable, so the
+        # deliberately-lethal example here uses an ABSOLUTE, out-of-worktree
+        # target (cwd=/tmp), which stays terminal.
+        handler("Bash", {"command": "sed -i 's/a/b/' /etc/passwd"}, _mock_ctx())
     )
 
     assert isinstance(result, PermissionResultDeny)
@@ -1653,7 +1772,9 @@ def test_cpp195_denial_is_terminal_mika_2471_replay_survivable(
         "git show origin/main:x > /etc/ck.rs",
         "git show origin/main:x > /var/outside/ck.rs",
         "git show origin/main:x > ../escape.rs",
-        "sed -i 's/a/b/' f",
+        # mika#2565 carved the in-worktree `sed -i` case; an ABSOLUTE, out-of-
+        # worktree target is a genuine escaping write and stays terminal.
+        "sed -i 's/a/b/' /etc/f",
         "rm -rf x",
         "git push --force origin x",  # pre-existing tier3-lethal case, unchanged
         # cpp#195 follow-up — composition must NOT paper over a genuinely bad
@@ -1994,8 +2115,10 @@ def test_cpp203_denial_is_terminal_sed_i_devnull_alone_survivable(
     [
         # Real, out-of-worktree target — a genuine write, stays terminal.
         "sed -i 's/a/b/' /etc/passwd",
-        # Real in-worktree target — also a genuine write, stays terminal.
-        "sed -i 's/a/b/' realfile.rs",
+        # (mika#2565 superseded the former "in-worktree realfile.rs stays
+        # terminal" case: a relative in-worktree `sed -i` substitution is now a
+        # SURVIVABLE deny — see
+        # ``test_mika2565_sed_i_in_worktree_is_survivable_but_still_refused``.)
         # cpp#154 D3 non-reopening: $HOME-as-~-respelling must NOT flip just
         # because this ticket touches the same lethality path.
         "sed -i 's/a/b/' $HOME/.bashrc",

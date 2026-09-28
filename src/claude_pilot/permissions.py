@@ -42,6 +42,7 @@ from .tier1 import (
     is_tier3_dangerous_for_lethality,
     is_within_project,
     rm_confined_to_pilot_scratch,
+    sed_i_confined_to_worktree,
 )
 from .transport import invoke_command
 from .types import (
@@ -870,8 +871,25 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # this), only lethality flips. When the carve applies we fall THROUGH to the
     # redirect/destination vetoes below, which still run on the FULL command, so
     # a confined `rm` that ALSO redirects out of the worktree is re-armed there.
-    if is_tier3_dangerous_for_lethality(command) and not rm_confined_to_pilot_scratch(
-        command, cwd
+    # mika#2565 (case B): a proven-danger match whose ONLY cause is `sed -i`
+    # substitution segment(s) editing RELATIVE files that all resolve inside the
+    # worktree is not, on its own, grounds to end the session — the exact sibling
+    # of the cpp#213 `rm`/`.pilot-scratch` carve, applied to the `sed -i` verb on
+    # in-worktree source files. `sed_i_confined_to_worktree` re-runs the
+    # unchanged `is_tier3_dangerous_for_lethality` on the command with those
+    # confined segments removed, so any OTHER proven-danger cause — a mixed
+    # target list, a chained destructive verb, an absolute / `$`-`~`-rooted / `..`
+    # / symlink-escaping target — still returns True here and stays terminal
+    # (fail-closed). Admission is byte-identical to HEAD (`is_tier3_dangerous` /
+    # `is_tier1_auto_approve` / YAML rules never call this); only lethality flips,
+    # so the pilot falls back to the Edit tool instead of dying. When the carve
+    # applies we fall THROUGH to the redirect/destination vetoes below, which run
+    # on the FULL command, so a confined `sed -i` that ALSO redirects out of the
+    # worktree is re-armed there.
+    if (
+        is_tier3_dangerous_for_lethality(command)
+        and not rm_confined_to_pilot_scratch(command, cwd)
+        and not sed_i_confined_to_worktree(command, cwd)
     ):
         return True
     # cpp#154: the narrowing above is deliberately cwd-free and lexical (plan

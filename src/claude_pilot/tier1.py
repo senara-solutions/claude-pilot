@@ -1001,6 +1001,42 @@ def _mask_quoted_redirect_chars(command: str) -> str:
     return "".join(out)
 
 
+# ── mika#2573 (case A): a print-only `sed` segment is not proven danger ──────
+#
+# A `sed -n '<addr>[,<addr>]p'` invocation (the closed-world print-only shape
+# `_is_safe_sed_print_only` already recognizes — `-n` mandatory and sole flag,
+# script is exactly one address/range + bare `p`, NO `-i` in-place, NO `w`/`W`
+# write command) reads its input and prints matching lines. It writes nothing
+# and executes nothing. Yet the LITERAL TEXT of its print SCRIPT is scanned by
+# the lethality verb patterns like any other segment, so a pilot filtering a
+# log for a dangerous string — `… | sed -n '/rm -rf/p'`, `… | sed -n
+# '/DROP TABLE/p'` — trips the very verb it is searching FOR and has its denial
+# made TERMINAL, although the verb is DATA (a search pattern), never a command.
+# This is the same syntactic over-refusal class cpp#205 ratified as SURVIVABLE:
+# a read filter is not proven danger.
+#
+# This blanks each print-only `sed` SEGMENT before the verb scan, mirroring the
+# segment-drop-then-recheck mechanism of `rm_confined_to_pilot_scratch`
+# (cpp#213): the surviving segments are re-joined with a newline (a separator
+# bash honors, so no two tokens glue into a phantom verb) and carry their full
+# text unchanged, so any genuine danger OUTSIDE the sed segment still matches.
+# LETHALITY ONLY — `is_tier3_dangerous` (the REFUSAL) never calls this, so the
+# command stays DENIED; only whether the denial ends the run changes. Reuses
+# `_is_safe_sed_print_only` verbatim, so the print-only shape recognized here
+# cannot drift from the one already whitelisted for the chain-safety path.
+def _blank_print_only_sed_segments(command: str) -> str:
+    survivors: list[str] = []
+    carved = False
+    for seg in _split_compound_command(command):
+        if _is_safe_sed_print_only(seg):
+            carved = True
+            continue
+        survivors.append(seg)
+    if not carved:
+        return command
+    return "\n".join(survivors)
+
+
 def is_tier3_dangerous_for_lethality(command: str) -> bool:
     """`is_tier3_dangerous`, but a redirect whose target writes nowhere
     (`/dev/null`, cpp#130) or writes a CONTAINED working file (under `/tmp` or
@@ -1086,7 +1122,13 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
     return _matches_proven_dangerous_lethality_verb(
         _strip_contained_redirects(
             _STDOUT_DEVNULL_RE.sub(
-                " ", _SED_I_DEVNULL_RE.sub(" ", _mask_quoted_redirect_chars(command))
+                " ",
+                _SED_I_DEVNULL_RE.sub(
+                    " ",
+                    _mask_quoted_redirect_chars(
+                        _blank_print_only_sed_segments(command)
+                    ),
+                ),
             )
         )
     )
@@ -3002,6 +3044,155 @@ def rm_confined_to_pilot_scratch(command: str, cwd: str) -> bool:
     for seg in _split_compound_command(command):
         operands = _rm_segment_operands(seg)
         if operands and all(is_within_pilot_scratch(op, cwd) for op in operands):
+            carved = True
+            continue
+        survivors.append(seg)
+    if not carved:
+        return False
+    return not is_tier3_dangerous_for_lethality("\n".join(survivors))
+
+
+# ── mika#2565 (case B): in-worktree `sed -i` source edit is not proven danger ─
+#
+# `TIER3_PATTERNS`' `sed -i` entry (`:183`, `\bsed\s+(-\w*i|-i\w*)\b`) matches on
+# the FLAG alone, regardless of target — correct for the REFUSAL (`sed -i` is
+# not an allow-listed idiom, so the command must stay DENIED and the pilot must
+# fall back to the Edit tool), but it made the denial TERMINAL even when the
+# in-place edit lands on an ORDINARY REPO SOURCE FILE inside the worktree. The
+# verbatim mika#2565 killer (session 6d61c747, l.5597, 20:38:05Z,
+# `[bash-grep] (terminal)`):
+#
+#   sed -i '5870,5990s/classify_dependabot_verdict(/classify_2519(/' \
+#     crates/mika-agent/src/evidence/guards.rs && grep -n "…" …/guards.rs
+#
+# edits a tracked source file by RELATIVE path — a routine in-worktree edit, not
+# proven danger (cpp#205). The deny STAYS (admission byte-identical: neither
+# `is_tier3_dangerous`, `is_tier1_auto_approve`, nor any YAML rule consults the
+# functions below); only lethality flips, so the pilot adapts to the Edit tool
+# instead of dying.
+#
+# Containment is decided by the SAME `is_within_project` mechanism the
+# destination veto uses — cwd/fs-aware, symlink-resolving. Every fail-closed
+# direction keeps the command TERMINAL, matching cpp#213's boundary that this
+# only ever flips terminal→survivable, never refused→allowed.
+
+# A `sed -i` in-place script restricted to a SINGLE write-free substitution,
+# optional leading address/range. Reusing the exact separators and flag charset
+# of `_SAFE_SED_SUB_RES`/`_is_safe_sed_pure_substitution` (only `g`/`p`/`i`/`I`/
+# `m`/`M`/digits — NO `w`/`W` write flag, NO `e` exec flag), so the carve can
+# NEVER apply to a script that writes to, reads from, or execs another file. A
+# standalone `w`/`W`/`r`/`R`/`e` command, a multi-command script (`;`), a `d`/
+# `y`/`a`/`i`/`c` command, or an unrecognized separator all fail this positive
+# match and keep the segment TERMINAL (fail-closed). The incident's script is a
+# plain address-range substitution and matches.
+_SED_I_ADDR = r"(?:\d+|\$|/(?:[^/\\]|\\.)*/)"
+_SED_I_SAFE_SUBST_SCRIPT_RE = re.compile(
+    r"^\s*(?:" + _SED_I_ADDR + r"(?:," + _SED_I_ADDR + r")?)?"
+    r"s(?P<sep>[/@#|:])"
+    r"(?:(?!(?P=sep))[^\\]|\\.)*(?P=sep)"
+    r"(?:(?!(?P=sep))[^\\]|\\.)*(?P=sep)"
+    r"[gpiImM0-9]*\s*$"
+)
+
+# In-place flag, short forms only: `-i`, `-ni`, `-ir`, … (the same `-\w*i`/
+# `-i\w*` shapes `TIER3_PATTERNS` catches). A backup-suffix form (`-i.bak`) or
+# the long `--in-place` are NOT detected here — the former is left on the
+# fail-closed (terminal) side deliberately, the latter is not caught by
+# `TIER3_PATTERNS` at all (already survivable), so neither reaches this carve.
+_SED_INPLACE_FLAG_RE = re.compile(r"-[A-Za-z]*i[A-Za-z]*$")
+
+
+def _sed_i_target_operands(segment: str) -> list[str] | None:
+    """The in-place FILE target operand(s) of a bare ``sed -i`` *segment* whose
+    script is a single write-free substitution, or ``None`` (fail-closed — the
+    caller keeps the segment, so it stays terminal) for every shape this carve
+    must not touch (mika#2565).
+
+    ``None`` when: the segment does not tokenize (``shlex`` raises); its leading
+    word is not exactly ``sed`` (a path-qualified ``/bin/sed`` stays terminal);
+    no short ``-i`` in-place flag is present; a multi-script/script-file flag
+    (``-e``/``-f``/``--expression``/``--file``) is present (script/file parsing
+    becomes ambiguous → fail closed); the script (first operand) is not a
+    write-free substitution (`_SED_I_SAFE_SUBST_SCRIPT_RE`); or there is no file
+    operand after the script.
+    """
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != "sed":
+        return None
+    saw_in_place = False
+    operands: list[str] = []
+    end_of_opts = False
+    for tok in tokens[1:]:
+        if not end_of_opts and tok == "--":
+            end_of_opts = True
+            continue
+        if not end_of_opts and tok.startswith("-") and tok != "-":
+            # `-e`/`-f` (and long forms) attach or name scripts, making the
+            # script/file split ambiguous — fail closed rather than guess.
+            if tok in ("-e", "-f", "--expression", "--file") or tok.startswith(
+                ("--expression", "--file")
+            ):
+                return None
+            if _SED_INPLACE_FLAG_RE.fullmatch(tok):
+                saw_in_place = True
+            continue
+        operands.append(tok)
+    if not saw_in_place:
+        return None
+    if len(operands) < 2:  # need script + >= 1 file target
+        return None
+    if _SED_I_SAFE_SUBST_SCRIPT_RE.match(operands[0]) is None:
+        return None
+    return operands[1:]
+
+
+def _sed_i_target_confined(target: str, cwd: str) -> bool:
+    """Whether a ``sed -i`` file *target* is a RELATIVE path resolving strictly
+    inside the worktree ``cwd`` (mika#2565).
+
+    Fail-CLOSED (``False`` — caller keeps the command terminal) for an ABSOLUTE
+    path (`/etc/x`), a ``$``/``~``-rooted operand (`$HOME/x`, `~/x` — the SAME
+    anti-respelling disqualifier the redirect/cp-mv/mkdir vetoes apply, since
+    `is_within_project` does no shell expansion and would read `Path(cwd) /
+    "$HOME/x"` as a contained same-named subdir), and — via `is_within_project`
+    itself — any ``..`` traversal or outbound-symlink target, or a ``cwd`` that
+    cannot be resolved.
+    """
+    if not target:
+        return False
+    if Path(target).is_absolute():
+        return False
+    if target.startswith("$") or target.startswith("~"):
+        return False
+    return is_within_project(target, cwd)
+
+
+def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
+    """Whether *command*'s tier3-for-lethality danger is due SOLELY to
+    ``sed -i`` substitution segment(s) whose EVERY file target resolves
+    strictly inside the worktree ``cwd`` (mika#2565).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision. Never touches admission (`is_tier3_dangerous`,
+    `is_tier1_auto_approve`, YAML rules); the command stays refused either way.
+
+    Mirrors `rm_confined_to_pilot_scratch` (cpp#213): each fully-confined
+    ``sed -i`` segment is removed and the remainder re-checked with the
+    unchanged `is_tier3_dangerous_for_lethality`, so every mixed/chained shape
+    stays terminal without a per-shape carve — a `sed -i` chained with another
+    destructive verb (`… && git reset --hard`), a mixed target list
+    (`sed -i '…' a.rs /etc/passwd`), or a second unconfined danger all leave a
+    proven-danger remainder that still fires. Returns ``False`` (stays terminal)
+    when no segment was confined or the remainder is still proven-dangerous.
+    """
+    survivors: list[str] = []
+    carved = False
+    for seg in _split_compound_command(command):
+        targets = _sed_i_target_operands(seg)
+        if targets and all(_sed_i_target_confined(t, cwd) for t in targets):
             carved = True
             continue
         survivors.append(seg)
