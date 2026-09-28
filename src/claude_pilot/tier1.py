@@ -703,20 +703,30 @@ def _is_uid_tolerant_tmp_scratch(value: str) -> bool:
 
 
 def _ce_scratch_variable_names(command: str) -> frozenset[str]:
-    """Every var name ``command`` assigns, anywhere in its raw text, to a
-    uid-tolerant ``/tmp`` scratch literal (mika#2562).
+    """Every var name whose EFFECTIVE (LAST-WINS) same-command assignment value is
+    a uid-tolerant ``/tmp`` scratch literal (mika#2562, tightened by cpp#224).
 
     Mirrors ``_mktemp_scratch_variable_names``: scans the WHOLE command (the
     assignment and the mkdir/chmod that consumes it are different compound
     segments), and is only ever consulted to GRANT a recognition on a command
     that is otherwise refused — so an over-generous match on inert heredoc-body
     text is bounded to a refusal that stays a refusal.
+
+    cpp#224 (TIGHTENING): recognition is LAST-WINS. A var is admitted ONLY if its
+    LAST same-command assignment roots at scratch. ``_CE_SCRATCH_ASSIGN_RE`` gives
+    the candidate vars (those with at least one ``/tmp`` assignment); for each we
+    re-resolve the LAST assignment across ANY value with ``_last_assignment_value``
+    and require THAT to be scratch. So ``X=/tmp/ok; X=$HOME/evil`` is NOT
+    recognized — its effective value is ``$HOME/evil`` — where the old "any
+    assignment roots at /tmp" scan wrongly admitted it. A scratch->scratch
+    reassignment (``X=/tmp/ok; X=/tmp/still-ok``) still is recognized.
     """
     names: set[str] = set()
     for m in _CE_SCRATCH_ASSIGN_RE.finditer(command):
-        value = m.group("dq") or m.group("sq") or m.group("bare")
-        if value is not None and _is_uid_tolerant_tmp_scratch(value):
-            names.add(m.group("var"))
+        var = m.group("var")
+        last = _last_assignment_value(command, var)
+        if last is not None and _is_uid_tolerant_tmp_scratch(last):
+            names.add(var)
     return frozenset(names)
 
 
@@ -747,10 +757,10 @@ def _is_ce_scratch_variable_ref(command: str, dest: str) -> bool:
 # lethality carves.
 #
 # Resolution is LAST-WINS (`_last_assignment_value`), so a reassignment out of scratch
-# (`SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir "$RUN"`) stays FATAL. (The DIRECT
-# `X=/tmp/ok; X=$HOME/evil; mkdir "$X"` form is admitted+survivable by the pre-existing
-# axis-A admission, which is NOT last-wins — a separate pre-existing tightening, cpp#224,
-# out of scope here.)
+# (`SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir "$RUN"`) stays FATAL. cpp#224 made the
+# DIRECT axis-A ADMISSION last-wins too (`_ce_scratch_variable_names` above), so the
+# direct `X=/tmp/ok; X=$HOME/evil; mkdir "$X"` form is now REFUSED + terminal — both the
+# admission axis and this lethality carve resolve the var's LAST assignment.
 _ANY_ASSIGNMENT_RE = re.compile(
     r'(?<![\w$])(?P<var>[A-Za-z_][A-Za-z0-9_]*)='
     r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s;|&()<>]*))'

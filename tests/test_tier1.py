@@ -3852,6 +3852,18 @@ class TestCeScratchSanctionUnit:
         assert _ce_scratch_variable_names('X="/tmp/x-$(whoami)"') == frozenset()
         assert _ce_scratch_variable_names("mkdir -p /tmp/x") == frozenset()
 
+    def test_axis_a_names_are_last_wins(self) -> None:
+        # cpp#224 (TIGHTENING): recognition resolves the var's EFFECTIVE (LAST)
+        # assignment, not "any assignment roots at /tmp". A reassignment OUT of
+        # scratch is no longer recognized.
+        assert _ce_scratch_variable_names("X=/tmp/ok; X=$HOME/evil") == frozenset()
+        # scratch -> scratch reassignment stays recognized (not over-tightened)
+        assert _ce_scratch_variable_names("X=/tmp/ok; X=/tmp/still-ok") == frozenset(
+            {"X"}
+        )
+        # non-scratch -> scratch: the LAST value IS scratch → recognized
+        assert _ce_scratch_variable_names("X=$HOME/evil; X=/tmp/ok") == frozenset({"X"})
+
     def test_axis_a_var_ref_requires_same_command_scratch_assignment(self) -> None:
         cmd = 'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
         # shlex-stripped operand forms, incl. the trailing-`)` subshell artifact
@@ -3866,6 +3878,21 @@ class TestCeScratchSanctionUnit:
         assert _is_ce_scratch_variable_ref(cmd, "$SCRATCH_ROOT/../etc") is False
         # a different var than the one assigned → refused
         assert _is_ce_scratch_variable_ref(cmd, "$OTHER") is False
+
+    def test_axis_a_var_ref_is_last_wins(self) -> None:
+        # cpp#224 (TIGHTENING): a var whose LAST assignment leaves scratch is NOT
+        # recognized, even though an EARLIER assignment rooted at /tmp scratch.
+        assert (
+            _is_ce_scratch_variable_ref('X=/tmp/ok; X=$HOME/evil; mkdir -p "$X"', "$X")
+            is False
+        )
+        # scratch -> scratch reassignment: LAST value is scratch → still recognized
+        assert (
+            _is_ce_scratch_variable_ref(
+                'X=/tmp/ok; X=/tmp/still-ok; mkdir "$X"', "$X"
+            )
+            is True
+        )
 
     # ── mika#2562 correction: transitive scratch-rooting, LETHALITY ONLY ──────
     def test_transitive_run_dir_roots_at_scratch(self) -> None:
