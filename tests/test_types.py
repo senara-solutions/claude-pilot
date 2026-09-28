@@ -25,7 +25,9 @@ def test_guardrail_defaults() -> None:
     assert GUARDRAIL_DEFAULTS.maxBudgetUsd == 0.0
     assert GUARDRAIL_DEFAULTS.stallThreshold == 5
     assert GUARDRAIL_DEFAULTS.emptyResponseThreshold == 5
-    assert GUARDRAIL_DEFAULTS.idleTimeoutMs == 300_000
+    # cpp#214: raised 300_000 -> 480_000, calibrated on the IDLE-domain
+    # measurement (max observed resume 296s + ~1.6x margin).
+    assert GUARDRAIL_DEFAULTS.idleTimeoutMs == 480_000
     assert GUARDRAIL_DEFAULTS.minTurnsBeforeDetection == 10
     # cpp#133: throttled-backoff ceiling (30 min).
     assert GUARDRAIL_DEFAULTS.rateLimitCeilingMs == 1_800_000
@@ -34,6 +36,19 @@ def test_guardrail_defaults() -> None:
     # change would remove the bound without any test noticing.
     assert GUARDRAIL_DEFAULTS.toolWaitCeilingMs == 1_800_000
     assert GUARDRAIL_DEFAULTS.modelWaitCeilingMs == 900_000
+
+
+def test_guardrail_ceiling_hierarchy_invariant() -> None:
+    """cpp#214/cpp#145: the four ceilings must stay ordered idle < model <
+    tool == rateLimit. Raising `idleTimeoutMs` to 480s (cpp#214) must keep it
+    strictly below the 900s model-wait ceiling, or a session that stalls
+    mid-generation would be censored by the wrong guard again."""
+    assert (
+        GUARDRAIL_DEFAULTS.idleTimeoutMs
+        < GUARDRAIL_DEFAULTS.modelWaitCeilingMs
+        < GUARDRAIL_DEFAULTS.toolWaitCeilingMs
+    )
+    assert GUARDRAIL_DEFAULTS.toolWaitCeilingMs == GUARDRAIL_DEFAULTS.rateLimitCeilingMs
 
 
 def test_pilot_config_minimal() -> None:

@@ -78,7 +78,16 @@ GUARDRAIL_DEFAULTS = ResolvedGuardrailConfig(
     maxBudgetUsd=0.0,  # 0 = disabled
     stallThreshold=5,
     emptyResponseThreshold=5,
-    idleTimeoutMs=300_000,
+    # cpp#214: 480s (8 min), a CALIBRATED ceiling, not a guess. The cpp#214
+    # measurement of the IDLE domain (nobody outstanding) found generation
+    # flows resume up to a MAX of 296s (p99 229s, zero recoveries past 300s in
+    # 188 samples); the old 300s ceiling censored its own tail, so a 296s
+    # survivor was byte-identical to a death. 480s = max-observed-resume (296s)
+    # plus ~1.6x margin, and stays below `modelWaitCeilingMs`=900s so the
+    # cpp#145 hierarchy (idle < model < tool == rateLimit) is preserved. This is
+    # the interim palliative; the real fix (stall detection / generation
+    # heartbeat) is cpp#219.
+    idleTimeoutMs=480_000,
     minTurnsBeforeDetection=10,
     # cpp#133: 30 min comfortably outlasts the SDK's own ~5 min backoff (the
     # 2026-08-06 founding incident) and several retry cycles, while bounding a
