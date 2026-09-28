@@ -1432,6 +1432,35 @@ def _destination_veto_reason(
                     "variable/tilde ($/~) — treated as not contained "
                     "(cpp#211 / cpp#154 D3 anti-respelling)"
                 )
+            # cpp#218 (the `mkdir` sibling of cpp#211 root cause 2): a `mkdir`
+            # destination that (after `_extract_mkdir_destinations`'s shlex
+            # quote-stripping) BEGINS with `$` or `~` is an unresolved
+            # variable/tilde root — the SAME accident cpp#211 closed for
+            # `bash-cp-mv`: `is_within_project` does no shell expansion, so
+            # `Path(cwd) / "$HOME/x"` (or `"~/x"`) resolves to a literal
+            # same-named subdirectory INSIDE the worktree and would wrongly read
+            # as CONTAINED — exactly what let a quoted `mkdir "$HOME/x"` slip
+            # through veto=None while the bare `mkdir $HOME/x` was refused (the
+            # YAML lookahead denies the bare form). Failing closed here, before
+            # `is_within_project`, treats the quoted form exactly like the bare
+            # form. Deliberately scoped to a `$`/`~` LEADING root only (the same
+            # expression cpp#211 reused, NOT the full lexical predicate whose
+            # charset/`..` sub-rules would over-tighten a contained quoted
+            # destination): a leading-`/` absolute destination stays a
+            # worktree-containment CANDIDATE for the `is_within_project` resolve
+            # below, so an absolute path that actually resolves INSIDE the
+            # worktree is still admitted, and a merely space-bearing CONTAINED
+            # name is not newly refused. The sanctioned `/tmp` scratch carve-out
+            # above (`_is_sanctioned_tmp_scratch`, cpp#143) already `continue`d
+            # past this for its named idiom, so that exception is unchanged.
+            if kind == "bash-mkdir" and (
+                dest.startswith("$") or dest.startswith("~")
+            ):
+                return (
+                    f"destination {dest!r} is rooted at an unresolved "
+                    "variable/tilde ($/~) — treated as not contained "
+                    "(cpp#218 / cpp#211 / cpp#154 D3 anti-respelling)"
+                )
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "
