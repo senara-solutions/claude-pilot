@@ -19,12 +19,15 @@ from claude_pilot import permissions as permissions_module
 from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
+    _ce_scratch_variable_names,
+    _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_mktemp_scratch_redirect_target,
     _is_safe_command_builtin,
     _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
+    _is_uid_tolerant_tmp_scratch,
     _mask_quoted_redirect_chars,
     _mktemp_scratch_variable_names,
     _quote_spans,
@@ -3794,3 +3797,71 @@ class TestRmConfinedToPilotScratch:
     def test_no_confined_rm_returns_false(self, scratch_worktree: Path) -> None:
         # nothing to carve: not an rm-under-scratch command at all
         assert rm_confined_to_pilot_scratch("rm -rf /etc", str(scratch_worktree)) is False
+
+
+# ── ce-* /tmp scratch: uid token + same-command var tracing (mika#2562) ────────
+#
+# Unit coverage for the two axes that re-admit the compound-engineering ce-*
+# scratch preamble cpp#218 collaterally denied. The end-to-end veto/handler
+# behaviour is pinned in test_policy_devpilot.py; this class pins the lexical
+# predicates in both directions, exhaustively on the security boundary.
+class TestCeScratchSanctionUnit:
+    def test_axis_b_uid_tokens_admitted(self) -> None:
+        base = "/tmp/compound-engineering-"
+        for tok in ("$(id -u)", "`id -u`", "$UID", "${UID}", "$EUID", "${EUID}"):
+            assert _is_uid_tolerant_tmp_scratch(base + tok) is True, tok
+        # inner whitespace in the substitution form is tolerated (bash allows it)
+        assert _is_uid_tolerant_tmp_scratch("/tmp/ce-$( id -u )") is True
+        assert _is_uid_tolerant_tmp_scratch("/tmp/ce-` id -u `") is True
+        # a plain literal scratch (no token) still passes
+        assert _is_uid_tolerant_tmp_scratch("/tmp/compound-engineering-1000") is True
+        # a token mid-path, not just as a suffix
+        assert _is_uid_tolerant_tmp_scratch("/tmp/ce-$(id -u)/runs") is True
+
+    def test_axis_b_non_uid_substitutions_refused(self) -> None:
+        # THE security boundary: only the exact uid tokens are tolerated. Every
+        # other substitution/variable in the /tmp path must fail.
+        for bad in (
+            "/tmp/x-$(whoami)",
+            "/tmp/x-$(rm -rf /)",
+            "/tmp/x-$(id -u; rm -rf /)",   # decorated: not the exact token
+            "/tmp/x-$(id -u$(evil))",       # nested: not the exact token
+            "/tmp/x-`whoami`",
+            "/tmp/$OTHER",
+            "/tmp/x-${OTHER}",
+            "/tmp/x-$UIDFOO",               # longer name, not $UID
+            "/tmp/../etc",                  # traversal
+            "/tmp/x-$(id -g)",              # gid, not uid
+            "$HOME/x",
+            "/etc/evil",
+            "",
+        ):
+            assert _is_uid_tolerant_tmp_scratch(bad) is False, bad
+
+    def test_axis_a_names_only_tmp_scratch_assignments(self) -> None:
+        assert _ce_scratch_variable_names(
+            'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
+        ) == frozenset({"SCRATCH_ROOT"})
+        assert _ce_scratch_variable_names('S="/tmp/ce-$UID"') == frozenset({"S"})
+        assert _ce_scratch_variable_names("S=/tmp/ce-1000") == frozenset({"S"})
+        assert _ce_scratch_variable_names("S='/tmp/ce'") == frozenset({"S"})
+        # NON-/tmp or non-scratch assignments are never named
+        assert _ce_scratch_variable_names('X="/etc/evil"') == frozenset()
+        assert _ce_scratch_variable_names('HOME="/tmp/../etc"') == frozenset()
+        assert _ce_scratch_variable_names('X="/tmp/x-$(whoami)"') == frozenset()
+        assert _ce_scratch_variable_names("mkdir -p /tmp/x") == frozenset()
+
+    def test_axis_a_var_ref_requires_same_command_scratch_assignment(self) -> None:
+        cmd = 'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
+        # shlex-stripped operand forms, incl. the trailing-`)` subshell artifact
+        assert _is_ce_scratch_variable_ref(cmd, "$SCRATCH_ROOT") is True
+        assert _is_ce_scratch_variable_ref(cmd, "${SCRATCH_ROOT}") is True
+        assert _is_ce_scratch_variable_ref(cmd, "$SCRATCH_ROOT)") is True
+        # no same-command assignment → unresolvable → refused
+        assert _is_ce_scratch_variable_ref("mkdir -p \"$SCRATCH_ROOT\"", "$SCRATCH_ROOT") is False
+        # assigned to a NON-/tmp value → refused
+        assert _is_ce_scratch_variable_ref('X="/etc/evil"; mkdir -p "$X"', "$X") is False
+        # a traversal tail on the reference is not a bare var ref → refused
+        assert _is_ce_scratch_variable_ref(cmd, "$SCRATCH_ROOT/../etc") is False
+        # a different var than the one assigned → refused
+        assert _is_ce_scratch_variable_ref(cmd, "$OTHER") is False
