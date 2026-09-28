@@ -2559,29 +2559,57 @@ def test_cpp209_handler_end_to_end_still_denied_but_survivable(
 
 
 def test_cpp209_admission_unaffected_for_lethality_false(tmp_path: Path) -> None:
-    """Admission-identity: the REFUSAL question (`for_lethality=False`,
-    every caller other than `_denial_is_terminal`) is byte-identical before
-    and after this fix — the new branch is gated entirely on
-    `for_lethality=True`, so a disqualified cp/mv destination is vetoed
-    exactly as `is_within_project` alone (unmodified) would decide, in both
-    cwd worlds."""
+    """Admission-identity, SUPERSEDED BY cpp#211 for the `$`/`~`-rooted class.
+
+    cpp#209 asserted the REFUSAL question (`for_lethality=False`) for a
+    `$VAR`-rooted cp/mv destination was byte-identical before and after
+    (`None` when `cwd` resolved, "resolves outside" when it did not) — i.e.
+    exactly what `is_within_project` alone decided. cpp#211 root cause 2
+    CLOSES that: a `$`/`~`-rooted cp/mv destination is now disqualified
+    LEXICALLY, before `is_within_project`, for BOTH questions — so the
+    refusal veto is the cpp#211 anti-respelling reason and, being lexical, is
+    the SAME in both cwd worlds (`$D/` is squarely in cpp#211's ratified
+    `$`-rooted class). The mktemp-scratch LETHALITY survivability the rest of
+    this cpp#209 section proves is UNCHANGED — it lives on `for_lethality=
+    True` and is re-asserted at the end here."""
     wt_gone = _torn_down_worktree(tmp_path)
     worktree = tmp_path / "wt2"
     (worktree / ".git").mkdir(parents=True)
     wt_here = str(worktree)
 
+    cpp211_reason = (
+        "destination '$D/' is rooted at an unresolved variable/tilde ($/~) "
+        "— treated as not contained (cpp#211 / cpp#154 D3 anti-respelling)"
+    )
+
     reason_gone = permissions_module._destination_veto_reason(
         _MIKA_2054_CP_ALONE, wt_gone, for_lethality=False
     )
-    assert reason_gone == (
-        "destination '$D/' resolves outside the worktree "
-        "(cpp#38 symlink-traversal containment)"
-    )
+    assert reason_gone == cpp211_reason
 
+    # cpp#211: no longer `None` — the accident of `is_within_project` reading
+    # `"$D/"` as a same-named in-worktree subdir is exactly what root cause 2
+    # closes, so an EXISTING worktree vetoes it too now (cwd-independent).
     reason_here = permissions_module._destination_veto_reason(
         _MIKA_2054_CP_ALONE, wt_here, for_lethality=False
     )
-    assert reason_here is None
+    assert reason_here == cpp211_reason
+
+    # cpp#209 core purpose intact: the mktemp-scratch idiom stays SURVIVABLE
+    # under the LETHALITY question (the carve-out `continue`s before cpp#211's
+    # lexical veto), in both cwd worlds.
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2054_CP_ALONE}, wt_gone
+        )
+        is False
+    )
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _MIKA_2054_CP_ALONE}, wt_here
+        )
+        is False
+    )
 
 
 def test_cpp209_non_reopening_154d3_176_195_196_201_203_205(
@@ -2619,3 +2647,118 @@ def test_cpp209_non_reopening_154d3_176_195_196_201_203_205(
             permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
             is expected
         ), cmd
+
+
+# ── cpp#211 — quoted $/~-rooted cp/mv destination: veto + terminality ────────
+#
+# Root cause 2 (this module's layer): `_destination_veto_reason` handed the
+# shlex-stripped destination straight to `is_within_project`, which does no
+# shell expansion — so `Path(cwd) / "$HOME/x"` (or `"~/x"`) read as a literal
+# same-named in-worktree subdir and returned veto=None. cpp#211 disqualifies a
+# `$`/`~`-LEADING cp/mv destination LEXICALLY, before `is_within_project`, for
+# BOTH the REFUSAL and the LETHALITY question — the same cpp#154 D3
+# anti-respelling doctrine already applied to redirect targets. Scoped to a
+# `$`/`~` leading root only, so a leading-`/` absolute path that resolves
+# INSIDE the worktree stays admitted (cpp#176) and a contained name with a
+# space is not newly refused. The cpp#201/#209 mktemp-scratch LETHALITY
+# carve-out still `continue`s before this veto, so its survivability is intact
+# (proven in `test_cpp209_admission_unaffected_for_lethality_false`).
+
+_CPP211_ROOTED_CP_MV = [
+    'cp secret "$HOME/exfil"',
+    'mv secret "$HOME/exfil"',
+    'cp secret "${HOME}/exfil"',
+    "cp x '$HOME/y'",
+    'cp x "~/y"',
+    'mv x "~/y"',
+    # Bare forms — same shlex-stripped dest, must veto identically.
+    "cp secret $HOME/exfil",
+    "cp x ~/y",
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP211_ROOTED_CP_MV)
+def test_cpp211_destination_veto_refuses_rooted(cmd: str, tmp_path: Path) -> None:
+    """Positive (the fix): `_destination_veto_reason` returns a veto for every
+    quoted or bare `$`/`~`-rooted cp/mv destination, in an EXISTING worktree
+    (where the pre-fix `is_within_project` accident wrongly read it as
+    contained). Cwd-independent — the veto is lexical."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert permissions_module._destination_veto_reason(cmd, wt) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", _CPP211_ROOTED_CP_MV)
+def test_cpp211_denial_is_terminal_rooted(cmd: str, tmp_path: Path) -> None:
+    """`$HOME`/`~`-rooted cp/mv is TERMINAL (matches the ratified
+    `$HOME`-stays-terminal invariant, cpp#154 D3 / cpp#157, and the redirect
+    side). Existing worktree, so the verdict is not an artifact of a torn-down
+    cwd."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Quoted CONTAINED destinations strictly under the worktree — veto=None.
+        'cp x "subdir/y"',
+        'cp x "./build/z"',
+        'mv old "nested/new"',
+        # A quoted name with a space is contained, not disqualified.
+        'cp x "a b"',
+        # Unquoted contained.
+        "cp src/a.rs src/b.rs",
+    ],
+)
+def test_cpp211_destination_veto_admits_contained(cmd: str, tmp_path: Path) -> None:
+    """Negative / both-directions: a QUOTED contained cp/mv destination is NOT
+    vetoed (quoting alone is never a refusal). Only `$`/`~`-rooting flips."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert permissions_module._destination_veto_reason(cmd, wt) is None, cmd
+
+
+def test_cpp211_absolute_in_worktree_still_admitted(tmp_path: Path) -> None:
+    """Both-directions guard for cpp#176: cpp#211 disqualifies a `$`/`~` LEADING
+    root only — a leading-`/` ABSOLUTE destination that actually resolves
+    INSIDE the worktree is still a containment CANDIDATE and stays admitted."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert (
+        permissions_module._destination_veto_reason(f"cp README.md {wt}/copy.md", wt)
+        is None
+    )
+
+
+def test_cpp211_handler_end_to_end_quoted_home_denied(tmp_path: Path) -> None:
+    """Handler-level proof through the real `can_use_tool` callback: a quoted
+    `$HOME` cp destination is REFUSED (never executed), while a quoted
+    contained destination is ADMITTED — the admission flip is exactly the
+    cpp#211 class and nothing wider."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    handler = _bundled_handler(cwd=wt)
+
+    denied = asyncio.run(
+        handler("Bash", {"command": 'cp secret "$HOME/exfil"'}, _mock_ctx())
+    )
+    assert isinstance(denied, PermissionResultDeny), (
+        "a quoted $HOME-rooted cp destination must be refused (cpp#211)"
+    )
+
+    admitted = asyncio.run(
+        handler("Bash", {"command": 'cp src/a.rs "src/b.rs"'}, _mock_ctx())
+    )
+    assert isinstance(admitted, PermissionResultAllow), (
+        "a quoted CONTAINED cp destination must stay admitted — quoting alone "
+        "is not a refusal (cpp#211 both-directions)"
+    )
