@@ -1068,7 +1068,7 @@ def _tool_result_count(message: UserMessage) -> int:
     degrades to 1 rather than raising inside the message loop. 1 is the
     conservative floor — under-counting leaves a tool outstanding and holds the
     session to the (generous) tool ceiling, while over-counting would retire a
-    tool that never returned and hand the wait back to the 300s idle budget.
+    tool that never returned and hand the wait back to the idle budget (480s).
     """
     content = getattr(message, "content", None)
     if not isinstance(content, list):

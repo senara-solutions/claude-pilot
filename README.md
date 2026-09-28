@@ -39,7 +39,7 @@ claude-pilot [options] <prompt>
 | `--max-budget <usd>` | Maximum cost in USD (default: disabled) |
 | `--stall-threshold <n>` | Consecutive no-tool turns before termination (0=off, default: 5) |
 | `--empty-threshold <n>` | Consecutive trivial responses before termination (0=off, default: 5) |
-| `--idle-timeout <ms>` | Idle timeout in ms (0=off, max 3_600_000, default: 300_000) |
+| `--idle-timeout <ms>` | Idle timeout in ms (0=off, max 3_600_000, default: 480_000) |
 | `--min-detection-turns <n>` | Turns before stall/empty detection activates (default: 10) |
 | `--no-guardrails` | Disable stall/empty/idle detection (`max_turns` still applies) |
 
@@ -56,7 +56,7 @@ Place `.claude/claude-pilot.json` in the target project:
     "maxTurns": 200,
     "stallThreshold": 5,
     "emptyResponseThreshold": 5,
-    "idleTimeoutMs": 300000,
+    "idleTimeoutMs": 480000,
     "minTurnsBeforeDetection": 10,
     "rateLimitCeilingMs": 1800000,
     "toolWaitCeilingMs": 1800000,

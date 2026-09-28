@@ -410,6 +410,29 @@ async def test_genuine_idle_stall_still_classifies_as_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cpp214_idle_session_mute_past_raised_ceiling_still_aborts() -> None:
+    """cpp#214 (Vincent/samidarko AC): raising `idleTimeoutMs` 300s -> 480s
+    MOVED the idle guard, it did not REMOVE it. A session that is IDLE — nobody
+    outstanding: no tool emitted, no model-wait open — and stays mute past the
+    (now longer) idle ceiling must STILL abort with `idle_timeout`.
+
+    The deadline is simulated with a short proxy idle budget, exactly as the
+    other watchdog tests do; what this asserts is the invariant, not the wall-
+    clock value: state is IDLE at the deadline, and the guard still fires."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=40))
+
+    # Nobody is being waited on: this is the IDLE domain the 480s ceiling now
+    # governs (cpp#145 hierarchy). No tool_use was emitted, no model wait opened.
+    assert guardrails._wait_state is _WaitState.IDLE
+
+    reason = await asyncio.wait_for(guardrails.wait_aborted(), timeout=2.0)
+
+    assert reason.guardrail == "idle_timeout"
+    assert reason.api_error_status is None
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
 async def test_productive_turn_clears_rate_limit_flag_before_idle() -> None:
     """cpp#119: a productive turn means a throttle-retry succeeded — the sticky
     flag clears, so a LATER genuine idle stall is `idle_timeout`, not
@@ -726,8 +749,9 @@ async def test_note_activity_does_not_clear_rate_limit_flag() -> None:
 # has not yet produced the first token of the next turn. The third killed six
 # productive sessions on the night of 2026-08-31 to 09-01.
 #
-# The fix does not relax anything. `idleTimeoutMs` is unchanged at 300s for
-# genuine silence. The two waiting states are told apart, given their own named
+# The fix does not relax anything. `idleTimeoutMs` still bounds genuine silence
+# (its value was later raised 300s -> 480s in cpp#214, calibrated separately;
+# cpp#145 did not touch it). The two waiting states are told apart, given their own named
 # budgets, and given their own abort reasons — each of which must still be able
 # to kill, or the guardrail was removed rather than repaired.
 #

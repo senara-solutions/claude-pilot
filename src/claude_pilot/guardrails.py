@@ -722,7 +722,7 @@ class SessionGuardrails:
         else:
             # A turn that produced no tool call is waiting for nobody: the model
             # spoke and stopped. If nothing follows, that is genuine silence and
-            # the original 300s budget is the right one.
+            # the idle budget (480s post-cpp#214) is the right one.
             self._awaiting_model = False
             self._model_wait_started_at = None
 
