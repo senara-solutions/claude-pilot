@@ -2649,3 +2649,44 @@ class TestCeScratchReadmittedHandlerEndToEnd:
             result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
             assert isinstance(result, PermissionResultDeny), cmd
             assert result.interrupt is True, cmd
+
+
+# The CANONICAL ce-* preamble the plugin actually writes: SCRATCH_ROOT is a
+# recognized /tmp scratch, but RUN_DIR = "$SCRATCH_ROOT/ce-…/$RUN_ID" is rooted
+# in that variable (not a literal), so cpp#218 vetoed the `mkdir "$RUN_DIR"`
+# TERMINALLY. mika#2562's correction is LETHALITY ONLY: the mkdir STAYS denied,
+# only its terminality flips back to the pre-#218 survivable posture.
+_CE_CANON_PREAMBLE = (
+    'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)";\n'
+    '(umask 077; mkdir -p "$SCRATCH_ROOT") || exit 1;\n'
+    'chmod 700 "$SCRATCH_ROOT" || exit 1;\n'
+    "RUN_ID=$(date +%Y%m%d-%H%M%S)-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ');\n"
+    'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID";\n'
+    '(umask 077; mkdir -p "$RUN_DIR") || exit 1; chmod 700 "$RUN_DIR" || exit 1;'
+)
+
+
+class TestCeScratchCanonicalPreambleLethality:
+    """mika#2562 correction: the full canonical preamble is SURVIVABLE, not fatal,
+    while the deny (admission) is byte-identical. Lethality only."""
+
+    def test_canonical_preamble_is_survivable_but_still_refused(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(handler("Bash", _bash(_CE_CANON_PREAMBLE), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)   # deny unchanged
+        assert result.interrupt is False                  # survivable (was fatal on HEAD)
+
+    def test_admission_byte_identical_for_canonical(self, tmp_path) -> None:
+        # The refusal side (`for_lethality=False`) is untouched: still vetoed.
+        cwd = str(tmp_path)
+        assert (
+            _destination_veto_reason(_CE_CANON_PREAMBLE, cwd, for_lethality=False)
+            is not None
+        )
+
+    def test_transitive_reassign_out_of_scratch_stays_fatal(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        cmd = 'SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir -p "$RUN"'
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is True                   # last-wins → non-scratch → fatal

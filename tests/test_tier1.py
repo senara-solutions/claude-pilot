@@ -27,6 +27,7 @@ from claude_pilot.tier1 import (
     _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
+    _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
     _mask_quoted_redirect_chars,
     _mktemp_scratch_variable_names,
@@ -3865,3 +3866,38 @@ class TestCeScratchSanctionUnit:
         assert _is_ce_scratch_variable_ref(cmd, "$SCRATCH_ROOT/../etc") is False
         # a different var than the one assigned → refused
         assert _is_ce_scratch_variable_ref(cmd, "$OTHER") is False
+
+    # ── mika#2562 correction: transitive scratch-rooting, LETHALITY ONLY ──────
+    def test_transitive_run_dir_roots_at_scratch(self) -> None:
+        # The canonical preamble: RUN_DIR = "$SCRATCH_ROOT/ce-…/$RUN_ID", where
+        # SCRATCH_ROOT is a recognized /tmp scratch. The bare `$RUN_DIR)` operand
+        # (trailing subshell `)`) must resolve as transitively scratch-rooted.
+        cmd = (
+            'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)";'
+            'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID";'
+            'mkdir -p "$RUN_DIR"'
+        )
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN_DIR") is True
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN_DIR)") is True
+
+    def test_transitive_tmpdir_default_root(self) -> None:
+        cmd = 'D="${TMPDIR:-/tmp}/compound-engineering-$(id -u)"; mkdir -p "$D"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is True
+
+    def test_transitive_is_last_wins(self) -> None:
+        # A reassignment OUT of scratch wins → NOT recognized (stays fatal).
+        cmd = 'SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir -p "$RUN"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN") is False
+
+    def test_transitive_negatives_not_rooted(self) -> None:
+        for cmd, dest in (
+            ('mkdir -p "$HOME/x"', "$HOME/x"),      # a tail, not a bare ref
+            ('mkdir -p "$UNSET"', "$UNSET"),        # no same-command assignment
+            ('S="/tmp/x-$(whoami)"; mkdir -p "$S"', "$S"),  # non-uid subst
+            ('R="$SR/../etc"; SR=/tmp/ok; mkdir -p "$R"', "$R"),  # `..` in suffix
+        ):
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, dest) is False, dest
+
+    def test_transitive_terminates_on_cycle(self) -> None:
+        cmd = "A=$B/x; B=$A/y; mkdir -p \"$A\""
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$A") is False

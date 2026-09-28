@@ -31,6 +31,7 @@ from .tier1 import (
     _is_contained_redirect_target,
     _is_lexically_disqualified_redirect_target,
     _is_mktemp_scratch_redirect_target,
+    _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
     _mask_quoted_redirect_chars,
     _redirect_targets,
@@ -1506,6 +1507,23 @@ def _destination_veto_reason(
             # name is not newly refused. The sanctioned `/tmp` scratch carve-out
             # above (`_is_sanctioned_tmp_scratch`, cpp#143) already `continue`d
             # past this for its named idiom, so that exception is unchanged.
+            # mika#2562 correction — LETHALITY ONLY. A `mkdir` whose destination
+            # is a variable that (LAST-WINS, transitively) roots at a recognized
+            # `/tmp` scratch (`RUN_DIR="$SCRATCH_ROOT/…"`; `${TMPDIR:-/tmp}/…`)
+            # is the canonical ce-* preamble. Pre-#218 that compound was a
+            # SURVIVABLE deny (dir never created by it); cpp#218's veto made it
+            # TERMINAL. `for_lethality`-gated, so this is a NO-OP on every
+            # admission call (the deny is unchanged, byte-identical) and flips
+            # only `_denial_is_terminal` back to survivable — same shape as the
+            # cpp#201/#209 mktemp lethality carve just above. The direct-reassign
+            # admission gap (`X=/tmp/ok; X=$HOME/evil; mkdir "$X"`) is a
+            # pre-existing non-last-wins axis-A defect, out of scope (cpp#224).
+            if (
+                for_lethality
+                and kind == "bash-mkdir"
+                and _is_transitive_ce_scratch_mkdir_target(command, dest)
+            ):
+                continue
             if kind == "bash-mkdir" and (
                 dest.startswith("$") or dest.startswith("~")
             ):

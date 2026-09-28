@@ -121,9 +121,36 @@ or chain-safety gates that sit above it. Where the idiom's real shape needs thos
 gates too, say so and leave them to a separate decision rather than widening them
 by reflex.
 
+## Correction — the canonical preamble needs TRANSITIVE rooting (lethality only)
+
+The first cut admitted the standalone `$SCRATCH_ROOT` form but the MPC gate showed the
+CANONICAL preamble was still **fatal**: it builds a second variable
+`RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID"` and does `mkdir -p "$RUN_DIR"`. `$RUN_DIR`'s
+value is `$<recognized-scratch-var>/<suffix>`, not a `/tmp` literal, so axis A did not
+recognize it and cpp#218's veto still fired terminally.
+
+Measured at the source, the **pre-#218** posture of that exact compound was a **survivable
+deny** (an assignment-prefixed compound is policy default-deny, non-terminal; the dir was
+never created by that command). So the regression was purely the *terminality*. The
+correction restores it, **lethality only**: a `mkdir` whose destination variable roots
+(transitively, via same-command **last-wins** assignments) at a recognized scratch —
+`_is_transitive_ce_scratch_mkdir_target`, consulted ONLY from the `for_lethality` veto path
+— flips terminal→survivable. The deny STAYS a deny; admission is **byte-identical** (the
+carve is a no-op on every `for_lethality=False` call). It also accepts the preamble's
+`${TMPDIR:-/tmp}/…` fallback root. Resolution is **last-wins**, so a reassignment out of
+scratch (`SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir "$RUN"`) stays fatal; a `..` in any
+suffix, an unassigned var, and a non-uid substitution stay fatal too.
+
+**Known out-of-scope caveat (cpp#224).** The DIRECT form `X=/tmp/ok; X=$HOME/evil; mkdir "$X"`
+is admitted+survivable at HEAD because the pre-existing **axis-A admission** is NOT last-wins
+(it recognizes `X` from the first `/tmp/ok` assignment). Making that fatal is a separate
+admission-narrowing (a tightening), tracked in cpp#224; it is deliberately not done here so
+this stays lethality-only / admission-byte-identical.
+
 ## References
 
 - Extends: cpp#143 (`/tmp` scratch sanction, `_is_sanctioned_tmp_scratch`).
-- Mirrors: cpp#201 (mktemp same-command tracing, `_is_mktemp_scratch_redirect_target`).
+- Mirrors: cpp#201 (mktemp same-command tracing, `_is_mktemp_scratch_redirect_target`); cpp#209 (`for_lethality`-gated carve shape).
 - Preserves: cpp#218 (quoted `$`/`~`-rooted mkdir veto), cpp#38 (containment), cpp#154 D3 (`$HOME`-stays-terminal).
+- Follow-up: cpp#224 (make axis-A admission last-wins — a tightening).
 - Tickets: mika#2562 (this fix), cpp#218 (the regression source), cpp#211 (parent class).
