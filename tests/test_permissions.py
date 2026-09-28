@@ -2876,3 +2876,140 @@ def test_cpp211_handler_end_to_end_quoted_home_denied(tmp_path: Path) -> None:
         "a quoted CONTAINED cp destination must stay admitted — quoting alone "
         "is not a refusal (cpp#211 both-directions)"
     )
+
+
+# ── cpp#218 — a QUOTED $/~-rooted mkdir destination is no longer admitted ────
+#
+# The `mkdir` sibling of cpp#211. Two mirrored root causes, same class:
+#
+# Root cause 1 (policy layer, `bash-mkdir` YAML rule): the whole-remainder
+# disqualifiers were whitespace-anchored (`(?!.*\s\$)` …), so a quoted LATER
+# operand (`mkdir a "$HOME/x"`) put the opening quote — not the metacharacter —
+# after the space and the lookahead never fired. Made quote-insensitive
+# (`(?!.*\s["']?\$)` …), so a rooted second-or-later operand is now denied at the
+# policy layer whether bare or quoted (see test_policy_devpilot.py).
+#
+# Root cause 2 (this module's layer, `_destination_veto_reason`): mkdir
+# destinations DO flow through the veto (`_segment_write_kind` == "bash-mkdir",
+# `_extract_mkdir_destinations` shlex-strips quotes). The shlex-stripped
+# destination went straight to `is_within_project`, which does no shell
+# expansion — so `Path(cwd) / "$HOME/x"` (or `"~/x"`) read as a literal
+# same-named in-worktree subdir and returned veto=None. This is the ONLY layer
+# that closes a SINGLE-operand `mkdir "$HOME/x"` (its metacharacter is the first
+# operand, so no whole-remainder space anchors it). cpp#218 disqualifies a
+# `$`/`~`-LEADING mkdir destination LEXICALLY, before `is_within_project`, for
+# BOTH the REFUSAL and the LETHALITY question — the same cpp#211 / cpp#154 D3
+# anti-respelling expression, reused verbatim. Scoped to a `$`/`~` leading root
+# only, so a leading-`/` absolute path that resolves INSIDE the worktree stays
+# admitted and a contained name with a space is not newly refused. The
+# sanctioned `/tmp` scratch carve-out (`_is_sanctioned_tmp_scratch`, cpp#143)
+# still `continue`s before this veto, so that exception is unchanged.
+
+_CPP218_ROOTED_MKDIR = [
+    'mkdir "$HOME/x"',
+    'mkdir "${HOME}/x"',
+    "mkdir '$HOME/x'",
+    'mkdir "~/x"',
+    'mkdir -p "$HOME/x"',
+    # Bare forms — same shlex-stripped dest, must veto identically.
+    "mkdir $HOME/x",
+    "mkdir ~/x",
+    # Multi-operand: the rooted operand anywhere on the line vetoes the segment.
+    'mkdir a "$HOME/x"',
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP218_ROOTED_MKDIR)
+def test_cpp218_destination_veto_refuses_rooted(cmd: str, tmp_path: Path) -> None:
+    """Positive (the fix): `_destination_veto_reason` returns a veto for every
+    quoted or bare `$`/`~`-rooted mkdir destination, in an EXISTING worktree
+    (where the pre-fix `is_within_project` accident wrongly read it as
+    contained). Cwd-independent — the veto is lexical."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert permissions_module._destination_veto_reason(cmd, wt) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", _CPP218_ROOTED_MKDIR)
+def test_cpp218_denial_is_terminal_rooted(cmd: str, tmp_path: Path) -> None:
+    """`$HOME`/`~`-rooted mkdir is TERMINAL (matches the ratified
+    `$HOME`-stays-terminal invariant, cpp#154 D3 / cpp#157, and the cp/mv side
+    from cpp#211). Existing worktree, so the verdict is not an artifact of a
+    torn-down cwd."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Quoted CONTAINED destinations strictly under the worktree — veto=None.
+        'mkdir "subdir/x"',
+        'mkdir "./build"',
+        'mkdir -p "nested/deep/dir"',
+        # A quoted name with a space is contained, not disqualified.
+        'mkdir "a b"',
+        # Unquoted contained.
+        "mkdir src/generated",
+        "mkdir -p crates/mika-os/src",
+    ],
+)
+def test_cpp218_destination_veto_admits_contained(cmd: str, tmp_path: Path) -> None:
+    """Negative / both-directions: a QUOTED contained mkdir destination is NOT
+    vetoed (quoting alone is never a refusal). Only `$`/`~`-rooting flips."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert permissions_module._destination_veto_reason(cmd, wt) is None, cmd
+
+
+def test_cpp218_absolute_in_worktree_still_admitted(tmp_path: Path) -> None:
+    """Both-directions guard: cpp#218 disqualifies a `$`/`~` LEADING root only —
+    a leading-`/` ABSOLUTE mkdir destination that actually resolves INSIDE the
+    worktree is still a containment CANDIDATE and stays admitted."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert (
+        permissions_module._destination_veto_reason(f"mkdir {wt}/built", wt) is None
+    )
+
+
+def test_cpp218_tmp_scratch_carveout_unchanged(tmp_path: Path) -> None:
+    """The sanctioned `/tmp` scratch mkdir (cpp#143) still `continue`s before the
+    cpp#218 lexical veto — unchanged."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    assert permissions_module._destination_veto_reason("mkdir -p /tmp/scratch", wt) is None
+
+
+def test_cpp218_handler_end_to_end_quoted_home_denied(tmp_path: Path) -> None:
+    """Handler-level proof through the real `can_use_tool` callback: a quoted
+    `$HOME` mkdir destination is REFUSED (never executed), while a quoted
+    contained destination is ADMITTED — the admission flip is exactly the
+    cpp#218 class and nothing wider."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+    handler = _bundled_handler(cwd=wt)
+
+    denied = asyncio.run(
+        handler("Bash", {"command": 'mkdir "$HOME/exfil"'}, _mock_ctx())
+    )
+    assert isinstance(denied, PermissionResultDeny), (
+        "a quoted $HOME-rooted mkdir destination must be refused (cpp#218)"
+    )
+
+    admitted = asyncio.run(
+        handler("Bash", {"command": 'mkdir -p "src/generated"'}, _mock_ctx())
+    )
+    assert isinstance(admitted, PermissionResultAllow), (
+        "a quoted CONTAINED mkdir destination must stay admitted — quoting alone "
+        "is not a refusal (cpp#218 both-directions)"
+    )

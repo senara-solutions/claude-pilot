@@ -434,11 +434,28 @@ rules:
   # `\s$` (not just the position right after the mandatory `\s+`), which holds
   # regardless of how the flag-group backtracks -- verified empirically (see
   # the plan doc and the cpp#150 section of tests/test_policy_devpilot.py).
+  #
+  # cpp#218 (the `mkdir` sibling of cpp#211): the whole-remainder disqualifiers
+  # were WHITESPACE-anchored (`(?!.*\s/)(?!.*\s~)(?!.*\s\$)`), so they only fired
+  # when the metacharacter sat immediately after a space. A QUOTED rooted
+  # destination (`mkdir "$HOME/x"`, `mkdir "~/x"`, `mkdir '$HOME/x'`,
+  # `mkdir "/abs/x"`) puts the OPENING QUOTE after the space and the metachar
+  # after the quote, so none of the lookaheads fired and the same out-of-worktree
+  # destination that is denied bare (`mkdir $HOME/x`) was ADMITTED when quoted --
+  # a containment/admission escape identical to cpp#211's `bash-cp-mv` hole. Fix:
+  # make each disqualifier quote-insensitive by allowing an optional opening
+  # quote (`["']?`) between the operand-boundary space and the metacharacter, so a
+  # `$`/`~`/`/`-rooted destination is refused whether bare or quoted. TIGHTENING
+  # ONLY -- a legitimately CONTAINED quoted destination (`mkdir "subdir/x"`,
+  # `mkdir "./build"`) still matches and is admitted; only `$`/`~`/`/`-ROOTING
+  # disqualifies. Destination containment is independently re-armed at runtime in
+  # permissions.py `_destination_veto_reason` (defense in depth, cpp#218 root
+  # cause 2 -- the `$`/`~`-leading-root veto mirrored from cpp#211).
   - id: bash-mkdir
     tool: Bash
-    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\s/)(?!.*\s~)(?!.*\s\$)(?!.*\.\.)\S'
+    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\s["'']?/)(?!.*\s["'']?~)(?!.*\s["'']?\$)(?!.*\.\.)\S'
     decision: allow
-    reason: "mkdir (relative, no .. / absolute / ~ / $ expansion) -- dev-pilot worktree scaffolding (mika#1116: mkdir -p crates/mika-os/src)"
+    reason: "mkdir (relative, no .. / absolute / ~ / $ expansion, quote-insensitive per cpp#218) -- dev-pilot worktree scaffolding (mika#1116: mkdir -p crates/mika-os/src)"
 
   # cpp#143's sanctioned /tmp scratch exception (see `_is_sanctioned_tmp_scratch`
   # in permissions.py) previously reached `decision: allow` ONLY as a side

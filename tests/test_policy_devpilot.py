@@ -2453,3 +2453,83 @@ def test_cpp211_full_honoring_path_quoted_home_denied(tmp_path: Path) -> None:
     # Contained quoted destination strictly under the worktree — admitted.
     assert _dest_effective('cp source docs/plans/copy.md', cwd) == "allow"
     assert _dest_effective('cp source "docs/plans/copy.md"', cwd) == "allow"
+
+
+# ── cpp#218 — a QUOTED $/~-rooted mkdir destination is no longer admitted ────
+#
+# The `mkdir` sibling of cpp#211, at the POLICY layer (root cause 1). The
+# `bash-mkdir` YAML rule's whole-remainder disqualifiers were whitespace-anchored
+# (`(?!.*\s\$)` …), so a quoted LATER operand (`mkdir a "$HOME/x"`) put the
+# opening quote — not the metacharacter — after the space and the lookahead never
+# fired. Made quote-insensitive (`(?!.*\s["']?\$)` …). NOTE: a SINGLE-operand
+# `mkdir "$HOME/x"` has its metacharacter at the FIRST operand (no whole-remainder
+# space to anchor on), so it is closed by `_destination_veto_reason` at runtime,
+# not the policy layer — see `_dest_effective` cases and test_permissions.py
+# (cpp#218 root cause 2). Only $/~/`/`-ROOTING disqualifies; a legitimately
+# CONTAINED quoted destination stays admitted (quoting alone is never a refusal).
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Quoted rooted LATER operand — caught at the policy layer by the
+        # quote-insensitive whole-remainder lookaheads.
+        'mkdir a "$HOME/x"',
+        'mkdir a "${HOME}/x"',
+        "mkdir a '$HOME/x'",
+        'mkdir a "~/x"',
+        'mkdir a "/abs/x"',
+        # Bare later operand still denied (parity with the quoted forms).
+        "mkdir a $HOME/x",
+        "mkdir a ~/x",
+        "mkdir a /abs/x",
+    ],
+)
+def test_cpp218_quoted_rooted_mkdir_later_operand_denied(cmd: str) -> None:
+    """Positive (root cause 1): a $/~/`/`-rooted mkdir operand appearing after a
+    space is refused at the POLICY layer, whether quoted, braced, single-quoted,
+    or bare."""
+    assert _effective(cmd) == "deny", cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # A quoted CONTAINED destination strictly under the worktree — quoting
+        # alone must NOT cause a refusal.
+        'mkdir "subdir/x"',
+        'mkdir "./build"',
+        'mkdir a "nested/dir"',
+        # A quoted name containing a space is still contained — not disqualified.
+        'mkdir "a b"',
+        # Unquoted contained forms unchanged.
+        "mkdir src/generated",
+        "mkdir -p crates/mika-os/src",
+    ],
+)
+def test_cpp218_quoted_contained_mkdir_still_admitted(cmd: str) -> None:
+    """Negative / both-directions (must not over-tighten): a QUOTED contained
+    mkdir destination is still ADMITTED at the policy layer. Only $/~/`/`
+    -rooting flips admitted->denied."""
+    assert _effective(cmd) == "allow", cmd
+
+
+def test_cpp218_full_honoring_path_quoted_home_denied(tmp_path: Path) -> None:
+    """Both fix layers together through the production honoring order (policy +
+    chain guard + `_destination_veto_reason`): a quoted `$HOME`/`~` mkdir
+    destination is refused — including the SINGLE-operand form the policy layer
+    admits and only the veto closes — while a quoted contained one is admitted,
+    in a REAL worktree."""
+    cwd = _make_worktree(tmp_path)
+    # Single-operand rooted — closed by the veto (cpp#218 root cause 2).
+    assert _dest_effective('mkdir "$HOME/exfil"', cwd) == "deny"
+    assert _dest_effective("mkdir '$HOME/exfil'", cwd) == "deny"
+    assert _dest_effective('mkdir "~/x"', cwd) == "deny"
+    assert _dest_effective('mkdir -p "$HOME/x"', cwd) == "deny"
+    assert _dest_effective("mkdir $HOME/x", cwd) == "deny"
+    # Contained quoted destinations strictly under the worktree — admitted.
+    assert _dest_effective('mkdir "docs/plans/new"', cwd) == "allow"
+    assert _dest_effective("mkdir docs/plans/new", cwd) == "allow"
+    # cpp#218 is scoped to $/~ leading roots: a quoted absolute stays exactly as
+    # HEAD decided it (veto: resolves outside the worktree) — unchanged.
+    assert _dest_effective('mkdir "/abs/x"', cwd) == "deny"
