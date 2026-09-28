@@ -1400,6 +1400,38 @@ def _destination_veto_reason(
                 and _is_mktemp_scratch_redirect_target(command, dest)
             ):
                 continue
+            # cpp#211: a `cp`/`mv` destination that (after `_extract_cp_mv_
+            # destination`'s shlex quote-stripping) BEGINS with `$` or `~` is an
+            # unresolved variable/tilde root — the SAME anti-respelling
+            # disqualifier `_is_lexically_disqualified_redirect_target` (cpp#154
+            # plan D3) already applies to redirect targets in the branch above,
+            # and for the SAME reason: `is_within_project` does no shell
+            # expansion, so `Path(cwd) / "$HOME/x"` (or `"~/x"`) resolves to a
+            # literal same-named subdirectory INSIDE the worktree and would
+            # wrongly read as CONTAINED — the exact accident that let a quoted
+            # `cp x "$HOME/y"` slip through veto=None while the bare
+            # `cp x $HOME/y` was refused (cpp#211 root cause 2). Failing closed
+            # here, before `is_within_project`, treats the quoted form exactly
+            # like the bare form. Deliberately scoped to a `$`/`~` LEADING root
+            # only (not the full lexical predicate): a leading-`/` absolute
+            # destination stays a worktree-containment CANDIDATE for the
+            # `is_within_project` resolve below, so an absolute path that
+            # actually resolves INSIDE the worktree is still admitted (cpp#176),
+            # and a merely space- or charset-bearing CONTAINED name
+            # (`cp x "a b"`) is not newly refused. The mktemp-scratch LETHALITY
+            # carve-out above (cpp#201/#209) already `continue`d past this for
+            # its one named idiom, so that survivability is unchanged; every
+            # other `$`/`~`-rooted cp/mv destination is refused under BOTH the
+            # REFUSAL and the LETHALITY question, matching the ratified
+            # `$HOME`-stays-terminal invariant (cpp#154 D3 / cpp#157).
+            if kind == "bash-cp-mv" and (
+                dest.startswith("$") or dest.startswith("~")
+            ):
+                return (
+                    f"destination {dest!r} is rooted at an unresolved "
+                    "variable/tilde ($/~) — treated as not contained "
+                    "(cpp#211 / cpp#154 D3 anti-respelling)"
+                )
             if not is_within_project(dest, cwd):
                 return (
                     f"destination {dest!r} resolves outside the worktree "

@@ -2376,3 +2376,80 @@ def test_cpp190_write_tail_full_handler_denies(tmp_path: Path) -> None:
     )
     result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
     assert isinstance(result, PermissionResultDeny)
+
+
+# ── cpp#211 — a QUOTED $/~-rooted cp/mv destination is no longer admitted ────
+#
+# Root cause 1 (this module's layer): the `bash-cp-mv` YAML rule's
+# whole-remainder disqualifiers were whitespace-anchored (`(?!.*\s\$)` …), so a
+# quoted operand (`"$HOME/y"`) put the opening quote — not the metacharacter —
+# after the space and the lookahead never fired. The same out-of-worktree
+# destination refused BARE (`cp x $HOME/y`) was ADMITTED quoted. The fix makes
+# each disqualifier quote-insensitive (`(?!.*\s["']?\$)` …). Both directions:
+# only $/~/`/`-ROOTING disqualifies; a legitimately CONTAINED quoted
+# destination stays admitted (quoting alone is never a refusal).
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Quoted $-rooted destination — the founding cpp#211 shape (cp and mv).
+        'cp secret "$HOME/exfil"',
+        'mv secret "$HOME/exfil"',
+        # Braced form.
+        'cp secret "${HOME}/exfil"',
+        # Single-quoted (no expansion in bash, but the policy must not admit it
+        # on the strength of the quote either).
+        "cp x '$HOME/y'",
+        # Quoted ~-rooted.
+        'cp x "~/y"',
+        'mv x "~/y"',
+        # Quoted absolute.
+        'cp x "/abs/y"',
+        # Bare forms still denied (parity with the quoted forms).
+        "cp secret $HOME/exfil",
+        "cp x ~/y",
+        "cp x /abs/y",
+    ],
+)
+def test_cpp211_quoted_rooted_cp_mv_destination_denied(cmd: str) -> None:
+    """Positive (the fix): every $/~/`/`-rooted cp/mv destination is refused at
+    the POLICY layer, whether the operand is quoted, braced, single-quoted, or
+    bare."""
+    assert _effective(cmd) == "deny", cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # A quoted CONTAINED destination strictly under the worktree — quoting
+        # alone must NOT cause a refusal.
+        'cp x "subdir/y"',
+        'cp x "./build/z"',
+        'mv old "nested/dir/new"',
+        # A quoted name containing a space is still contained — not disqualified.
+        'cp x "a b"',
+        # Unquoted contained forms unchanged.
+        "cp src/a.rs src/b.rs",
+        "mv old.py new.py",
+    ],
+)
+def test_cpp211_quoted_contained_cp_mv_destination_still_admitted(cmd: str) -> None:
+    """Negative / both-directions (must not over-tighten): a QUOTED contained
+    cp/mv destination is still ADMITTED at the policy layer. Only $/~/`/`
+    -rooting flips admitted->denied."""
+    assert _effective(cmd) == "allow", cmd
+
+
+def test_cpp211_full_honoring_path_quoted_home_denied(tmp_path: Path) -> None:
+    """Both fix layers together through the production honoring order (policy +
+    chain guard + `_destination_veto_reason`): a quoted `$HOME`/`~` destination
+    is refused, while a quoted contained one is admitted, in a REAL worktree."""
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective('cp secret "$HOME/exfil"', cwd) == "deny"
+    assert _dest_effective('mv secret "$HOME/exfil"', cwd) == "deny"
+    assert _dest_effective('cp x "~/y"', cwd) == "deny"
+    assert _dest_effective("cp x '$HOME/y'", cwd) == "deny"
+    # Contained quoted destination strictly under the worktree — admitted.
+    assert _dest_effective('cp source docs/plans/copy.md', cwd) == "allow"
+    assert _dest_effective('cp source "docs/plans/copy.md"', cwd) == "allow"
