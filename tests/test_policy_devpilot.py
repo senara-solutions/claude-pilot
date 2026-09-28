@@ -2533,3 +2533,160 @@ def test_cpp218_full_honoring_path_quoted_home_denied(tmp_path: Path) -> None:
     # cpp#218 is scoped to $/~ leading roots: a quoted absolute stays exactly as
     # HEAD decided it (veto: resolves outside the worktree) — unchanged.
     assert _dest_effective('mkdir "/abs/x"', cwd) == "deny"
+
+
+# ── mika#2562: re-admit the ce-* /tmp scratch cpp#218 collaterally denied ──────
+#
+# cpp#218's `$`/`~`-rooted `mkdir` destination veto turned the compound-engineering
+# ce-* scratch preamble (`SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"` …
+# `mkdir -p "$SCRATCH_ROOT"`) from a survivable refusal into a TERMINAL one,
+# killing the pilot at the top of every ce-* pipeline step. mika#2562 extends the
+# cpp#143 `/tmp`-scratch sanction (`_is_sanctioned_tmp_scratch`) on two bounded
+# axes so `_destination_veto_reason` no longer vetoes that class — WITHOUT
+# reopening any of the ratified negatives. Both directions, exhaustive on the
+# security boundary.
+
+_CE_PREAMBLE = (
+    'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"\n'
+    '(umask 077; mkdir -p "$SCRATCH_ROOT") || exit 1\n'
+    'chmod 700 "$SCRATCH_ROOT" || exit 1'
+)
+
+
+def _wt_handler(tmp_path):
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree), policy_path=_BUNDLED
+    )
+    return str(worktree), handler
+
+
+class TestCeScratchReadmittedDestinationVeto:
+    """`_destination_veto_reason` no longer vetoes the recognized ce-* scratch."""
+
+    def test_axis_a_same_command_var_no_longer_vetoed(self, tmp_path) -> None:
+        cwd = str(tmp_path)
+        cmd = 'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
+        assert _destination_veto_reason(cmd, cwd) is None
+        assert _destination_veto_reason(cmd, cwd, for_lethality=True) is None
+
+    def test_full_preamble_no_longer_vetoed(self, tmp_path) -> None:
+        cwd = str(tmp_path)
+        assert _destination_veto_reason(_CE_PREAMBLE, cwd) is None
+        assert _destination_veto_reason(_CE_PREAMBLE, cwd, for_lethality=True) is None
+
+    def test_axis_b_uid_token_literals_no_longer_vetoed(self, tmp_path) -> None:
+        cwd = str(tmp_path)
+        base = 'mkdir -p "/tmp/compound-engineering-{}"'
+        for tok in ("$UID", "${UID}", "$EUID", "$(id -u)", "`id -u`"):
+            assert _destination_veto_reason(base.format(tok), cwd) is None, tok
+
+    def test_negatives_still_vetoed(self, tmp_path) -> None:
+        cwd = str(tmp_path)
+        for cmd in (
+            'mkdir -p "$HOME/x"',                # $HOME exfil (cpp#218) — MUST stay
+            'mkdir -p "~/x"',
+            'X="/etc/evil"; mkdir -p "$X"',      # non-/tmp same-command assignment
+            'mkdir -p "$SCRATCH_ROOT"',          # no same-command assignment
+            'mkdir -p "/tmp/x-$(whoami)"',       # non-uid subst
+            'mkdir -p "/tmp/x-$(rm -rf /)"',     # non-uid subst
+            'mkdir -p "/tmp/x-$(id -u; rm -rf /)"',  # decorated uid subst
+            'mkdir -p "/tmp/$OTHER"',            # arbitrary var
+            'SCRATCH_ROOT="/tmp/ok"; mkdir -p "$SCRATCH_ROOT/../../etc"',  # traversal tail
+            'S="/tmp/../etc"; mkdir -p "$S"',    # traversal in assigned value
+        ):
+            assert _destination_veto_reason(cmd, cwd) is not None, cmd
+
+
+class TestCeScratchReadmittedHandlerEndToEnd:
+    """The regression fix, at the honoring point: the ce-* scratch step is no
+    longer TERMINAL (the kill), and the self-resolving uid-parameter literal
+    forms are genuinely admitted."""
+
+    def test_full_preamble_no_longer_terminal(self, tmp_path) -> None:
+        # cpp#218 made this DENY(interrupt=True) — the pilot-kill. The compound
+        # (leading assignment) is policy default-deny, so it does not reach a
+        # policy ALLOW; the fix restores the pre-cpp#218 SURVIVABLE refusal.
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(handler("Bash", _bash(_CE_PREAMBLE), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is False
+
+    def test_same_command_var_compound_no_longer_terminal(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        cmd = 'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"'
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is False
+
+    def test_uid_parameter_literal_is_admitted(self, tmp_path) -> None:
+        # A standalone `mkdir` under /tmp whose only expansion is a uid PARAMETER
+        # (no command substitution → chain-safe, policy=allow) is genuinely
+        # admitted once the destination veto is lifted.
+        _, handler = _wt_handler(tmp_path)
+        for tok in ("$UID", "${UID}", "$EUID"):
+            cmd = f'mkdir -p "/tmp/compound-engineering-{tok}"'
+            result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+            assert isinstance(result, PermissionResultAllow), tok
+
+    def test_home_exfil_stays_terminal(self, tmp_path) -> None:
+        # The cpp#218 invariant is intact: a quoted $HOME/~ rooted mkdir is
+        # still a TERMINAL destination veto.
+        _, handler = _wt_handler(tmp_path)
+        for cmd in ('mkdir -p "$HOME/x"', 'mkdir -p "~/x"'):
+            result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+            assert isinstance(result, PermissionResultDeny), cmd
+            assert result.interrupt is True, cmd
+
+    def test_non_uid_subst_and_non_tmp_stay_terminal(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        for cmd in (
+            'mkdir -p "/tmp/x-$(whoami)"',
+            'mkdir -p "/tmp/x-$(rm -rf /)"',
+            'X="/etc/evil"; mkdir -p "$X"',
+        ):
+            result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+            assert isinstance(result, PermissionResultDeny), cmd
+            assert result.interrupt is True, cmd
+
+
+# The CANONICAL ce-* preamble the plugin actually writes: SCRATCH_ROOT is a
+# recognized /tmp scratch, but RUN_DIR = "$SCRATCH_ROOT/ce-…/$RUN_ID" is rooted
+# in that variable (not a literal), so cpp#218 vetoed the `mkdir "$RUN_DIR"`
+# TERMINALLY. mika#2562's correction is LETHALITY ONLY: the mkdir STAYS denied,
+# only its terminality flips back to the pre-#218 survivable posture.
+_CE_CANON_PREAMBLE = (
+    'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)";\n'
+    '(umask 077; mkdir -p "$SCRATCH_ROOT") || exit 1;\n'
+    'chmod 700 "$SCRATCH_ROOT" || exit 1;\n'
+    "RUN_ID=$(date +%Y%m%d-%H%M%S)-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ');\n"
+    'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID";\n'
+    '(umask 077; mkdir -p "$RUN_DIR") || exit 1; chmod 700 "$RUN_DIR" || exit 1;'
+)
+
+
+class TestCeScratchCanonicalPreambleLethality:
+    """mika#2562 correction: the full canonical preamble is SURVIVABLE, not fatal,
+    while the deny (admission) is byte-identical. Lethality only."""
+
+    def test_canonical_preamble_is_survivable_but_still_refused(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(handler("Bash", _bash(_CE_CANON_PREAMBLE), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)   # deny unchanged
+        assert result.interrupt is False                  # survivable (was fatal on HEAD)
+
+    def test_admission_byte_identical_for_canonical(self, tmp_path) -> None:
+        # The refusal side (`for_lethality=False`) is untouched: still vetoed.
+        cwd = str(tmp_path)
+        assert (
+            _destination_veto_reason(_CE_CANON_PREAMBLE, cwd, for_lethality=False)
+            is not None
+        )
+
+    def test_transitive_reassign_out_of_scratch_stays_fatal(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        cmd = 'SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir -p "$RUN"'
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is True                   # last-wins → non-scratch → fatal

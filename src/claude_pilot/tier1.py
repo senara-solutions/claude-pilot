@@ -615,6 +615,215 @@ def _is_mktemp_scratch_redirect_target(command: str, dest: str) -> bool:
     return m.group("var") in _mktemp_scratch_variable_names(command)
 
 
+# ── ce-* /tmp scratch sanction: uid token + same-command var tracing (mika#2562) ─
+#
+# The compound-engineering ce-* skills open EVERY /mika pipeline step with this
+# preamble (SKILL.md step 6, single Bash string, multi-line):
+#
+#     SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"
+#     (umask 077; mkdir -p "$SCRATCH_ROOT") || exit 1
+#     chmod 700 "$SCRATCH_ROOT" || exit 1
+#
+# cpp#143 already sanctions a LITERAL /tmp scratch mkdir (`_is_sanctioned_tmp_
+# scratch`, `_TMP_SCRATCH_MKDIR_RE = ^/tmp/(?!.*\.\.)[\w./-]+$`). Two things put
+# the ce-* scratch OUTSIDE that literal recognition, and cpp#218's `$`-rooted
+# `mkdir` veto (`permissions._destination_veto_reason`) then turned the resulting
+# refusal TERMINAL — killing the pilot at the top of every ce-* step (mika#2562):
+#
+#   * AXIS A — the mkdir target is a VARIABLE (`$SCRATCH_ROOT`), not the literal.
+#   * AXIS B — the assigned VALUE carries a `$(id -u)` command substitution, so
+#     `_TMP_SCRATCH_MKDIR_RE`'s `[\w./-]` charset rejects it even as a literal.
+#
+# These two helpers extend the cpp#143 recognition on BOTH axes, each TIGHTLY
+# bounded — the same discipline as cpp#201's mktemp same-command tracing
+# (`_is_mktemp_scratch_redirect_target` above), which this mirrors:
+#
+#   * Axis B is a LITERAL WHITELIST of exactly the benign uid tokens
+#     (`$(id -u)`, `` `id -u` ``, `$UID`, `${UID}`, `$EUID`, `${EUID}`) — never
+#     arbitrary `$(...)` or `$VAR`. A path with ANY other substitution
+#     (`/tmp/x-$(whoami)`, `/tmp/x-$(rm -rf /)`, `/tmp/$OTHER`) still fails,
+#     because after replacing ONLY the whitelisted tokens the remainder must
+#     match the plain-`/tmp`-scratch charset, which admits no residual
+#     `$`/backtick/`(`/`)`. The uid-token regex is anchored so a decorated
+#     subst (`$(id -u; rm -rf /)`, `$(id -u$(evil))`) never matches the token
+#     and its metacharacters survive into the charset check, which rejects them.
+#   * Axis A resolves a `$VAR`/`${VAR}` mkdir/chmod target to a `/tmp`-scratch
+#     literal ONLY when the SAME command string assigns that var to such a
+#     literal (uid-tolerant). A var with no same-command assignment, or one
+#     assigned to a NON-`/tmp` value (`X="/etc/evil"`), is not recognized and
+#     stays refused by the ordinary cpp#218 / cpp#38 veto. A traversal tail on
+#     the reference (`"$SCRATCH_ROOT/../etc"`) is not a bare var reference, so it
+#     never matches and stays refused too.
+#
+# LEXICAL only — no `Path.resolve`, no filesystem access — matching cpp#143's own
+# rule (never resolve to GRANT). Consulted ONLY by `permissions._is_sanctioned_
+# tmp_scratch`; `is_tier1_auto_approve` and every YAML rule are untouched.
+_UID_TOKEN_RE = re.compile(
+    r"\$\(\s*id\s+-u\s*\)"          # $(id -u)  (optional inner whitespace)
+    r"|`\s*id\s+-u\s*`"             # `id -u`
+    r"|\$\{UID\}|\$\{EUID\}"        # ${UID} / ${EUID}
+    r"|\$UID(?![A-Za-z0-9_])"       # $UID   (not a longer name like $UIDFOO)
+    r"|\$EUID(?![A-Za-z0-9_])"      # $EUID
+)
+
+# Same charset as `_TMP_SCRATCH_MKDIR_RE` in permissions.py — kept in lockstep
+# (the uid-token substitution below reduces to exactly this after masking).
+_CE_SCRATCH_TMP_RE = re.compile(r"^/tmp/(?!.*\.\.)[\w./-]+$")
+
+# A `VAR=<value>` assignment whose value is a `/tmp/...` literal (quoted or bare).
+# The double-quoted branch is what the real preamble uses and is the only one
+# that can carry `$(id -u)` (the subst's internal space needs the quotes). The
+# bare branch excludes `(`/`)`/quotes/separators so it never spans a subst.
+_CE_SCRATCH_ASSIGN_RE = re.compile(
+    r"(?<![\w$])(?P<var>[A-Za-z_][A-Za-z0-9_]*)="
+    r"""(?:"(?P<dq>/tmp/[^"]*)"|'(?P<sq>/tmp/[^']*)'|(?P<bare>/tmp/[^\s"'`;|&()]+))"""
+)
+
+# A bare (shlex-stripped) variable reference: the WHOLE operand is `$VAR` or
+# `${VAR}`, with at most one trailing `)` (the artifact of a `(subshell; mkdir
+# -p "$V")` split). A tail (`$V/x`, `$V/../etc`) does NOT match — such an
+# operand is not a bare scratch reference and stays under the ordinary veto.
+_CE_SCRATCH_VARREF_RE = re.compile(
+    r"^\$\{?(?P<var>[A-Za-z_][A-Za-z0-9_]*)\}?\)?$"
+)
+
+
+def _is_uid_tolerant_tmp_scratch(value: str) -> bool:
+    """Axis B (mika#2562): whether ``value`` is a ``/tmp`` scratch literal that
+    is plain except for the whitelisted uid tokens.
+
+    Masks ONLY the exact uid tokens, then requires the remainder to be an
+    ordinary cpp#143 ``/tmp`` scratch — so any OTHER substitution or variable in
+    the path survives the mask and fails the charset. See the block comment above.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    masked = _UID_TOKEN_RE.sub("0", value)
+    return _CE_SCRATCH_TMP_RE.match(masked) is not None
+
+
+def _ce_scratch_variable_names(command: str) -> frozenset[str]:
+    """Every var name ``command`` assigns, anywhere in its raw text, to a
+    uid-tolerant ``/tmp`` scratch literal (mika#2562).
+
+    Mirrors ``_mktemp_scratch_variable_names``: scans the WHOLE command (the
+    assignment and the mkdir/chmod that consumes it are different compound
+    segments), and is only ever consulted to GRANT a recognition on a command
+    that is otherwise refused — so an over-generous match on inert heredoc-body
+    text is bounded to a refusal that stays a refusal.
+    """
+    names: set[str] = set()
+    for m in _CE_SCRATCH_ASSIGN_RE.finditer(command):
+        value = m.group("dq") or m.group("sq") or m.group("bare")
+        if value is not None and _is_uid_tolerant_tmp_scratch(value):
+            names.add(m.group("var"))
+    return frozenset(names)
+
+
+def _is_ce_scratch_variable_ref(command: str, dest: str) -> bool:
+    """Axis A (mika#2562): whether the (shlex-stripped) target ``dest`` is a bare
+    ``$VAR``/``${VAR}`` reference to a var ``command`` itself assigns to a
+    uid-tolerant ``/tmp`` scratch literal.
+
+    Mirrors ``_is_mktemp_scratch_redirect_target``. LEXICAL only.
+    """
+    m = _CE_SCRATCH_VARREF_RE.match(dest)
+    if m is None:
+        return False
+    return m.group("var") in _ce_scratch_variable_names(command)
+
+
+# --- mika#2562 correction: TRANSITIVE scratch-rooting, LETHALITY ONLY ---------
+# The canonical ce-* preamble builds `RUN_DIR="$SCRATCH_ROOT/ce-…/$RUN_ID"` then
+# `mkdir -p "$RUN_DIR"`. `$RUN_DIR`'s value is `$<recognized-scratch-var>/<suffix>`,
+# NOT a `/tmp` literal, so axis A (`_is_ce_scratch_variable_ref`) does not admit it
+# and cpp#218's `$`-rooted mkdir veto fires TERMINALLY. Pre-#218 that same preamble
+# was a SURVIVABLE deny (the assignment-prefixed compound is policy default-deny,
+# non-terminal — the dir was never created by that command). So the regression is
+# purely the terminality. This carve restores the pre-#218 posture: it is consulted
+# ONLY from the `for_lethality` veto path (see `permissions._destination_veto_reason`),
+# never from an admission call, so the deny STAYS a deny and NOTHING new is admitted —
+# only `_denial_is_terminal` flips to False. Same shape as the cpp#201/#209/#213
+# lethality carves.
+#
+# Resolution is LAST-WINS (`_last_assignment_value`), so a reassignment out of scratch
+# (`SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir "$RUN"`) stays FATAL. (The DIRECT
+# `X=/tmp/ok; X=$HOME/evil; mkdir "$X"` form is admitted+survivable by the pre-existing
+# axis-A admission, which is NOT last-wins — a separate pre-existing tightening, cpp#224,
+# out of scope here.)
+_ANY_ASSIGNMENT_RE = re.compile(
+    r'(?<![\w$])(?P<var>[A-Za-z_][A-Za-z0-9_]*)='
+    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s;|&()<>]*))'
+)
+_TMPDIR_DEFAULT_RE = re.compile(r"^\$\{TMPDIR:?-/tmp\}(?P<rest>/.*)$")
+_TRANSITIVE_VAR_PREFIX_RE = re.compile(
+    r"^\$\{(?P<vb>[A-Za-z_][A-Za-z0-9_]*)\}(?P<tb>/.*)$"
+    r"|^\$(?P<v>[A-Za-z_][A-Za-z0-9_]*)(?P<t>/.*)$"
+)
+_TRANSITIVE_SCRATCH_MAX_DEPTH = 8
+
+
+def _last_assignment_value(command: str, var: str) -> str | None:
+    """LAST-WINS value of the last same-command ``var=…`` assignment, else None.
+
+    Matches ANY assignment value (not only ``/tmp`` ones), so a reassignment OUT
+    of scratch is seen and overrides an earlier scratch assignment.
+    """
+    found: str | None = None
+    for m in _ANY_ASSIGNMENT_RE.finditer(command):
+        if m.group("var") == var:
+            if m.group("dq") is not None:
+                found = m.group("dq")
+            elif m.group("sq") is not None:
+                found = m.group("sq")
+            else:
+                found = m.group("bare")
+    return found
+
+
+def _is_tmpdir_default_scratch(value: str) -> bool:
+    """``${TMPDIR:-/tmp}/<rest>`` treated as a ``/tmp`` scratch root (the canonical
+    preamble's fallback), the ``<rest>`` held to the same uid-tolerant charset."""
+    m = _TMPDIR_DEFAULT_RE.match(value)
+    if m is None:
+        return False
+    return _is_uid_tolerant_tmp_scratch("/tmp" + m.group("rest"))
+
+
+def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
+    """Whether ``value`` roots (transitively, via same-command LAST-WINS assignments)
+    at a recognized scratch. LEXICAL, bounded depth, refuses ``..`` in a suffix."""
+    if depth > _TRANSITIVE_SCRATCH_MAX_DEPTH or not value:
+        return False
+    if _is_uid_tolerant_tmp_scratch(value) or _is_tmpdir_default_scratch(value):
+        return True
+    m = _TRANSITIVE_VAR_PREFIX_RE.match(value)
+    if m is None:
+        return False
+    inner = m.group("vb") or m.group("v")
+    tail = m.group("tb") or m.group("t")
+    if ".." in tail:
+        return False
+    nxt = _last_assignment_value(command, inner)
+    if nxt is None:
+        return False
+    return _value_roots_at_scratch(nxt, command, depth + 1)
+
+
+def _is_transitive_ce_scratch_mkdir_target(command: str, dest: str) -> bool:
+    """LETHALITY-ONLY: whether the (shlex-stripped) ``dest`` is a bare ``$VAR``
+    whose LAST same-command assignment roots (transitively) at a recognized
+    scratch. Consulted only from the ``for_lethality`` veto path; the deny stays.
+    """
+    m = _CE_SCRATCH_VARREF_RE.match(dest)
+    if m is None:
+        return False
+    value = _last_assignment_value(command, m.group("var"))
+    if value is None:
+        return False
+    return _value_roots_at_scratch(value, command, 0)
+
+
 def _is_contained_redirect_target(dest: str) -> bool:
     """Whether a LITERAL redirect target text is contained: in-worktree (relative)
     or under ``/tmp`` (cpp#154).

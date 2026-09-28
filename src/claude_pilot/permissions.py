@@ -27,9 +27,12 @@ from .guardrails import SessionGuardrails
 from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
+    _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_lexically_disqualified_redirect_target,
     _is_mktemp_scratch_redirect_target,
+    _is_transitive_ce_scratch_mkdir_target,
+    _is_uid_tolerant_tmp_scratch,
     _mask_quoted_redirect_chars,
     _redirect_targets,
     _split_compound_command,
@@ -1177,9 +1180,9 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
 _TMP_SCRATCH_MKDIR_RE = re.compile(r"^/tmp/(?!.*\.\.)[\w./-]+$")
 
 
-def _is_sanctioned_tmp_scratch(dest: str) -> bool:
+def _is_sanctioned_tmp_scratch(dest: str, command: str = "") -> bool:
     """Whether an (already `mkdir`-classified) raw destination operand is the
-    sanctioned ``/tmp`` scratch exception (cpp#143).
+    sanctioned ``/tmp`` scratch exception (cpp#143, extended by mika#2562).
 
     Purely lexical — no filesystem access, no symlink resolution — matching
     ``_is_sanctioned_pure_heredoc``'s own mechanism exactly. ``dest`` must be
@@ -1187,8 +1190,37 @@ def _is_sanctioned_tmp_scratch(dest: str) -> bool:
     returns): only a command that itself spells ``/tmp/...`` qualifies, so a
     symlink or relative path that merely *resolves into* ``/tmp`` does not —
     it is still caught by the ordinary containment veto below (cpp#38).
+
+    mika#2562 extends this recognition on TWO tightly bounded axes so the
+    compound-engineering ce-* scratch preamble
+    (``SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"`` … ``mkdir -p
+    "$SCRATCH_ROOT"``) is re-admitted, without reopening the cpp#218 ``$HOME``
+    exfil hole. See the block comment above ``tier1._is_uid_tolerant_tmp_scratch``
+    for the full boundary and why each axis is safe:
+
+      * AXIS B — a literal ``/tmp`` scratch that carries ONLY a whitelisted uid
+        token (``$(id -u)``, `` `id -u` ``, ``$UID``/``${UID}``,
+        ``$EUID``/``${EUID}``). Any other substitution/variable still fails.
+      * AXIS A — a bare ``$VAR``/``${VAR}`` operand whose value ``command`` itself
+        assigns (same command string) to such a uid-tolerant ``/tmp`` scratch
+        literal. Requires ``command`` to be passed; a var with no same-command
+        ``/tmp``-scratch assignment is NOT recognized and stays under the veto.
+
+    Both axes are refusal-safe by construction: an unrecognized operand simply
+    falls through to the cpp#218 (``$``/``~``-rooted) and cpp#38 (containment)
+    vetoes exactly as before.
     """
-    return bool(dest) and _TMP_SCRATCH_MKDIR_RE.match(dest) is not None
+    if not dest:
+        return False
+    if _TMP_SCRATCH_MKDIR_RE.match(dest) is not None:
+        return True
+    # Axis B: literal /tmp scratch tolerating ONLY the whitelisted uid tokens.
+    if _is_uid_tolerant_tmp_scratch(dest):
+        return True
+    # Axis A: a same-command variable assigned to a uid-tolerant /tmp scratch.
+    if command and _is_ce_scratch_variable_ref(command, dest):
+        return True
+    return False
 
 
 def _destination_veto_reason(
@@ -1260,7 +1292,7 @@ def _destination_veto_reason(
                 "parsed — denied fail-closed"
             )
         for dest in dests:
-            if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest):
+            if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest, command):
                 continue
             # cpp#195 (both the original fix and this follow-up): `bash-git-
             # show-redirect` (cpp#35/#128, `git show <ref>:<path> >`, predates
@@ -1475,6 +1507,23 @@ def _destination_veto_reason(
             # name is not newly refused. The sanctioned `/tmp` scratch carve-out
             # above (`_is_sanctioned_tmp_scratch`, cpp#143) already `continue`d
             # past this for its named idiom, so that exception is unchanged.
+            # mika#2562 correction — LETHALITY ONLY. A `mkdir` whose destination
+            # is a variable that (LAST-WINS, transitively) roots at a recognized
+            # `/tmp` scratch (`RUN_DIR="$SCRATCH_ROOT/…"`; `${TMPDIR:-/tmp}/…`)
+            # is the canonical ce-* preamble. Pre-#218 that compound was a
+            # SURVIVABLE deny (dir never created by it); cpp#218's veto made it
+            # TERMINAL. `for_lethality`-gated, so this is a NO-OP on every
+            # admission call (the deny is unchanged, byte-identical) and flips
+            # only `_denial_is_terminal` back to survivable — same shape as the
+            # cpp#201/#209 mktemp lethality carve just above. The direct-reassign
+            # admission gap (`X=/tmp/ok; X=$HOME/evil; mkdir "$X"`) is a
+            # pre-existing non-last-wins axis-A defect, out of scope (cpp#224).
+            if (
+                for_lethality
+                and kind == "bash-mkdir"
+                and _is_transitive_ce_scratch_mkdir_target(command, dest)
+            ):
+                continue
             if kind == "bash-mkdir" and (
                 dest.startswith("$") or dest.startswith("~")
             ):
