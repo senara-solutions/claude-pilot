@@ -33,7 +33,9 @@ from .tier1 import (
     _is_mktemp_scratch_redirect_target,
     _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
+    _mask_lethality_redirect_chars,
     _mask_quoted_redirect_chars,
+    _needs_lethality_redirect_mask,
     _redirect_targets,
     _split_compound_command,
     is_safe_bash_command,
@@ -898,7 +900,24 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # cpp#154 the blanket `>` tier3 pattern covered all three by accident. This
     # call restores the two checks AC2 names — control plane and cwd escape —
     # for redirect targets specifically. Order mirrors `_destination_veto_reason`.
-    if _redirect_destination_veto_reason(command, cwd) is not None:
+    # cpp#236: a `<`/`>` inside a quote or a command/process substitution is not
+    # an outer-command redirect. The flat quote scanner desyncs on the `'"'"'`-
+    # in-`$(...)` idiom (the `<email>` Co-Authored-By trailer), leaking the
+    # trailer `>` into the redirect vetoes as a phantom out-of-worktree target.
+    # Re-mask non-TOP-level `<`/`>` with the substitution-aware context parser
+    # before the redirect/destination vetoes, ONLY when a substitution or an
+    # unbalanced quote is present, so every other command is byte-identical to
+    # HEAD. The verb check above already ran on the RAW command, so a dangerous
+    # verb / process substitution inside `$(...)`/`<(...)` stayed terminal and
+    # never reaches here; mkdir/cp/mv destination vetoes are classified by
+    # leading word (unaffected by `<`/`>` masking); a real UNQUOTED outer
+    # redirect (`> /etc/passwd`) is TOP-level and is never masked.
+    veto_command = (
+        _mask_lethality_redirect_chars(command)
+        if _needs_lethality_redirect_mask(command)
+        else command
+    )
+    if _redirect_destination_veto_reason(veto_command, cwd) is not None:
         return True
     # cpp#201: `for_lethality=True` narrows exactly one case — a redirect
     # target rooted at a variable the SAME command assigns from `mktemp`'s
@@ -914,7 +933,7 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # everywhere else `_destination_veto_reason` is called) still vetoes it
     # for the REFUSAL. See `_destination_veto_reason`'s own docstring and its
     # per-target loop for the mechanism.
-    return _destination_veto_reason(command, cwd, for_lethality=True) is not None
+    return _destination_veto_reason(veto_command, cwd, for_lethality=True) is not None
 
 
 # ── Destination validation for write-capable structural rules (cpp#38, cpp#42) ─

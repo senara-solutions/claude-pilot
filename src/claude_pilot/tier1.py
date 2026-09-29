@@ -1013,6 +1013,124 @@ def _mask_quoted_redirect_chars(command: str) -> str:
     return "".join(out)
 
 
+# ── cpp#236: a `<`/`>` that is not a TOP-level outer redirect operator ────────
+#
+# Pilot 946d2786 (mika#2578) died on a benign `git commit -m "$(printf … 'Co-
+# Authored-By: … <noreply@anthropic.com>' …)"`. The `>` closing the quoted
+# trailer email leaked into the destination veto as a phantom out-of-worktree
+# redirect. `_mask_quoted_redirect_chars` misses it: the `'"'"'` literal-
+# apostrophe idiom embeds a `"` inside the outer `"$( … )"`, and bash parses
+# `$(…)` RECURSIVELY (re-scoping quotes) while `_quote_spans` is flat — with an
+# odd `'"'"'` count the scanner desyncs, reports the trailing region
+# unterminated (→ mask returns the command unchanged, cpp#157 D5) AND leaves the
+# trailer `>` between spans (phantom-unquoted). `shlex` fails on the same input
+# ("No closing quotation"). Only an explicit substitution-context parser works.
+#
+# LETHALITY PATH ONLY — never consulted by `is_tier3_dangerous` / `TIER3_PATTERNS`
+# / tier1 / `is_tier3_dangerous_for_lethality`; admission is byte-identical.
+def _mask_lethality_redirect_chars(command: str) -> str:
+    r"""Blank every ``<``/``>`` that is NOT a TOP-level outer-command redirect
+    operator — one inside a single/double quote, a command substitution
+    ``$(...)``, or a backtick region — leaving real outer redirect operators
+    intact. Length-preserving (one space per masked char). Purely lexical.
+    """
+    out = list(command)
+    stack: list[str] = []          # "DQ" | "SQ" | "SUB" | "BT"
+    sub_paren: list[int] = []      # nested-paren depth, one entry per SUB frame
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        top = stack[-1] if stack else "TOP"
+        if top == "SQ":            # single quotes: no escapes; only ' closes
+            if ch == "'":
+                stack.pop()
+            elif ch in "<>":
+                out[i] = " "
+            i += 1
+            continue
+        if top == "BT":            # backtick: \X escapes; ` closes
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "`":
+                stack.pop()
+            elif ch in "<>":
+                out[i] = " "
+            i += 1
+            continue
+        # top in TOP / DQ / SUB : \X is an atomic escape pair
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            stack.append("SUB")
+            sub_paren.append(0)
+            i += 2
+            continue
+        if ch == "`":
+            stack.append("BT")
+            i += 1
+            continue
+        if ch == '"':
+            if top == "DQ":
+                stack.pop()
+            else:
+                stack.append("DQ")
+            i += 1
+            continue
+        if ch == "'":
+            if top in ("TOP", "SUB"):   # inside "..." a ' is a literal char
+                stack.append("SQ")
+            i += 1
+            continue
+        if top == "SUB":
+            if ch == "(":
+                sub_paren[-1] += 1
+            elif ch == ")":
+                if sub_paren[-1] > 0:
+                    sub_paren[-1] -= 1
+                else:
+                    stack.pop()
+                    sub_paren.pop()
+            elif ch in "<>":
+                out[i] = " "
+            i += 1
+            continue
+        if top == "DQ":
+            if ch in "<>":
+                out[i] = " "
+            i += 1
+            continue
+        # TOP: a real outer redirect operator — leave intact.
+        i += 1
+    if stack:
+        # Genuinely unterminated (a quote/substitution never closed): fail-closed
+        # toward lethal (cpp#157 D5) — do NOT exempt any `<`/`>`. The verbatim
+        # `'"'"'`-in-`$(…)` killer parses BALANCED here (every context closes) and
+        # is still masked; only a real dangling quote reaches this and is left raw.
+        return command
+    return "".join(out)
+
+
+def _has_unterminated_quote(command: str) -> bool:
+    """True when the trailing quoted region runs off the end unterminated per the
+    shared ``_quote_spans`` scanner — the condition under which
+    ``_mask_quoted_redirect_chars`` returns the command unchanged and a quoted
+    ``<``/``>`` leaks into redirect extraction (cpp#236). Purely lexical.
+    """
+    spans = _quote_spans(command)
+    return bool(spans) and not spans[-1][2]
+
+
+def _needs_lethality_redirect_mask(command: str) -> bool:
+    """Whether the substitution-aware mask is required (cpp#236): a command
+    carrying a command/process substitution or an unbalanced quote — the only
+    cases where a ``<``/``>`` cannot be attributed by the flat scanner. Every
+    other command uses the raw text, so lethality is byte-identical to HEAD.
+    """
+    return "$(" in command or "`" in command or _has_unterminated_quote(command)
+
+
 # ── mika#2573 (case A): a print-only `sed` segment is not proven danger ──────
 #
 # A `sed -n '<addr>[,<addr>]p'` invocation (the closed-world print-only shape
