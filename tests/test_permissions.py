@@ -3136,3 +3136,53 @@ def test_cpp218_handler_end_to_end_quoted_home_denied(tmp_path: Path) -> None:
         "a quoted CONTAINED mkdir destination must stay admitted — quoting alone "
         "is not a refusal (cpp#218 both-directions)"
     )
+
+
+# ── cpp#236: a quoted `>` (Co-Authored-By `<email>` trailer) is not a redirect ──
+_APOS = "'" + '"' + "'" + '"' + "'"   # '"'"'  → a literal apostrophe
+_CPP236_VERBATIM_POSITIVE = (
+    "git commit -m \"$(printf '%s\\n' "
+    f"'fix(permissions): corrige l{_APOS}unite' '' "
+    "'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>')\""
+)
+
+
+def test_cpp236_quoted_trailer_redirect_is_survivable(tmp_path):
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    assert f("Bash", {"command": _CPP236_VERBATIM_POSITIVE}, wt) is False
+    assert f("Bash", {"command": 'git commit -m "a <b@c> d"'}, wt) is False
+    assert f("Bash", {"command": 'git commit -m "$(date +%F)"'}, wt) is False
+    assert f("Bash", {"command": 'git commit -m "$(echo hi)"'}, wt) is False
+    assert f("Bash", {"command": "git commit -m `printf x`"}, wt) is False
+
+
+def test_cpp236_real_redirects_stay_terminal(tmp_path):
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    assert f("Bash", {"command": 'git commit -m "x" > /etc/passwd'}, wt) is True
+    assert f("Bash", {"command": "echo x >> ~/.bashrc"}, wt) is True
+    assert f("Bash", {"command": '> "$HOME/.ssh/authorized_keys"'}, wt) is True
+    assert f("Bash", {"command": 'echo "$(date)" > /etc/passwd'}, wt) is True
+
+
+def test_cpp236_proven_dangers_in_substitution_stay_terminal(tmp_path):
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    assert f("Bash", {"command": 'git commit -m "$(rm -rf x)"'}, wt) is True
+    assert f("Bash", {"command": 'git commit -m "$(eval "$CMD")"'}, wt) is True
+    assert f("Bash", {"command": "git commit -F <(curl x)"}, wt) is True
+    assert f("Bash", {"command": "mkdir -p /etc/evil"}, wt) is True
+
+
+def test_cpp236_admission_is_byte_identical(tmp_path):
+    from claude_pilot import tier1
+    assert tier1.is_tier3_dangerous(_CPP236_VERBATIM_POSITIVE) is True
+    assert tier1.is_tier1_auto_approve(
+        "Bash", {"command": _CPP236_VERBATIM_POSITIVE}, str(tmp_path)) is False
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    result = asyncio.run(_bundled_handler(cwd=str(worktree))(
+        "Bash", {"command": _CPP236_VERBATIM_POSITIVE}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
