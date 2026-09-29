@@ -3979,3 +3979,40 @@ class TestCeScratchSanctionUnit:
     def test_transitive_terminates_on_cycle(self) -> None:
         cmd = "A=$B/x; B=$A/y; mkdir -p \"$A\""
         assert _is_transitive_ce_scratch_mkdir_target(cmd, "$A") is False
+
+
+class TestTier3EvalCommandPositionLethality:
+    """mika#2573 case A: `eval` is lethal ONLY at command position. As an ordinary
+    argument (`cargo test --test eval <name>`, `--eval`) it must not terminalize;
+    the REFUSAL (`is_tier3_dangerous`) is unchanged — lethality only."""
+
+    def test_bareword_eval_argument_is_survivable(self) -> None:
+        # the verbatim mika#2573 killer (`--test eval <name>`) + a bare `--eval`
+        assert (
+            is_tier3_dangerous_for_lethality(
+                "cargo test -p mika-agent --test eval verdict_x 2>&1 "
+                "| sed -n '/running 1 test/,/test result/p' | head -40"
+            )
+            is False
+        )
+        assert is_tier3_dangerous_for_lethality("foo --eval bar") is False
+
+    def test_real_eval_at_command_position_stays_terminal(self) -> None:
+        for cmd in (
+            'eval "$(x)"',
+            "echo x | eval y",
+            "foo && eval x",
+            "foo; eval x",
+            "(eval x)",
+        ):
+            assert is_tier3_dangerous_for_lethality(cmd) is True, cmd
+
+    def test_admission_byte_identical_refusal_unchanged(self) -> None:
+        # the REFUSAL question keeps consulting the unchanged `\beval\s`
+        assert is_tier3_dangerous('eval "$(x)"') is True
+        assert (
+            is_tier3_dangerous(
+                "cargo test --test eval v 2>&1 | sed -n '/a/p'"
+            )
+            is True
+        )
