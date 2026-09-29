@@ -1498,6 +1498,57 @@ class TestTier3SedIDevnullLethality:
         )
 
 
+class TestTier3PrintOnlySedLethality:
+    """mika#2573 (case A): a print-only `sed -n '<addr>[,<addr>]p'` SEGMENT is
+    blanked before the lethality verb scan, so the LITERAL TEXT of its print
+    script — which may name a dangerous verb it is searching FOR — no longer
+    makes the denial session-fatal. Read filters are not proven danger (cpp#205).
+
+    `is_tier3_dangerous` (the REFUSAL) is untouched, so the command stays denied;
+    only `is_tier3_dangerous_for_lethality` (consulted by `_denial_is_terminal`)
+    drops the print-only sed segment. Reuses `_is_safe_sed_print_only` verbatim.
+    """
+
+    def test_print_only_sed_over_danger_string_not_lethal(self) -> None:
+        # Positive, red-before-this-fix: a print-only sed whose SCRIPT contains a
+        # dangerous-verb substring trips the verb it searches for. Measured True
+        # on pre-fix HEAD; must now be survivable.
+        assert (
+            is_tier3_dangerous_for_lethality("cargo build 2>&1 | sed -n '/rm -rf/p' | head")
+            is False
+        )
+        assert is_tier3_dangerous_for_lethality("grep x | sed -n '/DROP TABLE/p'") is False
+        assert (
+            is_tier3_dangerous_for_lethality("sed -n '/git reset --hard/p' log.txt")
+            is False
+        )
+
+    def test_print_only_sed_still_refused(self) -> None:
+        # Invariant: the REFUSAL classifier is untouched — the compound stays
+        # tier3-dangerous (the `rm -rf` substring still matches for the refusal).
+        assert is_tier3_dangerous("cargo build 2>&1 | sed -n '/rm -rf/p' | head") is True
+
+    def test_danger_outside_print_only_sed_stays_lethal(self) -> None:
+        # Negative: only the print-only sed SEGMENT is blanked; a real dangerous
+        # verb in another segment still matches and stays fatal.
+        assert (
+            is_tier3_dangerous_for_lethality("rm -rf /etc | sed -n '/x/p'") is True
+        )
+        assert (
+            is_tier3_dangerous_for_lethality("sed -n '/x/p' log && rm -rf /etc")
+            is True
+        )
+
+    def test_non_print_only_sed_not_blanked(self) -> None:
+        # Negative: an `-i` in-place sed is NOT print-only, so it is not blanked
+        # here and stays fatal at this (cwd-free) layer, exactly as cpp#203 pins.
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' realfile.rs") is True
+        # A `sed` with a `w` write command is not `-n ... p` print-only and is
+        # not blanked (it is not proven-danger by any verb here either, so this
+        # merely confirms the carve does not touch it).
+        assert _is_safe_sed_print_only("sed 'w /tmp/x' file") is False
+
+
 class TestTier3ContainedRedirectLethality:
     """cpp#154: a redirect whose LITERAL target is contained — under `/tmp/` or
     relative to the worktree — stays REFUSED but is no longer session-fatal.
