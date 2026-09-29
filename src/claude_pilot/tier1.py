@@ -3224,23 +3224,64 @@ def rm_confined_to_pilot_scratch(command: str, cwd: str) -> bool:
 # direction keeps the command TERMINAL, matching cpp#213's boundary that this
 # only ever flips terminal→survivable, never refused→allowed.
 
-# A `sed -i` in-place script restricted to a SINGLE write-free substitution,
-# optional leading address/range. Reusing the exact separators and flag charset
-# of `_SAFE_SED_SUB_RES`/`_is_safe_sed_pure_substitution` (only `g`/`p`/`i`/`I`/
-# `m`/`M`/digits — NO `w`/`W` write flag, NO `e` exec flag), so the carve can
-# NEVER apply to a script that writes to, reads from, or execs another file. A
-# standalone `w`/`W`/`r`/`R`/`e` command, a multi-command script (`;`), a `d`/
-# `y`/`a`/`i`/`c` command, or an unrecognized separator all fail this positive
-# match and keep the segment TERMINAL (fail-closed). The incident's script is a
-# plain address-range substitution and matches.
+# ONE `sed -i` in-place write-free substitution UNIT, optional leading address/
+# range, matched from the start of the (whitespace-stripped) string but NOT
+# anchored at the end — `_sed_i_script_all_safe_subs` (cpp#243) consumes these
+# units one at a time, requiring a `;` between them, so a multi-substitution
+# script (`s/a/b/g; s/c/d/g`, several `-e`) is validated without ever
+# hand-parsing the script to find where it ends. Reuses the exact separators and
+# flag charset of `_SAFE_SED_SUB_RES`/`_is_safe_sed_pure_substitution` (only
+# `g`/`p`/`i`/`I`/`m`/`M`/digits — NO `w`/`W` write flag, NO `e` exec flag), so
+# the carve can NEVER apply to a script that writes to, reads from, or execs
+# another file. A standalone `w`/`W`/`r`/`R`/`e` command, a trailing `w FILE`
+# write on a substitution (`s/a/b/w /etc/x` — `w` is not in the flag charset,
+# so the unit ends before it and the leftover `w …` matches no further unit), a
+# `d`/`y`/`a`/`i`/`c` command, or an unrecognized separator all fail the scan
+# and keep the segment TERMINAL (fail-closed). The incident's script is a plain
+# address-range substitution and matches.
 _SED_I_ADDR = r"(?:\d+|\$|/(?:[^/\\]|\\.)*/)"
-_SED_I_SAFE_SUBST_SCRIPT_RE = re.compile(
-    r"^\s*(?:" + _SED_I_ADDR + r"(?:," + _SED_I_ADDR + r")?)?"
+_SED_I_SUBST_UNIT_RE = re.compile(
+    r"\s*(?:" + _SED_I_ADDR + r"(?:," + _SED_I_ADDR + r")?)?"
     r"s(?P<sep>[/@#|:])"
     r"(?:(?!(?P=sep))[^\\]|\\.)*(?P=sep)"
     r"(?:(?!(?P=sep))[^\\]|\\.)*(?P=sep)"
-    r"[gpiImM0-9]*\s*$"
+    r"[gpiImM0-9]*"
 )
+
+
+def _sed_i_script_all_safe_subs(script: str) -> bool:
+    """True iff *script* is one or more write-free substitution commands,
+    separated by ``;`` (cpp#243).
+
+    Consumes `_SED_I_SUBST_UNIT_RE` matches from the front; after each unit the
+    remainder must be empty or a ``;`` followed by another unit. This validates
+    the WHOLE script (single-`s`, multi-`;`, or the concatenation of several
+    ``-e`` scripts) as substitutions ONLY, without hand-parsing the script to
+    locate file operands — the `;` seen by the scanner is always a top-level
+    command separator, because each unit regex has already consumed the
+    substitution up to its closing separator and flags (a `;` inside a PATTERN or
+    REPLACEMENT is an ordinary character there, never reached by the scanner).
+
+    Fail-CLOSED (``False``): an empty script, any non-`s` command (`w`/`W`/`r`/
+    `R`/`e`/`d`/`y`/`a`/`i`/`c`), a trailing `w FILE` write flag on a
+    substitution, an unrecognized separator, or a trailing/empty `;` command.
+    """
+    rest = script.strip()
+    if not rest:
+        return False
+    while True:
+        m = _SED_I_SUBST_UNIT_RE.match(rest)
+        if m is None:
+            return False
+        rest = rest[m.end() :].lstrip()
+        if not rest:
+            return True
+        if rest[0] != ";":
+            return False
+        rest = rest[1:].lstrip()
+        if not rest:
+            # A trailing `;` with no following command — fail closed.
+            return False
 
 # In-place flag, short forms only: `-i`, `-ni`, `-ir`, … (the same `-\w*i`/
 # `-i\w*` shapes `TIER3_PATTERNS` catches). A backup-suffix form (`-i.bak`) or
@@ -3252,17 +3293,26 @@ _SED_INPLACE_FLAG_RE = re.compile(r"-[A-Za-z]*i[A-Za-z]*$")
 
 def _sed_i_target_operands(segment: str) -> list[str] | None:
     """The in-place FILE target operand(s) of a bare ``sed -i`` *segment* whose
-    script is a single write-free substitution, or ``None`` (fail-closed — the
-    caller keeps the segment, so it stays terminal) for every shape this carve
-    must not touch (mika#2565).
+    script is one or more write-free substitutions, or ``None`` (fail-closed —
+    the caller keeps the segment, so it stays terminal) for every shape this
+    carve must not touch (mika#2565, cpp#243).
+
+    The sed SCRIPT is one shlex argument regardless of its internal content
+    (multiple `s///g` separated by `;`, escaped separators `\\/`, embedded
+    `"…"`), and several ``-e``/``--expression`` scripts each contribute one such
+    argument. shlex separates the script argument(s) from the FILE operands
+    reliably; the file operands are then the non-option positionals that are NOT
+    the (positional) script. The script content is NOT hand-parsed to find where
+    it ends — every collected script is validated in full by
+    `_sed_i_script_all_safe_subs` (substitutions only, no `w`/`W`/`r`/`R`/`e`).
 
     ``None`` when: the segment does not tokenize (``shlex`` raises); its leading
     word is not exactly ``sed`` (a path-qualified ``/bin/sed`` stays terminal);
-    no short ``-i`` in-place flag is present; a multi-script/script-file flag
-    (``-e``/``-f``/``--expression``/``--file``) is present (script/file parsing
-    becomes ambiguous → fail closed); the script (first operand) is not a
-    write-free substitution (`_SED_I_SAFE_SUBST_SCRIPT_RE`); or there is no file
-    operand after the script.
+    no short ``-i`` in-place flag is present; a script-FILE flag
+    (``-f``/``--file``) is present (the external script cannot be inspected →
+    fail closed); ANY collected script is not a pure-substitution script
+    (`_sed_i_script_all_safe_subs`); or there is no file operand after the
+    script(s).
     """
     try:
         tokens = shlex.split(segment, posix=True)
@@ -3271,30 +3321,65 @@ def _sed_i_target_operands(segment: str) -> list[str] | None:
     if not tokens or tokens[0] != "sed":
         return None
     saw_in_place = False
-    operands: list[str] = []
+    scripts: list[str] = []  # explicit `-e`/`--expression` script expressions
+    positionals: list[str] = []
     end_of_opts = False
-    for tok in tokens[1:]:
+    i = 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
         if not end_of_opts and tok == "--":
             end_of_opts = True
+            i += 1
             continue
         if not end_of_opts and tok.startswith("-") and tok != "-":
-            # `-e`/`-f` (and long forms) attach or name scripts, making the
-            # script/file split ambiguous — fail closed rather than guess.
-            if tok in ("-e", "-f", "--expression", "--file") or tok.startswith(
-                ("--expression", "--file")
+            # `-f`/`--file` name an EXTERNAL script file whose content is
+            # unknowable — fail closed rather than admit an uninspectable script.
+            if (
+                tok in ("-f", "--file")
+                or tok.startswith("--file=")
+                or tok.startswith("-f")  # combined `-f<path>`
             ):
                 return None
+            # `-e`/`--expression` supply an INLINE script expression: separate
+            # (`-e SCRIPT`), combined (`-eSCRIPT`), or `--expression=SCRIPT`.
+            if tok in ("-e", "--expression"):
+                i += 1
+                if i >= n:
+                    return None
+                scripts.append(tokens[i])
+                i += 1
+                continue
+            if tok.startswith("--expression="):
+                scripts.append(tok[len("--expression=") :])
+                i += 1
+                continue
+            if tok.startswith("-e") and len(tok) > 2:
+                scripts.append(tok[2:])
+                i += 1
+                continue
             if _SED_INPLACE_FLAG_RE.fullmatch(tok):
                 saw_in_place = True
+            i += 1
             continue
-        operands.append(tok)
+        positionals.append(tok)
+        i += 1
     if not saw_in_place:
         return None
-    if len(operands) < 2:  # need script + >= 1 file target
+    if scripts:
+        # `-e`/`--expression` present → every positional is a file operand.
+        files = positionals
+    else:
+        # Bare form → the FIRST positional is the script, the rest are files.
+        if not positionals:
+            return None
+        scripts = [positionals[0]]
+        files = positionals[1:]
+    if not files:  # need >= 1 file target
         return None
-    if _SED_I_SAFE_SUBST_SCRIPT_RE.match(operands[0]) is None:
+    if not all(_sed_i_script_all_safe_subs(scr) for scr in scripts):
         return None
-    return operands[1:]
+    return files
 
 
 def _sed_i_target_confined(target: str, cwd: str) -> bool:
