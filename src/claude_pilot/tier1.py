@@ -166,6 +166,25 @@ TIER1_SAFE_SKILLS: frozenset[str] = frozenset({
 _FD_DEVNULL_RE = re.compile(r"\b\d+>/dev/null(?![/\w.])")
 
 
+# cpp#234 + cpp#235: ONE definition of "shell `eval` at command position", used
+# by BOTH admission (`TIER3_PATTERNS`, below) and lethality
+# (`_TIER3_VERB_PATTERNS_FOR_LETHALITY`). Bare `\beval\s` matched `eval` as an
+# ORDINARY ARGUMENT (`cargo test --test eval <name>`, `node --eval`,
+# `--test=eval`) — the cargo integration-test target name, never the builtin.
+# This anchors `eval` to a command position: start / after a pipe-or-separator
+# `[|&;\n(` / a backtick / a command-opening keyword (`then|do|else|elif|!`),
+# optionally behind an exec-prefix chain (`sudo|env|exec|command|nohup|time|
+# xargs`). cpp#234 WIDENED anchor (backtick / keywords / exec-prefixes) so a real
+# `eval` behind `sudo`/`env`/`` ` ``/`then` stays flagged. The `env` prefix only
+# matches `env … eval`, never `env VAR= cargo` (a different rule refuses that).
+_EVAL_COMMAND_POSITION_RE: re.Pattern[str] = re.compile(
+    r"(?:^|[|&;\n(`]|(?:\b(?:then|do|else|elif)|!)\s+)"
+    r"\s*"
+    r"(?:(?:sudo|env|exec|command|nohup|time|xargs)(?:\s+-\S+)*\s+)*"
+    r"eval\s"
+)
+
+
 TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b"),           # rm -rf, rm -fr, rm -rfi
     re.compile(r"git\s+push\s+.*--force\b"),                # git push --force
@@ -180,7 +199,11 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgh\s+label\s+(delete|edit)\b"),
     re.compile(r"\bbash\s+-c\b"),
     re.compile(r"\bsh\s+-c\b"),
-    re.compile(r"\beval\s"),
+    # cpp#235: admission adopts the same command-position `eval` definition as
+    # lethality (shared object above). `cargo test --test eval <name>` /
+    # `node --eval` / `--test=eval` are no longer flagged (the word is a test
+    # target name, not the builtin); a real command-position `eval` still is.
+    _EVAL_COMMAND_POSITION_RE,
     # NOTE: the blanket `\bxargs\b` deny was REMOVED here (cpp#40), for the same
     # reason the `find … -exec` blanket deny was (cpp#33): it was the SOLE guard
     # for xargs' inner command, which the header doctrine forbids. xargs safety
@@ -252,19 +275,14 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 # dangerous by that function too (verified case by case in the cpp#205 plan
 # doc's audit table) — this was already true before cpp#205 (that function's
 # own docstring already claimed the superset) and is unaffected by this change.
-# mika#2573 (case A): `eval` is proven-dangerous for LETHALITY only at command
-# position. `TIER3_PATTERNS`' `\beval\s` matches `eval` used as an ORDINARY
-# ARGUMENT (`cargo test --test eval <name>`, `--eval`), where bash never invokes
-# the builtin — the verbatim mika#2573 killer. Admission (`is_tier3_dangerous`,
-# YAML, tier1) keeps consulting the unchanged `\beval\s`, so the command stays
-# DENIED; only lethality changes. Real invocations stay terminal: `eval "$(x)"`,
-# `x | eval y`, `foo && eval x`, `foo; eval x`, `(eval x)`. `bash -c`/`sh -c`
-# untouched. Only the `\beval\s` entry is swapped in the lethality tuple.
-_EVAL_COMMAND_POSITION_RE: re.Pattern[str] = re.compile(r"(?:^|[|&;\n(])\s*eval\s")
-_TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = tuple(
-    _EVAL_COMMAND_POSITION_RE if p.pattern == r"\beval\s" else p
-    for p in TIER3_PATTERNS[:-1]
-)
+# mika#2573 (case A) + cpp#234/#235: the lethality verb set is `TIER3_PATTERNS`
+# minus its trailing generic-redirect catch-all. The `eval` entry there IS the
+# shared `_EVAL_COMMAND_POSITION_RE` (command position, widened anchor — see its
+# block comment above), so ADMISSION and LETHALITY consult ONE definition of
+# "shell eval": no per-entry swap, no duplicated regex. `cargo test --test eval`
+# / `node --eval` / `--test=eval` are neither refused nor terminal; a real
+# command-position `eval` (incl. behind backtick/then/sudo/env) is both.
+_TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = TIER3_PATTERNS[:-1]
 
 # NEW verb patterns, LETHALITY-ONLY. NOT added to `TIER3_PATTERNS`, NEVER
 # consulted by `is_tier3_dangerous` (the REFUSAL) or by `is_safe_bash_command`/
