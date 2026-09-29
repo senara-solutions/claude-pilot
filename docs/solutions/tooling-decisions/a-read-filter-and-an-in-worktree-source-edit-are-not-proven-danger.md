@@ -1,13 +1,13 @@
 ---
 title: "A read filter and an in-worktree source edit are refused without being lethal"
 date: 2026-09-28
-last_updated: 2026-09-28
+last_updated: 2026-09-29
 module: claude_pilot.tier1
 component: permission-classifier
 problem_type: design_decision
 category: tooling-decisions
 severity: high
-tags: [permissions, policy, lethality, denial, sed, eval, read-filter, in-worktree, containment, fail-closed, claude-pilot-203, claude-pilot-205, claude-pilot-213, mika-2573, mika-2565]
+tags: [permissions, policy, lethality, denial, admission, sed, eval, read-filter, in-worktree, containment, fail-closed, claude-pilot-203, claude-pilot-205, claude-pilot-213, claude-pilot-234, claude-pilot-235, mika-2573, mika-2565]
 applies_when: "carving a survivable-deny exemption for a read/filter pipeline or an in-worktree source edit that a syntactic classifier over-refuses"
 ---
 
@@ -126,6 +126,57 @@ The edit to `tier1.py` was refused by the Claude Code auto-mode classifier
 (`[Self-Modification]` — the pilot editing its own permission logic) and was
 applied under human (Vincent) validation via Remote Control, the same escalation
 path cpp#223 used. Lethality only; no admission change.
+
+## ONE definition, both layers, WIDENED anchor (cpp#234 + cpp#235)
+
+Case A (above) left the two layers holding TWO different definitions of "`eval`
+at command position": lethality used the narrowed `_EVAL_COMMAND_POSITION_RE`,
+but admission (`TIER3_PATTERNS`) still used the bare `\beval\s`. Two immediate
+consequences fell out of that split, and both are fixed by collapsing it to ONE
+shared pattern object referenced by both layers.
+
+**cpp#235 — admission was still over-refusing.** Because admission kept
+`\beval\s`, `cargo test -p mika-agent --test eval <name>` (and `--test=eval`,
+`node --eval`) stayed REFUSED at admission even after case A made it survivable:
+no pilot could run mika-agent's `eval` integration tests in the sandbox. The
+fix (ratified by Vincent → Prime, an ADMISSION change) is to make admission
+adopt the SAME command-position definition — one pattern object, used by both
+`TIER3_PATTERNS` and `_TIER3_VERB_PATTERNS_FOR_LETHALITY`, never duplicated.
+
+**cpp#234 — the anchor was too narrow for real invocations.** After #233,
+four shapes where `eval` genuinely IS the builtin stopped being recognized as
+command position, so a pilot attempting an arbitrary `eval` behind one of them
+was refused but no longer terminated — a defense-in-depth regression. The
+shared anchor is therefore WIDENED to also open on: a backtick (`` `eval … ` ``);
+a command-opening keyword `then`/`do`/`else`/`elif` (at a word boundary, so a
+word merely ENDING in one is not a false anchor) or `!`, followed by whitespace;
+and an optional chain of exec prefixes `sudo`/`env`/`exec`/`command`/`nohup`/
+`time`/`xargs` (each with optional `-flags`). The original anchors `^|[|&;\n(]`
+are kept verbatim.
+
+```python
+_EVAL_COMMAND_POSITION_RE = re.compile(
+    r"(?:^|[|&;\n(`]|(?:\b(?:then|do|else|elif)|!)\s+)"
+    r"\s*"
+    r"(?:(?:sudo|env|exec|command|nohup|time|xargs)(?:\s+-\S+)*\s+)*"
+    r"eval\s"
+)
+```
+
+The subtle non-regression: the `env` exec-prefix must match only `env … eval`,
+never `env VAR= cargo …` (the proxy-disabling shape, a legitimate SEPARATE
+refusal). It cannot: that command carries no `eval` token, so the anchor's
+trailing `eval\s` never matches it, and its refusal stays on its own admission
+axis (not tier3, not auto-approved), untouched. The `tier1` auto-approve gate
+(`is_tier1_auto_approve`) is likewise untouched.
+
+Verified (both `is_tier3_dangerous` AND `_denial_is_terminal`, real git
+worktree): the three `--test eval` / `--test=eval` / `--eval` positives and
+#233's founding piped positive are ADMITTED and survivable; `eval "$(…)"`,
+`x | eval y`, `sudo eval`, `` `eval …` ``, `then eval`, `env eval`, `&& eval`,
+`; eval`, `(eval …)` stay refused AND terminal. Same auto-mode block as case A;
+handed back for a Vincent-validated apply (he approves #234/#235 alongside #236
+in one manual session).
 
 ## Related
 
