@@ -110,17 +110,22 @@ via encoding — STOP, and hand back the exact patch so a human-validated apply
 can finish (the same path cpp#2562/#218 took). The two `sed`-shaped carves in
 this change were NOT blocked and landed normally.
 
-## The residual: case A needs an `eval`-command-position narrowing (handed back)
+## Case A, LANDED: an `eval`-command-position narrowing (cpp#231, mika#2573)
 
 `\beval\s` matches `eval` as an ordinary argument (`--test eval`, `--eval`),
 where bash never invokes the builtin. For LETHALITY, `eval` is proven-dangerous
 only at a COMMAND position — the first word of a segment, i.e. after `^` or a
-shell separator (`|`, `&`, `;`, newline, `(`). `eval "$(x)"`, `x | eval y`,
-`foo && eval x` stay terminal; `--test eval` / `--eval` become survivable. The
-proposed change swaps only the `\beval\s` entry in the lethality tuple
-(`_TIER3_VERB_PATTERNS_FOR_LETHALITY`), leaving `TIER3_PATTERNS` (admission)
-byte-identical. It was blocked by the auto-mode classifier and is handed back for
-human-validated apply; until it lands, the verbatim case A stays terminal.
+shell separator (`|`, `&`, `;`, newline, `(`). The fix swaps ONLY the `\beval\s`
+entry in the lethality tuple (`_TIER3_VERB_PATTERNS_FOR_LETHALITY`) for
+`_EVAL_COMMAND_POSITION_RE = (?:^|[|&;\n(])\s*eval\s`, leaving `TIER3_PATTERNS`
+(admission) byte-identical. Verified: `eval "$(x)"`, `x | eval y`, `foo && eval x`,
+`foo; eval x`, `(eval x)` stay terminal; the verbatim case A and `--test eval` /
+`--eval` become survivable; `is_tier3_dangerous` (the REFUSAL) is unchanged.
+
+The edit to `tier1.py` was refused by the Claude Code auto-mode classifier
+(`[Self-Modification]` — the pilot editing its own permission logic) and was
+applied under human (Vincent) validation via Remote Control, the same escalation
+path cpp#223 used. Lethality only; no admission change.
 
 ## Related
 
