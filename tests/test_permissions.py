@@ -745,6 +745,16 @@ def test_mika2565_sed_i_in_worktree_is_survivable_but_still_refused(
         + guards
     )
 
+    # cpp#243: a MULTI-expression substitution script (several `s///` separated
+    # by `;`, or several `-e`) on relative in-worktree files is survivable too —
+    # cpp#229 only carved the single-substitution shape.
+    multi_verbatim = (
+        "sed -i 's/merged_pr(1900, branch, 60)/merged_pr(1900, branch, X)/g; "
+        's/merged_pr(1900, "feat\\/1888\\/research", 60)/'
+        'merged_pr(1900, "feat\\/1888\\/research", X)/g; '
+        "s/foo/bar/g' " + guards
+    )
+
     # Positive — proven-danger cause is SOLELY an in-worktree `sed -i` substitution.
     for cmd in (
         incident,
@@ -752,6 +762,11 @@ def test_mika2565_sed_i_in_worktree_is_survivable_but_still_refused(
         "sed -i '5870,5990s/foo(/bar(/' " + guards,
         "sed -i 's@a@b@g' src/x.rs",
         "echo hi && sed -i 's/a/b/' src/x.rs",  # harmless prefix + confined sed -i
+        multi_verbatim,  # cpp#243 verbatim #2482 shape
+        "sed -i 's/a\\/b/c/g; s/d/e/g' src/x.rs",  # multi-`;`, escaped separator
+        "sed -i 's/a/b/g;s/c/d/g' src/x.rs",  # multi-`;`, no whitespace
+        "sed -i -e 's/a/b/' -e 's/c/d/' src/x.rs",  # multiple `-e` scripts
+        'sed -i \'s/a"x"b/c/g; s/d/e/g\' src/x.rs',  # embedded double-quotes
     ):
         assert f("Bash", {"command": cmd}, wt) is False, cmd
 
@@ -763,10 +778,14 @@ def test_mika2565_sed_i_in_worktree_is_survivable_but_still_refused(
         "sed -i 's/a/b/' ~/x",  # ~-rooted respelling
         "sed -i 's/a/b/' ../../etc/x",  # `..` escape
         "sed -i 's/a/b/w /etc/evil' src/x.rs",  # `w` write flag in the script → rejected
+        "sed -i 's/a/b/g; w /etc/x' src/x.rs",  # `w` write COMMAND after `;` → rejected
+        "sed -i -e 's/a/b/g' -e 's/c/d/w /tmp/x' src/x.rs",  # `w` in a later `-e`
         "sed -i '/foo/d' src/x.rs",  # non-substitution (delete) script → fail closed
+        "sed -i 's/a/b/g; s/c/d/g' /etc/hosts",  # multi-sub but absolute target
+        "sed -i -f script.sed src/x.rs",  # external script file → fail closed
         "sed -i 's/a/b/' src/x.rs /etc/passwd",  # mixed targets, one absolute
         "sed -i 's/a/b/' src/x.rs && git reset --hard",  # chained destructive verb
-        "sed -i -e 's/a/b/' -e 's/c/d/' src/x.rs",  # `-e` multi-script → fail closed
+        "sed -i 's/a/b/' src/x.rs ; rm -rf x",  # `;` OUTSIDE quotes + dangerous verb
     ):
         assert f("Bash", {"command": cmd}, wt) is True, cmd
 
