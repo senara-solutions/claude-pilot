@@ -1149,6 +1149,169 @@ def _needs_lethality_redirect_mask(command: str) -> bool:
     return "$(" in command or "`" in command or _has_unterminated_quote(command)
 
 
+# ── cpp#241: a `<`/`>` inside a LITERAL-QUOTED heredoc BODY is not a redirect ──
+#
+# Pilots #2590 (7cd3ce9a) and #1990 (2bf1c7f3) died within three hours on the SAME
+# shape: an interpreter reading a QUOTED-delimiter heredoc — `python3 - <<'PY' …
+# PY`, `node - <<'JS' … JS` — whose body regex-edits Rust source (`-> Vec<T>`,
+# `None::<…>`, `if a > b`). Because the delimiter is QUOTED, bash performs NO
+# expansion: the body is fed VERBATIM to the interpreter on stdin, so a `>`/`<` in
+# it is pure DATA. But the flat redirect/destination vetoes do not model the
+# heredoc body, so a body `>` is read as a phantom out-of-worktree redirect →
+# `_destination_veto_reason` returns non-None → the denial is made TERMINAL. This
+# is the cpp#236 family (a `<`/`>` that is not a real outer redirect), but the
+# cpp#236 mask models quotes and substitutions, NOT heredoc bodies. This pass
+# blanks `<`/`>` inside the body of a heredoc whose delimiter is QUOTED/ESCAPED
+# (`<<'D'`/`<<"D"`/`<<\D`). An UNQUOTED `<<D` body IS expanded, so it is left RAW
+# (its `$(…)`/backticks execute) → `<<D $(curl …)` and `curl … | python3` stay
+# terminal. LETHALITY PATH ONLY — admission byte-identical. Fail-closed: the
+# opener line is never masked (a real redirect on it stays terminal), and an
+# UNTERMINATED heredoc returns the command unchanged.
+_HEREDOC_DELIM_STOP = frozenset(" \t\n;|&<>()")
+
+
+def _parse_heredoc_opener(line: str, i: int) -> tuple[str, bool, bool, int] | None:
+    r"""At ``line[i:i+2] == '<<'`` (already known OUTSIDE quotes), parse the heredoc
+    opener. Return ``(delim, no_expansion, dash, end)`` where ``delim`` is the
+    closing terminator (quotes/backslash removed), ``no_expansion`` is True iff the
+    delimiter was QUOTED or ESCAPED, ``dash`` is the ``<<-`` form, ``end`` is just
+    past the delimiter. ``None`` for a ``<<<`` here-string or an empty delimiter.
+    """
+    n = len(line)
+    j = i + 2
+    if j < n and line[j] == "<":
+        return None  # `<<<` here-string, not a heredoc
+    dash = False
+    if j < n and line[j] == "-":
+        dash = True
+        j += 1
+    while j < n and line[j] in (" ", "\t"):
+        j += 1
+    delim_chars: list[str] = []
+    no_expansion = False
+    while j < n:
+        ch = line[j]
+        if ch == "'":
+            no_expansion = True
+            j += 1
+            while j < n and line[j] != "'":
+                delim_chars.append(line[j])
+                j += 1
+            if j < n:
+                j += 1  # consume closing '
+            continue
+        if ch == '"':
+            no_expansion = True
+            j += 1
+            while j < n and line[j] != '"':
+                if line[j] == "\\" and j + 1 < n:
+                    delim_chars.append(line[j + 1])
+                    j += 2
+                    continue
+                delim_chars.append(line[j])
+                j += 1
+            if j < n:
+                j += 1  # consume closing "
+            continue
+        if ch == "\\" and j + 1 < n:
+            no_expansion = True
+            delim_chars.append(line[j + 1])
+            j += 2
+            continue
+        if ch in _HEREDOC_DELIM_STOP:
+            break
+        delim_chars.append(ch)
+        j += 1
+    delim = "".join(delim_chars)
+    if not delim:
+        return None
+    return delim, no_expansion, dash, j
+
+
+def _scan_command_line_for_heredocs(line: str) -> list[tuple[str, bool, bool]]:
+    """Quote-aware scan of ONE command line for `<<` openers OUTSIDE quotes. Return
+    ``(delim, no_expansion, dash)`` per opener, left-to-right (bash reads their
+    bodies in this order). A `<<` inside a quote and a `<<<` here-string are ignored.
+    """
+    result: list[tuple[str, bool, bool]] = []
+    i, n = 0, len(line)
+    in_sq = in_dq = False
+    while i < n:
+        ch = line[i]
+        if in_sq:
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'":
+            in_sq = True
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            i += 1
+            continue
+        if ch == "<" and i + 1 < n and line[i + 1] == "<":
+            parsed = _parse_heredoc_opener(line, i)
+            if parsed is None:
+                i += 2  # `<<<` or empty delim — step past `<<`
+                continue
+            delim, no_expansion, dash, end = parsed
+            result.append((delim, no_expansion, dash))
+            i = end
+            continue
+        i += 1
+    return result
+
+
+def _needs_lethality_heredoc_mask(command: str) -> bool:
+    """Whether the heredoc-body mask could apply (cpp#241): a `<<` marker present.
+    A command without one skips the pass and is byte-identical to HEAD.
+    """
+    return "<<" in command
+
+
+def _mask_lethality_heredoc_redirect_chars(command: str) -> str:
+    r"""Blank every ``<``/``>`` inside the BODY of a QUOTED/ESCAPED-delimiter heredoc
+    (cpp#241). The opener line is never touched; an UNQUOTED body is left raw (it IS
+    expanded); an UNTERMINATED heredoc returns the command UNCHANGED (fail-closed
+    toward lethal). Length-preserving and purely lexical. LETHALITY PATH ONLY.
+    """
+    lines = command.split("\n")
+    out_lines = list(lines)
+    pending: list[tuple[str, bool, bool]] = []
+    masked_any = False
+    for idx, line in enumerate(lines):
+        if not pending:
+            pending.extend(_scan_command_line_for_heredocs(line))
+            continue
+        delim, no_expansion, dash = pending[0]
+        candidate = line.lstrip("\t") if dash else line
+        if candidate == delim:
+            pending.pop(0)  # terminator line — consumed, never masked
+            continue
+        if no_expansion and ("<" in line or ">" in line):
+            out_lines[idx] = line.replace("<", " ").replace(">", " ")
+            masked_any = True
+    if pending:
+        # Unterminated heredoc: body span not provable — do not exempt (cpp#157 D5).
+        return command
+    if not masked_any:
+        return command
+    return "\n".join(out_lines)
+
+
 # ── mika#2573 (case A): a print-only `sed` segment is not proven danger ──────
 #
 # A `sed -n '<addr>[,<addr>]p'` invocation (the closed-world print-only shape
