@@ -509,11 +509,25 @@ rules:
     decision: allow
     reason: "rm of relative path(s), NO flags -- dev-pilot cleanup only; any -r/-f/-rf or absolute/~ routes to relay (denied here)"
 
+  # cpp#242 (Prime-ratified admission, 2026-09-30): the anchor was pinned to a
+  # BARE first word (`^cargo\s+…`), so the standard way to pass a build/measure
+  # variable -- an inline `NAME=value` prefix (`CARGO_INCREMENTAL=0 cargo …`) --
+  # fell to default-deny and starved the pilot (mika#2105, error_max_turns with
+  # zero work). Fix (a): accept a prefix of `NAME=value` assignments, but ONLY
+  # for a CLOSED allow-list of five build/log names
+  # (`CARGO_INCREMENTAL|CARGO_TARGET_DIR|RUST_LOG|RUST_BACKTRACE|CARGO_TERM_COLOR`),
+  # each followed by whitespace and chainable. This is a CLOSED alternation, never
+  # a generic `\w+=` prefix: any off-list name -- `PATH=`, `HOME=`, `LD_PRELOAD=`
+  # / `LD_*`, `HTTPS_PROXY=`/`HTTP_PROXY=`, `FOO=` -- leaves the command REFUSED
+  # (default-deny), so the egress/proxy-disabling axis is a SEPARATE, untouched
+  # concern (`HTTPS_PROXY= cargo build` stays refused on its own admission axis).
+  # Fix (b): admit `cargo --version` and `cargo metadata` (read-only) as
+  # subcommands. `cargo publish` remains excluded (tier3-denied).
   - id: bash-cargo
     tool: Bash
-    pattern: '^cargo\s+(build|test|check|clippy|fmt|run|clean|doc|tree)\b'
+    pattern: '^(?:(?:CARGO_INCREMENTAL|CARGO_TARGET_DIR|RUST_LOG|RUST_BACKTRACE|CARGO_TERM_COLOR)=\S*\s+)*cargo\s+(build|test|check|clippy|fmt|run|clean|doc|tree|metadata|--version)\b'
     decision: allow
-    reason: "cargo build/test/check/clippy/fmt/run/clean/doc/tree -- dev-pilot Rust toolchain (cargo publish excluded, tier3-denied)"
+    reason: "cargo build/test/check/clippy/fmt/run/clean/doc/tree/metadata/--version, optionally prefixed by a CLOSED allow-list of env assignments (CARGO_INCREMENTAL/CARGO_TARGET_DIR/RUST_LOG/RUST_BACKTRACE/CARGO_TERM_COLOR only) -- dev-pilot Rust toolchain (cpp#242; cargo publish excluded, tier3-denied; off-list names e.g. PATH=/HOME=/LD_*/HTTPS_PROXY= stay default-denied)"
 
   - id: bash-npm
     tool: Bash
