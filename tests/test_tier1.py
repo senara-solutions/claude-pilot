@@ -38,6 +38,8 @@ from claude_pilot.tier1 import (
     _quote_spans,
     _redirect_targets,
     _rm_segment_operands,
+    _sed_i_target_operands,
+    _sed_inplace_suffix,
     _split_compound_command,
     contains_unquoted_metacharacter,
     is_readonly_waitloop_script,
@@ -54,6 +56,7 @@ from claude_pilot.tier1 import (
     is_within_project,
     readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
+    sed_i_confined_to_worktree,
 )
 
 
@@ -3944,6 +3947,97 @@ class TestRmConfinedToPilotScratch:
     def test_no_confined_rm_returns_false(self, scratch_worktree: Path) -> None:
         # nothing to carve: not an rm-under-scratch command at all
         assert rm_confined_to_pilot_scratch("rm -rf /etc", str(scratch_worktree)) is False
+
+
+# ── cpp#253: `sed -i` with a backup SUFFIX is confined like bare `-i` (mika#2601) ─
+#
+# Pilot #2601 (f2edcf8f, 2026-09-30T14:28:33.718Z) died TERMINAL on
+# `sed -i.bak 's/…/…/' crates/mika-agent/src/task_engine/mod.rs && grep …` — an
+# in-place edit confined to the worktree, but with the GNU backup-SUFFIX form
+# (`-i.bak`) the pre-cpp#253 recognizer did not accept: `-[A-Za-z]*i[A-Za-z]*`
+# only matched all-letter clusters, so `-i.bak` (the `.bak` suffix) failed to
+# register as an in-place flag, `_sed_i_target_operands` returned `None`, and the
+# denial stayed terminal. cpp#253 extends #229/#245 recognition to the suffix
+# forms — the same substitution/confinement rules, PLUS the `<file><SUFFIX>`
+# backup must also land under the worktree — LETHALITY ONLY (admission
+# byte-identical; end-to-end pinned in test_permissions.py).
+class TestCpp253SedInplaceSuffix:
+    def test_suffix_recognizer_accepts_bare_and_suffix_forms(self) -> None:
+        # (token, expected suffix) — bare `-i`, clustered, and the SUFFIX forms.
+        for tok, suffix in (
+            ("-i", ""),
+            ("-ni", ""),  # clustered no-arg flag before `i`
+            ("-i.bak", ".bak"),
+            ("-i.orig", ".orig"),
+            ("-ibak", "bak"),  # GNU: no dot required
+            ("-ni.bak", ".bak"),  # cluster + suffix, split on the FIRST `i`
+            ("-i.bak-2", ".bak-2"),
+        ):
+            assert _sed_inplace_suffix(tok) == suffix, tok
+
+    def test_suffix_recognizer_rejects_non_inplace_and_wildcard(self) -> None:
+        # `None` (not an in-place flag / fail-closed) for: no `i`, a `*` wildcard
+        # suffix (GNU projects the backup to an arbitrary path), a non-letter
+        # leading cluster, a `--`-long option, and the bare dash.
+        for tok in (
+            "-n",  # no `i`
+            "-e",  # no `i`
+            "-i.b*",  # `*` wildcard suffix → fail closed
+            "-i/tmp/*",  # `*` wildcard suffix → fail closed
+            "--in-place",  # `--` long option (leading cluster not letters)
+            "-",  # bare dash
+            "src/x.rs",  # a file operand, not a flag
+        ):
+            assert _sed_inplace_suffix(tok) is None, tok
+
+    def test_operands_carry_suffix(self) -> None:
+        # `_sed_i_target_operands` returns (files, suffix); the script must be
+        # pure substitutions (#245) either way.
+        assert _sed_i_target_operands("sed -i.bak 's/a/b/' src/x.rs") == (
+            ["src/x.rs"],
+            ".bak",
+        )
+        assert _sed_i_target_operands("sed -i 's/a/b/' src/x.rs") == (["src/x.rs"], "")
+        assert _sed_i_target_operands(
+            "sed -i.orig -e 's/a/b/' -e 's/c/d/' a.rs b.rs"
+        ) == (["a.rs", "b.rs"], ".orig")
+        # A write flag / non-substitution script still fails closed (#245).
+        assert _sed_i_target_operands("sed -i.bak 's/a/b/w /etc/x' src/x.rs") is None
+        assert _sed_i_target_operands("sed -i.bak '/foo/d' src/x.rs") is None
+
+    def test_backup_confinement(self, scratch_worktree: Path) -> None:
+        wt = str(scratch_worktree)
+        # In-worktree target + in-worktree backup → carved (survivable).
+        assert sed_i_confined_to_worktree("sed -i.bak 's/a/b/' src/x.rs", wt) is True
+        assert sed_i_confined_to_worktree("sed -i.orig 's/a/b/' src/x.rs", wt) is True
+        # A suffix that projects the backup OUT of the worktree stays terminal,
+        # even though the edited target itself is confined.
+        assert (
+            sed_i_confined_to_worktree(
+                "sed -i.bak/../../../../../../tmp/x 's/a/b/' src/x.rs", wt
+            )
+            is False
+        )
+        # Absolute target → not carved (backup irrelevant).
+        assert sed_i_confined_to_worktree("sed -i.bak 's/a/b/' /etc/hosts", wt) is False
+
+    def test_recognizer_is_bounded_time(self) -> None:
+        """cpp#253 (cpp#250 ReDoS lesson): the suffix recognizer is a LINEAR scan,
+        so a pathological token — a long cluster of `i`-split candidates ending in
+        a non-matching `*` that on a backtracking regex forces quadratic retries —
+        returns in well under 50 ms. The pre-rewrite lazy-quantifier regex was
+        O(n^2) on this input (seconds at n~16k); the linear scan is microseconds.
+        """
+        adversarial = "-" + ("ai" * 8000) + "*"  # ~16 KB, no in-place match
+        result, elapsed = _elapsed(_sed_inplace_suffix, adversarial)
+        assert result is None
+        assert elapsed < _REDOS_BUDGET_S, f"_sed_inplace_suffix: {elapsed * 1000:.1f} ms"
+        # And through the full operand extractor over a long suffix + long path.
+        seg = "sed -i" + ("." * 4000) + " 's/a/b/' " + ("d/" * 500) + "x.rs"
+        _, elapsed = _elapsed(_sed_i_target_operands, seg)
+        assert elapsed < _REDOS_BUDGET_S, (
+            f"_sed_i_target_operands: {elapsed * 1000:.1f} ms"
+        )
 
 
 # ── ce-* /tmp scratch: uid token + same-command var tracing (mika#2562) ────────

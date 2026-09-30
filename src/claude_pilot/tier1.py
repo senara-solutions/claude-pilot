@@ -3446,19 +3446,48 @@ def _sed_i_script_all_safe_subs(script: str) -> bool:
             # A trailing `;` with no following command — fail closed.
             return False
 
-# In-place flag, short forms only: `-i`, `-ni`, `-ir`, … (the same `-\w*i`/
-# `-i\w*` shapes `TIER3_PATTERNS` catches). A backup-suffix form (`-i.bak`) or
-# the long `--in-place` are NOT detected here — the former is left on the
-# fail-closed (terminal) side deliberately, the latter is not caught by
-# `TIER3_PATTERNS` at all (already survivable), so neither reaches this carve.
-_SED_INPLACE_FLAG_RE = re.compile(r"-[A-Za-z]*i[A-Za-z]*$")
+def _sed_inplace_suffix(tok: str) -> str | None:
+    """If *tok* is a GNU sed in-place flag — bare ``-i``, a clustered ``-ni``, or
+    a SUFFIX form ``-i.bak`` / ``-i.orig`` / ``-ibak`` (cpp#253, mika#2601) —
+    return its backup SUFFIX (``""`` for bare ``-i``); otherwise ``None``.
+
+    GNU sed: inside a short-option cluster the ``-i`` option consumes the REST of
+    the argument as its optional backup suffix, so the flag is the FIRST ``i``
+    after the leading dash and the suffix is everything after it. The suffix forms
+    ALSO write ``<file><SUFFIX>`` beside each target (`mod.rs` → `mod.rs.bak`),
+    inside the worktree; the returned suffix lets the caller confine that backup
+    too (cpp#229 invariant, extended to the backup). The leading cluster (before
+    the ``i``) must be ASCII letters — other no-arg short flags (`-n`, `-r`, …) —
+    matching the pre-cpp#253 `-[A-Za-z]*i[A-Za-z]*` charset; ``--in-place`` (a
+    ``--``-prefixed long option) is not recognized here and is not caught by
+    ``TIER3_PATTERNS`` anyway (already survivable). A ``*`` in the suffix is a GNU
+    wildcard (each ``*`` is replaced by the filename, which can PROJECT the backup
+    to an arbitrary path), so it disqualifies the token → fail closed (stays
+    terminal). This is a LINEAR scan — no backtracking regex — so recognition stays
+    bounded-time on pathological input (cpp#250 ReDoS lesson).
+    """
+    if len(tok) < 2 or tok[0] != "-":
+        return None
+    idx = tok.find("i", 1)
+    if idx == -1:
+        return None
+    lead = tok[1:idx]
+    if lead and not (lead.isascii() and lead.isalpha()):
+        return None
+    suffix = tok[idx + 1 :]
+    if "*" in suffix:
+        return None
+    return suffix
 
 
-def _sed_i_target_operands(segment: str) -> list[str] | None:
-    """The in-place FILE target operand(s) of a bare ``sed -i`` *segment* whose
-    script is one or more write-free substitutions, or ``None`` (fail-closed —
-    the caller keeps the segment, so it stays terminal) for every shape this
-    carve must not touch (mika#2565, cpp#243).
+def _sed_i_target_operands(segment: str) -> tuple[list[str], str] | None:
+    """The in-place FILE target operand(s) of a ``sed -i`` *segment* whose script
+    is one or more write-free substitutions, paired with the backup SUFFIX (empty
+    string for bare ``-i``; ``.bak``/``.orig``/… for the GNU attached-suffix forms
+    ``-i.bak`` — cpp#253), or ``None`` (fail-closed — the caller keeps the segment,
+    so it stays terminal) for every shape this carve must not touch (mika#2565,
+    cpp#243). The suffix lets the caller confine the ``<file><SUFFIX>`` backup that
+    the suffix forms write beside each target.
 
     The sed SCRIPT is one shlex argument regardless of its internal content
     (multiple `s///g` separated by `;`, escaped separators `\\/`, embedded
@@ -3484,6 +3513,7 @@ def _sed_i_target_operands(segment: str) -> list[str] | None:
     if not tokens or tokens[0] != "sed":
         return None
     saw_in_place = False
+    backup_suffix = ""  # GNU `-i<SUFFIX>` attached backup suffix (cpp#253)
     scripts: list[str] = []  # explicit `-e`/`--expression` script expressions
     positionals: list[str] = []
     end_of_opts = False
@@ -3521,8 +3551,10 @@ def _sed_i_target_operands(segment: str) -> list[str] | None:
                 scripts.append(tok[2:])
                 i += 1
                 continue
-            if _SED_INPLACE_FLAG_RE.fullmatch(tok):
+            suffix = _sed_inplace_suffix(tok)
+            if suffix is not None:
                 saw_in_place = True
+                backup_suffix = suffix
             i += 1
             continue
         positionals.append(tok)
@@ -3542,7 +3574,7 @@ def _sed_i_target_operands(segment: str) -> list[str] | None:
         return None
     if not all(_sed_i_script_all_safe_subs(scr) for scr in scripts):
         return None
-    return files
+    return files, backup_suffix
 
 
 def _sed_i_target_confined(target: str, cwd: str) -> bool:
@@ -3566,6 +3598,27 @@ def _sed_i_target_confined(target: str, cwd: str) -> bool:
     return is_within_project(target, cwd)
 
 
+def _sed_i_edit_and_backup_confined(target: str, suffix: str, cwd: str) -> bool:
+    """Whether a ``sed -i<suffix>`` edit is fully confined: the edited *target*
+    AND — for the attached-suffix forms (`-i.bak`) — the ``<target><suffix>``
+    backup file both resolve strictly inside the worktree ``cwd`` (cpp#253).
+
+    GNU sed with a non-``*`` suffix writes the backup by APPENDING the suffix to
+    the filename (`crates/…/mod.rs` → `crates/…/mod.rs.bak`), so the backup path
+    is ``target + suffix``. A suffix that would project that backup out of the
+    worktree (`.bak/../../etc/x`) is rejected by `_sed_i_target_confined` via
+    `is_within_project` (fail-closed). Bare ``-i`` (empty suffix) writes no
+    backup, so only the edited target is checked. (The ``*`` wildcard suffix
+    never reaches here — `_SED_INPLACE_FLAG_RE` excludes it, so such a token is
+    not recognized as in-place and the segment stays terminal.)
+    """
+    if not _sed_i_target_confined(target, cwd):
+        return False
+    if suffix and not _sed_i_target_confined(target + suffix, cwd):
+        return False
+    return True
+
+
 def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     """Whether *command*'s tier3-for-lethality danger is due SOLELY to
     ``sed -i`` substitution segment(s) whose EVERY file target resolves
@@ -3587,10 +3640,14 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     survivors: list[str] = []
     carved = False
     for seg in _split_compound_command(command):
-        targets = _sed_i_target_operands(seg)
-        if targets and all(_sed_i_target_confined(t, cwd) for t in targets):
-            carved = True
-            continue
+        result = _sed_i_target_operands(seg)
+        if result is not None:
+            targets, suffix = result
+            if all(
+                _sed_i_edit_and_backup_confined(t, suffix, cwd) for t in targets
+            ):
+                carved = True
+                continue
         survivors.append(seg)
     if not carved:
         return False

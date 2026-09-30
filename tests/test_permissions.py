@@ -852,6 +852,114 @@ def test_mika2565_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+def test_cpp253_sed_i_suffix_in_worktree_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#253 (mika#2601): a `sed -i` with a GNU backup SUFFIX (`-i.bak`,
+    `-i.orig`) editing RELATIVE files that all resolve inside the worktree — and
+    whose `<file><SUFFIX>` backup ALSO lands inside it — is a SURVIVABLE deny
+    (`_denial_is_terminal` returns ``False``), exactly like the bare `-i` case
+    (#229/#245). Every escape / write / chained-danger shape stays terminal.
+
+    Direct extension of the mika#2565 (#229/#245) carve to the suffix forms. The
+    command is still REFUSED (admission byte-identical — see
+    ``test_cpp253_admission_is_byte_identical_only_lethality_flips``); only
+    lethality flips, so the pilot falls back to the Edit tool instead of dying.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "crates" / "mika-agent" / "src" / "task_engine").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    (worktree / "path" / "to").mkdir(parents=True)
+    wt = str(worktree)
+
+    mod = "crates/mika-agent/src/task_engine/mod.rs"
+    # The verbatim pilot #2601 killer (f2edcf8f, 2026-09-30T14:28:33.718Z).
+    incident = (
+        "sed -i.bak 's/^const PRODUCTION_ATTEMPTS: u32 = 3;$/"
+        "const PRODUCTION_ATTEMPTS: u32 = 1;/' " + mod + ' && grep -n '
+        '"^const PRODUCTION_ATTEMPTS" ' + mod
+    )
+
+    # AC1 — proven-danger cause is SOLELY an in-worktree suffix-form `sed -i`.
+    for cmd in (
+        incident,
+        "sed -i.bak 's/a/b/' path/to/x",  # isolated suffix form
+        "sed -i.orig 's/a/b/' src/x.rs",  # a different suffix
+        "sed -i.bak -e 's/a/b/' -e 's/c/d/' src/x.rs",  # multi-`-e` (#245) + suffix
+        "sed -ibak 's/a/b/' src/x.rs",  # GNU: no dot required
+        "echo hi && sed -i.bak 's/a/b/' src/x.rs",  # harmless prefix + confined
+        "sed -i 's/a/b/' src/x.rs",  # bare `-i` regression guard (#229 unchanged)
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # AC2 — every escape / write / chained-danger shape stays TERMINAL.
+    for cmd in (
+        "sed -i.bak 's/a/b/' /etc/hosts",  # out-of-worktree target
+        'sed -i.bak "s/a/b/" "$HOME/x"',  # $-rooted respelling
+        "sed -i.bak 's/a/b/' ~/x",  # ~-rooted respelling
+        "sed -i.bak 's/a/b/' ../../etc/x",  # `..` escape
+        "sed -i.bak 's/a/b/w /etc/x' src/x.rs",  # `s///w` write flag in the script
+        "sed -i.bak 's/a/b/g; w /etc/x' src/x.rs",  # `w` write COMMAND after `;`
+        "sed -i.bak '1r /etc/passwd' src/x.rs",  # `r` read command
+        "sed -i.bak/../../../../../../tmp/x 's/a/b/' src/x.rs",  # backup projected out
+        "sed -i/tmp/* 's/a/b/' src/x.rs",  # `*` wildcard suffix → fail closed
+        "sed -i.bak 's/a/b/' src/x.rs /etc/passwd",  # mixed targets, one absolute
+        "sed -i.bak 's/a/b/' src/x.rs && git reset --hard",  # chained destructive verb
+        "sed -i.bak 's/a/b/' src/x.rs ; rm -rf /",  # `;` OUTSIDE quotes + danger
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_cpp253_sed_i_suffix_symlink_escape_stays_terminal(tmp_path: Path) -> None:
+    """cpp#253 fail-closed: a suffix-form `sed -i` target routed through an
+    OUTBOUND symlink resolves outside the worktree and stays terminal —
+    `is_within_project` resolves symlinks, so containment is not launderable.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / "esc").symlink_to(outside, target_is_directory=True)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed -i.bak 's/a/b/' esc/x.rs"}, str(worktree)
+        )
+        is True
+    )
+
+
+def test_cpp253_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#253 sovereign boundary: admission for the suffix-form in-worktree
+    `sed -i.bak` case is byte-identical to HEAD — the command is STILL denied.
+    `sed -i.bak` is still tier3-dangerous (the REFUSAL classifier), never
+    tier1-auto-approved, and the policy still default-denies it. Only
+    `_denial_is_terminal` flips terminal→survivable; end-to-end the handler
+    returns a non-terminal ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    cmd = "sed -i.bak 's/a/b/' src/x.rs"
+
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    result = asyncio.run(
+        _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     tmp_path: Path,
 ) -> None:
