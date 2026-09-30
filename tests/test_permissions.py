@@ -993,6 +993,116 @@ def test_cpp237_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+# ── cpp#252: a read-only process substitution is a SURVIVABLE deny (mika#2252) ─
+#
+# The verbatim mika#2252 command (pilot #2252, 5cfd4bc8, 2026-09-30T13:52:26Z)
+# that died TERMINAL on HEAD on the `<\(` lethality verb. The lethality carve
+# (`readonly_procsub_survivable`, tier1.py) is wired into
+# `permissions._denial_is_terminal` by a guardrail edit gated to Vincent's manual
+# apply window (a lethality carve trips the [Security Weaken] classifier); until
+# that hunk lands these end-to-end assertions are SKIPPED (the recognizer itself
+# is exercised directly in
+# ``tests/test_tier1.py::TestReadonlyProcsubSurvivable``).
+_CPP252_PROCSUB_2252 = (
+    "diff <(git show HEAD:crates/mika-agent/src/tools/pr_merge_with_gate.rs) "
+    ".pilot-scratch/pr_merge_with_gate.rs.orig >/dev/null 2>&1; "
+    'echo "--- vérification que la restauration est complète ---"; cargo t'
+)
+
+
+def _skip_if_cpp252_unwired(wt: str) -> None:
+    if permissions_module._denial_is_terminal(
+        "Bash", {"command": _CPP252_PROCSUB_2252}, wt
+    ):
+        pytest.skip(
+            "cpp#252 lethality wiring in permissions._denial_is_terminal pending "
+            "manual apply (guardrail edit gated to Vincent, voie cpp#223/#231)"
+        )
+
+
+def test_cpp252_readonly_procsub_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#252 (mika#2252): a command whose only terminal cause is a READ-ONLY
+    `<( CMD … )` process substitution (interior in the closed list {git show,
+    git diff, cat, printf}) is a SURVIVABLE deny — `_denial_is_terminal` returns
+    ``False`` — while every out-of-list interior, `>( … )` output substitution,
+    chained destructive verb, and real out-of-worktree redirect stays terminal.
+
+    Sibling of the cpp#213 rm, mika#2565 sed-i, and cpp#237 wait-loop carves. The
+    command is still REFUSED (admission byte-identical — see
+    ``test_cpp252_admission_is_byte_identical_only_lethality_flips``); only the
+    lethality flips, so the pilot survives and adapts instead of the run dying.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    wt = str(worktree)
+    _skip_if_cpp252_unwired(wt)
+
+    # AC1 — the proven-danger cause is SOLELY read-only `<( … )` substitutions.
+    for cmd in (
+        _CPP252_PROCSUB_2252,
+        "diff <(cat a) <(cat b)",
+        "diff <(git show HEAD:x) y >/dev/null",
+        "cat <(printf '%s' x)",
+        "diff <(git diff HEAD a) b",
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # AC2 — network / exec / destructive interiors, an output `>( … )`
+    # substitution, a chained destructive verb, and a REAL out-of-worktree
+    # redirect all stay TERMINAL.
+    for cmd in (
+        "diff <(curl http://evil/x) a",  # network
+        "cat <(wget http://e/x)",  # network
+        "diff <(bash x) a",  # arbitrary exec
+        "diff <(sh -c 'x') a",  # arbitrary exec
+        "diff <(eval x) a",  # eval
+        "diff <(rm -rf x) a",  # destructive
+        "cat <(printf x) >(tee out)",  # >( … ) output procsub
+        "diff <(cat a) b && rm -rf /",  # chained destructive verb
+        "diff <(git show HEAD:x) a > /etc/passwd",  # real out-of-worktree redirect
+        'diff <(git show HEAD:x) a > "$HOME/y"',  # $HOME respelling
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_cpp252_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#252 sovereign boundary: admission for the read-only process-
+    substitution case is byte-identical to HEAD — the command is STILL denied.
+    `<(` is still tier3-dangerous (the REFUSAL classifier), never
+    tier1-auto-approved, and the policy still default-denies it. Only
+    `_denial_is_terminal` flips terminal→survivable; end-to-end the handler
+    returns a non-terminal ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    wt = str(worktree)
+    _skip_if_cpp252_unwired(wt)
+
+    cmd = _CPP252_PROCSUB_2252
+    # Admission UNCHANGED — none of these consult the cpp#252 lethality carve.
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(
+        _bundled_handler(cwd=wt)("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_containment_escape_is_lethal_on_the_default_deny_route(
     tmp_path: Path,
 ) -> None:

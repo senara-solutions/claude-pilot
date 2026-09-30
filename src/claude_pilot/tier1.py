@@ -3834,3 +3834,200 @@ def is_readonly_waitloop_script(command: str) -> bool:
         if not _waitloop_statement_is_readonly(stmt):
             return False
     return saw_do and saw_done
+
+
+# ── cpp#252: a read-only process substitution is not on its own session-fatal ──
+#
+# mika#2252 (pilot #2252, 5cfd4bc8, 2026-09-30T13:52:26.824Z) died TERMINAL on a
+# pure read-only comparison:
+#
+#   diff <(git show HEAD:crates/mika-agent/src/tools/pr_merge_with_gate.rs)
+#     .pilot-scratch/pr_merge_with_gate.rs.orig >/dev/null 2>&1;
+#     echo "--- vérification que la restauration est complète ---"; cargo t
+#
+# The ONLY terminal cause (proven at source on HEAD 216033d) is the `<\(` entry
+# of `TIER3_PATTERNS` (`:229`) — one of the verb patterns in
+# `_TIER3_VERB_PATTERNS_FOR_LETHALITY`, so `is_tier3_dangerous_for_lethality`
+# returns True and `_denial_is_terminal` returns True at its first gate. NOT the
+# `>/dev/null` redirect (stripped by `_STDOUT_DEVNULL_RE` before the pattern
+# check), NOT `diff`/`echo`/`cargo t`, NOT the `2>&1` fd-dup. A `<( … )` process
+# substitution is lethal because its interior CAN smuggle anything — but under
+# cpp#205 (terminal reserved to PROVEN danger) the danger of `<( CMD … )` is
+# exactly the danger of CMD. When every process substitution in the command is a
+# READ-ONLY input substitution `<( CMD … )` whose interior CMD's leading word is
+# in a CLOSED read list, there is no proven danger, so the denial must not be
+# terminal.
+#
+# CLOSED READ LIST (MPC-ratified 2026-09-30): `git show`, `git diff`, `cat`,
+# `printf`. `git show`/`git diff` read a blob/tree; `cat` reads a file; `printf`
+# formats a string — none writes, networks, execs, or wraps a shell. `echo` is
+# NOT admitted (the ticket draft listed it; MPC dropped it). Any `>( … )` OUTPUT
+# process substitution, any `<( … )` whose interior leading word is outside the
+# list (`<(curl …)`, `<(bash …)`, `<(sh -c …)`, `<(eval …)`, `<(rm …)`,
+# `<(python3 …)`), any command substitution (`` ` ``/`$(`), and any
+# nested/unbalanced substitution keep the denial TERMINAL (fail-closed).
+#
+# LETHALITY ONLY, admission byte-identical. Exact sibling of the cpp#213
+# rm/.pilot-scratch, mika#2565 sed-i, and cpp#237 wait-loop carves: consulted
+# ONLY by `permissions._denial_is_terminal`, never by `is_tier3_dangerous` /
+# `is_tier1_auto_approve` / any YAML rule / `is_tier3_dangerous_for_lethality`
+# itself. The command STAYS refused (`<(` is still tier3-dangerous for the
+# REFUSAL and is never tier1-auto-approved); only `_denial_is_terminal` flips
+# True→False, so the pilot survives and adapts (reach for a native tool)
+# instead of the run being killed.
+#
+# Mechanism mirrors cpp#213/#2565: each ADMITTED `<( … )` span is blanked and the
+# remainder is re-checked with the unchanged `is_tier3_dangerous_for_lethality`,
+# so any OTHER proven-danger cause — a chained destructive verb
+# (`diff <(cat a) b && rm -rf /`), a second unadmitted substitution — still
+# returns True there and stays terminal. A real out-of-worktree REDIRECT
+# (`diff <(git show HEAD:x) a > /etc/passwd`) survives the re-check (cpp#205
+# dropped the bare-`>` catch-all from the lethality verb set) but is re-armed by
+# `_denial_is_terminal`'s redirect/destination vetoes on the FULL command, so it
+# stays terminal too. `>/dev/null` (and any worktree-relative target) passes
+# those vetoes and stays survivable.
+#
+# Recognition is PURELY LEXICAL (no cwd, no filesystem) and LINEAR — a single
+# left-to-right scan and one negated-char-class fullmatch per interior, NO
+# nested-quantifier regex (the cpp#250 ReDoS lesson). Fail-CLOSED on every
+# ambiguity: any unbalanced quote/paren, any command substitution, any `>( … )`,
+# or any interior outside the closed list makes it return False and the `<(`
+# verb keeps the denial TERMINAL.
+
+# The interior of an admitted `<( CMD … )`: a closed-list read verb as the
+# leading word, followed only by argument characters that cannot chain, redirect,
+# substitute, or open a nested process substitution (`;`, `|`, `&`, `<`, `>`,
+# `(`, `)`, `$`, backtick, newline are all excluded). Single negated-char-class
+# star — linear, no catastrophic backtracking. Matched against the STRIPPED
+# interior with `fullmatch`.
+_PROCSUB_READ_INTERIOR_RE = re.compile(
+    r"(?:git[ \t]+show|git[ \t]+diff|cat|printf)(?:[ \t][^;|&<>()$`\n]*)?"
+)
+
+
+def _readonly_procsub_masked(command: str) -> str | None:
+    """*command* with every TOP-level admitted `<( CMD … )` read-only process
+    substitution blanked to spaces (length-preserving), or ``None`` (fail-closed)
+    when the command carries ANY process/command substitution this carve must not
+    admit — a `>( … )` output substitution, a `<( … )` whose interior leading
+    word is outside the closed READ list {git show, git diff, cat, printf}, a
+    command substitution (`` ` ``/`$(`), or a nested/unbalanced/unterminated
+    substitution or quote.
+
+    Purely lexical, single left-to-right pass. Returns ``None`` when no admitted
+    `<( … )` was found at all (nothing to carve). A `<(`/`>(`/`` ` ``/`$(` inside
+    a single- or double-quoted region is literal DATA, not a substitution, and is
+    skipped over (never blanked) — consistent with `is_tier3_dangerous_for_
+    lethality`, which quote-masks `<`/`>` before its own pattern check."""
+    out = list(command)
+    i, n = 0, len(command)
+    found = False
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'":
+            j = command.find("'", i + 1)
+            if j == -1:
+                return None  # unbalanced single quote
+            i = j + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                c = command[j]
+                if c == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if c == "`" or (c == "$" and j + 1 < n and command[j + 1] == "("):
+                    return None  # command substitution inside "…" — fail closed
+                if c == '"':
+                    break
+                j += 1
+            if j >= n:
+                return None  # unbalanced double quote
+            i = j + 1
+            continue
+        if ch == "`":
+            return None  # backtick command substitution — fail closed
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            return None  # $( … ) command substitution — fail closed
+        if ch == ">" and i + 1 < n and command[i + 1] == "(":
+            return None  # >( … ) OUTPUT process substitution — stays terminal
+        if ch == "<" and i + 1 < n and command[i + 1] == "(":
+            k = _procsub_close_index(command, i + 2)
+            if k is None:
+                return None  # unbalanced <( … )
+            if _PROCSUB_READ_INTERIOR_RE.fullmatch(command[i + 2 : k].strip()) is None:
+                return None  # interior outside the closed read list
+            for p in range(i, k + 1):
+                out[p] = " "
+            found = True
+            i = k + 1
+            continue
+        i += 1
+    if not found:
+        return None
+    return "".join(out)
+
+
+def _procsub_close_index(command: str, start: int) -> int | None:
+    """Index of the `)` that closes a `<(` whose interior begins at *start*, or
+    ``None`` (fail-closed) if it is unbalanced or unterminated. Tracks nested
+    parens and skips quoted regions so a `)` inside a quote does not close the
+    substitution early. Linear."""
+    depth = 1
+    k, n = start, len(command)
+    while k < n:
+        c = command[k]
+        if c == "\\" and k + 1 < n:
+            k += 2
+            continue
+        if c == "'":
+            e = command.find("'", k + 1)
+            if e == -1:
+                return None
+            k = e + 1
+            continue
+        if c == '"':
+            e = k + 1
+            while e < n:
+                if command[e] == "\\" and e + 1 < n:
+                    e += 2
+                    continue
+                if command[e] == '"':
+                    break
+                e += 1
+            if e >= n:
+                return None
+            k = e + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return None
+
+
+def readonly_procsub_survivable(command: str) -> bool:
+    """Whether *command*'s tier3-for-lethality danger is due SOLELY to admitted
+    read-only `<( CMD … )` process substitutions (cpp#252).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision. Never touches admission (`is_tier3_dangerous`,
+    `is_tier1_auto_approve`, YAML rules, `is_tier3_dangerous_for_lethality`); the
+    command stays refused either way. Purely lexical, fail-closed on any
+    ambiguity. Returns ``False`` (stays terminal) when no admitted `<( … )` was
+    found, when any substitution is outside the closed READ list or is an output
+    `>( … )`, or when the command has ANOTHER proven-danger cause after the
+    admitted substitutions are removed."""
+    if not isinstance(command, str) or not command:
+        return False
+    masked = _readonly_procsub_masked(command)
+    if masked is None:
+        return False
+    return not is_tier3_dangerous_for_lethality(masked)

@@ -52,6 +52,7 @@ from claude_pilot.tier1 import (
     is_tier3_dangerous_for_lethality,
     is_within_pilot_scratch,
     is_within_project,
+    readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
 )
 
@@ -4272,3 +4273,108 @@ class TestReadonlyWaitloopScript:
             "sh -c 'while [ ! -f x ]; do echo \"oops; done'",
         ):
             assert is_readonly_waitloop_script(cmd) is False, cmd
+
+
+# ── cpp#252: read-only process-substitution lethality recognizer ──────────────
+# The verbatim mika#2252 command (pilot #2252, 5cfd4bc8, 2026-09-30T13:52:26Z)
+# that died TERMINAL on HEAD on the `<\(` entry of TIER3_PATTERNS.
+PROCSUB_2252 = (
+    "diff <(git show HEAD:crates/mika-agent/src/tools/pr_merge_with_gate.rs) "
+    ".pilot-scratch/pr_merge_with_gate.rs.orig >/dev/null 2>&1; "
+    'echo "--- vérification que la restauration est complète ---"; cargo t'
+)
+
+
+class TestReadonlyProcsubSurvivable:
+    """`readonly_procsub_survivable` — the cpp#252 lethality carve recognizer.
+
+    Purely lexical, fail-closed, linear (no nested-quantifier regex — the
+    cpp#250 ReDoS lesson). Recognizes a command whose tier3-for-lethality danger
+    is due SOLELY to `<( CMD … )` READ-ONLY process substitutions whose interior
+    leading word is in the MPC-ratified CLOSED list {git show, git diff, cat,
+    printf}. Every `>( … )` output substitution, out-of-list interior, command
+    substitution, and command carrying ANOTHER proven-danger cause is rejected so
+    the `<(` verb keeps the denial terminal.
+
+    NOTE: this recognizer proves only that the SUBSTITUTIONS are safe read-only
+    input redirections. An out-of-worktree REDIRECT on the outer command
+    (`… > /etc/passwd`) survives this recognizer (cpp#205 dropped the bare-`>`
+    catch-all from the lethality verb set) and is re-armed downstream by
+    `permissions._denial_is_terminal`'s destination vetoes — exercised
+    end-to-end in ``tests/test_permissions.py``.
+    """
+
+    def test_verbatim_2252_is_recognized(self) -> None:
+        assert readonly_procsub_survivable(PROCSUB_2252) is True
+
+    def test_positive_shapes_recognized(self) -> None:
+        for cmd in (
+            # the ticket's second AC1 case: two `cat` input substitutions
+            "diff <(cat a) <(cat b)",
+            # isolated `git show` comparison, output discarded
+            "diff <(git show HEAD:x) y >/dev/null",
+            # git diff (IN the closed list per MPC)
+            "diff <(git diff HEAD a) b",
+            # printf-formatted input substitution
+            "cat <(printf '%s' x)",
+            # a safe substitution alongside a >/dev/null redirect and a chained
+            # read-only tail
+            "diff <(git show HEAD:x) y >/dev/null 2>&1; echo done; cargo t",
+        ):
+            assert readonly_procsub_survivable(cmd) is True, cmd
+
+    def test_out_of_list_interiors_rejected(self) -> None:
+        for cmd in (
+            "diff <(curl http://evil/x) a",  # network
+            "cat <(wget http://e/x)",  # network
+            "diff <(bash x) a",  # arbitrary exec
+            "diff <(sh -c 'x') a",  # arbitrary exec
+            "diff <(eval x) a",  # eval
+            "diff <(rm -rf x) a",  # destructive
+            "diff <(python3 x) a",  # interpreter
+            "cat <(echo hi)",  # echo NOT admitted (MPC dropped it)
+        ):
+            assert readonly_procsub_survivable(cmd) is False, cmd
+
+    def test_output_substitution_and_nested_danger_rejected(self) -> None:
+        for cmd in (
+            "cat <(printf x) >(tee out)",  # >( … ) output procsub
+            "tee >(cat) < a",  # output procsub, no safe input procsub
+            "diff <(cat a) b && rm -rf /",  # safe procsub + chained destructive verb
+            "diff <(git show HEAD:x; rm -rf /) a",  # danger inside the interior
+            "cat <($(evil))",  # command substitution inside the interior
+            "diff <(cat `evil`) a",  # backtick command substitution
+            "diff <(cat a",  # unbalanced <( …
+        ):
+            assert readonly_procsub_survivable(cmd) is False, cmd
+
+    def test_no_procsub_returns_false(self) -> None:
+        # No `<( … )` at all → nothing to carve; the terminal decision stands.
+        for cmd in ("rm -rf /", "echo hi", "", "diff a b"):
+            assert readonly_procsub_survivable(cmd) is False, cmd
+
+    def test_quoted_procsub_is_literal_not_carved(self) -> None:
+        # A `<(` inside quotes is literal DATA, never a substitution — no admitted
+        # substitution is found, so the recognizer declines to carve (fail-safe:
+        # a quoted `<(` is already non-terminal via is_tier3_dangerous_for_
+        # lethality's quote mask, so it never reaches this carve at HEAD).
+        assert readonly_procsub_survivable("echo '<(rm -rf /)'") is False
+
+    def test_recognizer_is_bounded_time(self) -> None:
+        """cpp#252 / cpp#250 lesson: recognition is LINEAR — no nested-quantifier
+        regex. A pathological input (a long read interior, and many stacked
+        substitutions) returns in well under 50 ms."""
+        pathological = (
+            PROCSUB_2252
+            + " ; "
+            + "diff <(cat a) <(cat b) ; " * 200
+            + "cat <(printf " + ("x" * 20000) + ")"
+        )
+        result, elapsed = _elapsed(readonly_procsub_survivable, pathological)
+        assert result is True, "pathological input should still be recognized"
+        assert elapsed < _REDOS_BUDGET_S, f"took {elapsed * 1000:.1f} ms"
+        # A non-matching adversarial interior (long allowed run then a forbidden
+        # char that forces the fullmatch to fail) must also stay linear.
+        adversarial = "diff <(cat " + ("a" * 100000) + ";) b"
+        _, elapsed2 = _elapsed(readonly_procsub_survivable, adversarial)
+        assert elapsed2 < _REDOS_BUDGET_S, f"adversarial took {elapsed2 * 1000:.1f} ms"

@@ -46,6 +46,7 @@ from .tier1 import (
     is_tier3_dangerous,
     is_tier3_dangerous_for_lethality,
     is_within_project,
+    readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
     sed_i_confined_to_worktree,
 )
@@ -896,6 +897,7 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
         and not rm_confined_to_pilot_scratch(command, cwd)
         and not sed_i_confined_to_worktree(command, cwd)
         and not is_readonly_waitloop_script(command)
+        and not readonly_procsub_survivable(command)
     ):
         return True
     # cpp#154: the narrowing above is deliberately cwd-free and lexical (plan
