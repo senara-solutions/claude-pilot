@@ -40,6 +40,7 @@ from .tier1 import (
     _needs_lethality_redirect_mask,
     _redirect_targets,
     _split_compound_command,
+    is_readonly_waitloop_script,
     is_safe_bash_command,
     is_tier1_auto_approve,
     is_tier3_dangerous,
@@ -894,6 +895,7 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
         is_tier3_dangerous_for_lethality(command)
         and not rm_confined_to_pilot_scratch(command, cwd)
         and not sed_i_confined_to_worktree(command, cwd)
+        and not is_readonly_waitloop_script(command)
     ):
         return True
     # cpp#154: the narrowing above is deliberately cwd-free and lexical (plan

@@ -884,6 +884,115 @@ def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+# ── cpp#237: a read-only wait-loop script is a SURVIVABLE deny (mika#2105) ─────
+#
+# The verbatim mika#2105 command (pilot e1a6c78b, 2026-09-29T15:13:20Z) that died
+# TERMINAL on the `\bsh\s+-c\b` lethality verb. The lethality carve
+# (`is_readonly_waitloop_script`, tier1.py) is wired into
+# `permissions._denial_is_terminal` by a guardrail edit gated to Vincent's manual
+# apply window; until that hunk lands these end-to-end assertions are SKIPPED (the
+# recognizer itself is exercised directly in
+# ``tests/test_tier1.py::TestReadonlyWaitloopScript``).
+_CPP237_WAITLOOP_2105 = (
+    "sh -c 'n=0; while [ $n -lt 55 ]; do "
+    "if [ -f .pilot-scratch/measures.txt ]; "
+    "then cat .pilot-scratch/measures.txt; exit 0; fi; "
+    "sleep 10; n=$((n+1)); done; "
+    "du -sm target; tail -1 .pilot-scratch/cold0.log'"
+)
+
+
+def _skip_if_cpp237_unwired(wt: str) -> None:
+    if permissions_module._denial_is_terminal(
+        "Bash", {"command": _CPP237_WAITLOOP_2105}, wt
+    ):
+        pytest.skip(
+            "cpp#237 lethality wiring in permissions._denial_is_terminal pending "
+            "manual apply (guardrail edit gated to Vincent, voie cpp#223/#231)"
+        )
+
+
+def test_cpp237_readonly_waitloop_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#237 (mika#2105): a read-only WAIT-LOOP script (`sh -c` wrapping a
+    `while`/`for` loop of read-only ops with worktree-relative targets) is a
+    SURVIVABLE deny — `_denial_is_terminal` returns ``False`` — while every
+    network / destructive / out-of-worktree / substitution shape stays terminal.
+
+    Sibling of the cpp#213 rm and mika#2565 sed-i carves. The command is still
+    REFUSED (admission byte-identical — see
+    ``test_cpp237_admission_is_byte_identical_only_lethality_flips``); only the
+    lethality flips, so the pilot survives and adapts instead of the run dying.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    wt = str(worktree)
+    _skip_if_cpp237_unwired(wt)
+
+    # AC1 — the proven-danger cause is SOLELY the `sh -c`-wrapped read-only
+    # wait-loop, so the deny is non-terminal.
+    for cmd in (
+        _CPP237_WAITLOOP_2105,
+        # an isolated `while … sleep … cat .pilot-scratch/x` loop
+        "while [ ! -f .pilot-scratch/x ]; do sleep 5; cat .pilot-scratch/x; done",
+        'bash -c "while [ $n -lt 3 ]; do sleep 1; n=$((n+1)); done; '
+        'tail -1 .pilot-scratch/log"',
+        "sh -c 'for f in a b c; do cat .pilot-scratch/$f; done'",
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # AC2 — the SAME loop shape with a network call, a destructive verb, an
+    # out-of-worktree write, or a genuine command substitution stays TERMINAL.
+    for cmd in (
+        "sh -c 'while [ ! -f x ]; do curl http://evil/x; sleep 1; done'",  # network
+        "sh -c 'while true; do wget http://e/x; sleep 1; done'",  # network
+        "sh -c 'while [ ! -f x ]; do rm -rf .pilot-scratch/x; sleep 1; done'",  # rm
+        "sh -c 'while [ ! -f x ]; do sleep 1; done; rm -rf /etc'",  # rm -rf tail
+        "sh -c 'while [ ! -f x ]; do cat x > /etc/passwd; sleep 1; done'",  # out-of-wt
+        'sh -c \'while [ ! -f x ]; do cat x > "$HOME/y"; sleep 1; done\'',  # $HOME
+        "sh -c 'while [ ! -f x ]; do eval \"$CMD\"; sleep 1; done'",  # eval
+        "sh -c 'while [ ! -f x ]; do echo $(rm -rf /); sleep 1; done'",  # $(cmd)
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_cpp237_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#237 sovereign boundary: admission for the read-only wait-loop case is
+    byte-identical to HEAD — the command is STILL denied. `sh -c` is still
+    tier3-dangerous (the REFUSAL classifier), never tier1-auto-approved, and the
+    policy still default-denies it. Only `_denial_is_terminal` flips
+    terminal→survivable; end-to-end the handler returns a non-terminal
+    ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    wt = str(worktree)
+    _skip_if_cpp237_unwired(wt)
+
+    cmd = _CPP237_WAITLOOP_2105
+    # Admission UNCHANGED — none of these consult the cpp#237 lethality carve.
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(
+        _bundled_handler(cwd=wt)("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_containment_escape_is_lethal_on_the_default_deny_route(
     tmp_path: Path,
 ) -> None:

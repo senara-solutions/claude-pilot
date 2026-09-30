@@ -3595,3 +3595,242 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     if not carved:
         return False
     return not is_tier3_dangerous_for_lethality("\n".join(survivors))
+
+
+# ── cpp#237: a read-only WAIT-LOOP script is not on its own session-fatal ──────
+#
+# mika#2105 (pilot e1a6c78b, 2026-09-29T15:13:20Z) died TERMINAL on a pure
+# read-only wait-loop:
+#
+#   sh -c 'n=0; while [ $n -lt 55 ]; do if [ -f .pilot-scratch/measures.txt ];
+#          then cat .pilot-scratch/measures.txt; exit 0; fi; sleep 10;
+#          n=$((n+1)); done; du -sm target; tail -1 .pilot-scratch/cold0.log'
+#
+# The ONLY terminal cause (proven at source on HEAD c136814) is the `\bsh\s+-c\b`
+# entry of `TIER3_PATTERNS` — one of the verb patterns in
+# `_TIER3_VERB_PATTERNS_FOR_LETHALITY`, so `is_tier3_dangerous_for_lethality`
+# returns True and `_denial_is_terminal` returns True at its first gate. NOT the
+# arithmetic `$((n+1))` (single-quoted, never reaches a redirect scanner; it is
+# not a `$(` command substitution to any lethality mask), NOT `du`/`cat`/`tail`,
+# NOT a `while`/`done`/`;` token, NOT any redirect (there is none). The `sh -c`
+# verb is lethal because a wrapper CAN smuggle anything — but under cpp#205
+# (terminal reserved to PROVEN danger) the danger of `sh -c` is exactly the
+# danger of the SCRIPT it wraps. When that script is a read-only wait-loop whose
+# every command is read-only and every file target is worktree-relative, there
+# is no proven danger, so the denial must not be terminal.
+#
+# LETHALITY ONLY, admission byte-identical. This is the exact sibling of the
+# cpp#213 rm/.pilot-scratch and mika#2565 sed-i carves: consulted ONLY by
+# `permissions._denial_is_terminal`, never by `is_tier3_dangerous` /
+# `is_tier1_auto_approve` / any YAML rule / `is_tier3_dangerous_for_lethality`
+# itself. The command STAYS refused (`sh -c` is still tier3-dangerous for the
+# REFUSAL and is never tier1-auto-approved); only `_denial_is_terminal` flips
+# True→False, so the pilot survives and adapts (reach for a native tool / a
+# scratch-file poll) instead of the run being killed.
+#
+# Recognition is PURELY LEXICAL (no cwd, no filesystem, no `Path.resolve()`) —
+# the same load-bearing choice `is_tier3_dangerous_for_lethality` and
+# `_is_sanctioned_tmp_scratch` document: the script is DENIED and never executes,
+# so this decides only whether an already-refused command's refusal is fatal.
+# The recognizer is FAIL-CLOSED on every ambiguity: any command word outside the
+# read-only allowlist (`curl`, `wget`, `rm`, `eval`, `cp`, `mv`, `tee`, `dd`, a
+# nested `sh`/`bash`, …), any command substitution (`` ` ``, `$(cmd)`, `${ …; }`
+# funsub, `$'…'`), any pipe/background/subshell/redirect metacharacter
+# (`| & < > ( )`), any absolute / `..` / `~` / dangerous-env-var (`$HOME`,
+# `$OLDPWD`, `$PWD`, …) file operand, or any unbalanced quote makes it return
+# False and the `sh -c` verb keeps the denial TERMINAL. Arithmetic `$((…))` with
+# no nested `$` is inert and is blanked before the substitution check, so a
+# counter increment (`n=$((n+1))`) is allowed while `$(( $(cmd) ))` (a real
+# command substitution smuggled inside arithmetic) survives the blank and is
+# rejected by the `$(`-remains check.
+
+# Command words that only READ or are inert — safe as the leading word of a
+# simple command inside a recognized wait-loop. No writer, no network, no
+# exec/eval, no `sh`/`bash` wrapper. `[`/`test` are the POSIX condition builtins.
+_WAITLOOP_READONLY_CMDS: frozenset[str] = frozenset(
+    {
+        "[",
+        "test",
+        "cat",
+        "head",
+        "tail",
+        "du",
+        "ls",
+        "wc",
+        "sleep",
+        "exit",
+        ":",
+        "true",
+        "false",
+        "echo",
+        "printf",
+        "grep",
+        "stat",
+        "dirname",
+        "basename",
+    }
+)
+
+# Shell keywords that STRUCTURE a loop/conditional — not commands.
+_WAITLOOP_KEYWORDS: frozenset[str] = frozenset(
+    {"while", "until", "for", "do", "done", "if", "then", "elif", "else", "fi", "in"}
+)
+
+# Environment variables whose expansion names a path OUTSIDE the worktree (or
+# rewrites word-splitting/lookup) — a `$HOME`/`$OLDPWD`/… file operand is not a
+# worktree-relative target, so it disqualifies the read-only recognition.
+_WAITLOOP_DANGEROUS_VARS: frozenset[str] = frozenset(
+    {"HOME", "OLDPWD", "PWD", "IFS", "PATH", "ENV", "BASH_ENV", "CDPATH", "TMPDIR"}
+)
+
+# `sh -c '<script>'` / `bash -c "<script>"` wrapper: the whole command is the
+# wrapper and a single quoted script argument, nothing after the closing quote.
+_WAITLOOP_SH_C_WRAPPER_RE = re.compile(
+    r"^\s*(?:sh|bash)\s+-c\s+(['\"])(?P<body>.*)\1\s*$", re.DOTALL
+)
+_WAITLOOP_SH_C_PREFIX_RE = re.compile(r"^\s*(?:sh|bash)\s+-c\b")
+
+# Arithmetic expansion `$((…))` whose interior carries NO `$`/backtick — inert
+# integer arithmetic, blanked to `0` before the command-substitution check so a
+# loop counter (`n=$((n+1))`) is allowed. An interior `$` (a command
+# substitution smuggled inside arithmetic, `$(( $(cmd) ))`) does NOT match, so
+# the residual `$(` is caught by the reject below (fail-closed).
+_WAITLOOP_ARITH_RE = re.compile(r"\$\(\((?:[^()$`]|\([^()$`]*\))*\)\)")
+
+_WAITLOOP_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
+_WAITLOOP_LOOP_KEYWORD_RE = re.compile(r"\b(?:while|until|for)\b")
+
+
+def _waitloop_operand_is_safe(tok: str) -> bool:
+    """Whether *tok* is a safe operand inside a recognized read-only wait-loop:
+    a flag, the `[`/`]` test brackets, or a WORKTREE-RELATIVE literal — never an
+    absolute / `..` / `~` / dangerous-env-var path. Purely lexical."""
+    if tok in ("[", "]"):
+        return True
+    if tok.startswith("-"):  # a flag (`-f`, `-lt`, `-sm`, `-1`, `-n`, `--`)
+        return True
+    if tok.startswith("/") or tok.startswith("~"):
+        return False
+    if ".." in tok:
+        return False
+    if "$" in tok:
+        # Only bare parameter expansions `$name` / `${name}` survive here (`$(`,
+        # backtick, `$'`, funsub are already globally rejected upstream). A bare
+        # `$` with no identifier, or a reference to a dangerous env var, fails.
+        if re.search(r"\$(?![A-Za-z_{])", tok):
+            return False
+        for name in re.findall(r"\$\{?([A-Za-z_]\w*)", tok):
+            if name in _WAITLOOP_DANGEROUS_VARS:
+                return False
+    return True
+
+
+def _waitloop_statement_is_readonly(statement: str) -> bool:
+    """Whether one `;`/newline-separated statement is a read-only simple command
+    (optionally led by loop/conditional keywords or variable assignments), or a
+    `for NAME in <safe list>` head. Fail-closed on any tokenization error."""
+    try:
+        toks = shlex.split(statement)
+    except ValueError:
+        return False
+    i = 0
+    while i < len(toks) and toks[i] in _WAITLOOP_KEYWORDS:
+        kw = toks[i]
+        i += 1
+        if kw == "for":
+            # `for NAME in <list>` — skip the loop variable and `in`; every
+            # remaining token is an iteration operand, with no command word.
+            if i < len(toks):
+                i += 1  # loop variable name
+            if i < len(toks) and toks[i] == "in":
+                i += 1
+            return all(_waitloop_operand_is_safe(t) for t in toks[i:])
+    if i >= len(toks):
+        return True  # keywords only (`fi`, `done`, `else`) or empty
+    # Leading `NAME=value` assignment prefixes (the command word, if any, follows).
+    while i < len(toks) and _WAITLOOP_ASSIGN_RE.match(toks[i]):
+        if not _waitloop_operand_is_safe(toks[i].split("=", 1)[1]):
+            return False
+        i += 1
+    if i >= len(toks):
+        return True  # a pure assignment statement (`n=0`)
+    if toks[i] not in _WAITLOOP_READONLY_CMDS:
+        return False
+    return all(_waitloop_operand_is_safe(t) for t in toks[i + 1 :])
+
+
+def _waitloop_split_statements(script: str) -> list[str] | None:
+    """Quote-aware split of *script* on unquoted `;` / newline. ``None`` on an
+    unbalanced quote (fail-closed)."""
+    out: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    for ch in script:
+        if quote is not None:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif ch in ";\n":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if quote is not None:
+        return None
+    out.append("".join(cur))
+    return out
+
+
+def is_readonly_waitloop_script(command: str) -> bool:
+    """Whether *command*'s tier3-for-lethality danger is due SOLELY to being a
+    read-only WAIT-LOOP script — a `while`/`until`/`for` loop (optionally wrapped
+    in a single `sh -c`/`bash -c`), composed only of read-only commands
+    (`[`/`test`, `cat`, `head`, `tail`, `du`, `ls`, `wc`, `sleep`, `exit`, `:`,
+    `true`, `false`, `echo`, `printf`, `grep`, …), inert arithmetic (`$((…))`),
+    and worktree-relative file operands (cpp#237).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision. Never touches admission (`is_tier3_dangerous`,
+    `is_tier1_auto_approve`, YAML rules, `is_tier3_dangerous_for_lethality`); the
+    command stays refused either way. Purely lexical, fail-closed on any
+    ambiguity — see the block comment above. Returns ``False`` (stays terminal)
+    for anything that is not provably a self-contained read-only wait-loop."""
+    if not isinstance(command, str) or not command:
+        return False
+    m = _WAITLOOP_SH_C_WRAPPER_RE.match(command)
+    if m is not None:
+        script = m.group("body")
+    elif _WAITLOOP_SH_C_PREFIX_RE.match(command):
+        # A `sh -c`/`bash -c` wrapper we cannot cleanly unwrap (unbalanced /
+        # trailing tokens) → fail closed.
+        return False
+    else:
+        script = command
+    # Global rejects: any command substitution or unquotable expansion.
+    if "`" in script or "$'" in script or re.search(r"\$\{[\s|]", script):
+        return False
+    blanked = _WAITLOOP_ARITH_RE.sub("0", script)
+    if "$(" in blanked:  # a command substitution (arithmetic already blanked)
+        return False
+    # Global rejects: any pipe / background / subshell / redirect metacharacter.
+    if any(ch in blanked for ch in "|&<>()"):
+        return False
+    # Must actually BE a loop — a bare `sh -c 'cat x'` is out of scope.
+    if not _WAITLOOP_LOOP_KEYWORD_RE.search(blanked):
+        return False
+    statements = _waitloop_split_statements(blanked)
+    if statements is None:
+        return False
+    saw_do = saw_done = False
+    for stmt in statements:
+        toks = stmt.split()
+        if "do" in toks:
+            saw_do = True
+        if "done" in toks:
+            saw_done = True
+        if not _waitloop_statement_is_readonly(stmt):
+            return False
+    return saw_do and saw_done
