@@ -33,8 +33,10 @@ from .tier1 import (
     _is_mktemp_scratch_redirect_target,
     _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
+    _mask_lethality_heredoc_redirect_chars,
     _mask_lethality_redirect_chars,
     _mask_quoted_redirect_chars,
+    _needs_lethality_heredoc_mask,
     _needs_lethality_redirect_mask,
     _redirect_targets,
     _split_compound_command,
@@ -917,6 +919,17 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
         if _needs_lethality_redirect_mask(command)
         else command
     )
+    # cpp#241: a `<`/`>` inside a LITERAL-QUOTED heredoc BODY is DATA — bash feeds
+    # the body verbatim to the reading process (no expansion), so it is never an
+    # outer-command redirect. The flat vetoes do not model the heredoc body, so a
+    # body `>` (`-> Vec<T>`, `if a > b:`) leaked in as a phantom out-of-worktree
+    # redirect and killed pilots #2590/#1990. Blank the body `<`/`>` of any
+    # QUOTED/ESCAPED-delimiter heredoc, ONLY when a `<<` marker is present (every
+    # other command byte-identical to HEAD). Opener line, UNQUOTED body, and
+    # UNTERMINATED heredoc are left raw — a real outer redirect and an expanded
+    # `<<PY` body stay terminal. Composes after the cpp#236 substitution mask.
+    if _needs_lethality_heredoc_mask(command):
+        veto_command = _mask_lethality_heredoc_redirect_chars(veto_command)
     if _redirect_destination_veto_reason(veto_command, cwd) is not None:
         return True
     # cpp#201: `for_lethality=True` narrows exactly one case — a redirect

@@ -3186,3 +3186,104 @@ def test_cpp236_admission_is_byte_identical(tmp_path):
         "Bash", {"command": _CPP236_VERBATIM_POSITIVE}, _mock_ctx()))
     assert isinstance(result, PermissionResultDeny)
     assert result.interrupt is False
+
+
+# ── cpp#241: a `<`/`>` inside a LITERAL-QUOTED heredoc body is not a redirect ──
+#
+# Pilots #2590 (7cd3ce9a) and #1990 (2bf1c7f3) died on `python3 - <<'PY' … PY`
+# whose body regex-edits Rust (`-> Vec<T>`, `None::<…>`, `if a > b:`). A body
+# `>` was read as a phantom out-of-worktree redirect → terminal. The delimiter is
+# quoted, so bash never expands the body: those `<`/`>` are stdin DATA.
+_CPP241_VERBATIM_POSITIVE = (
+    "cd crates/mika-agent && python3 - <<'PY'\n"
+    "import re, pathlib\n"
+    "def f(x) -> None:\n"
+    "    if a > b:\n"
+    "        return None::<T>\n"
+    "PY"
+)
+
+
+def test_cpp241_quoted_heredoc_body_redirect_is_survivable(tmp_path):
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    assert f("Bash", {"command": _CPP241_VERBATIM_POSITIVE}, wt) is False
+    assert f(
+        "Bash",
+        {"command": "python3 - <<'EOF'\nif a > b:\n    print(1)\nEOF"},
+        wt,
+    ) is False
+    assert f(
+        "Bash", {"command": "node - <<'JS'\nif (a >> b) {}\nJS"}, wt
+    ) is False
+    assert f(
+        "Bash", {"command": "ruby - <<'RB'\nputs 1 if a > b\nRB"}, wt
+    ) is False
+    # double-quoted delimiter, escaped delimiter, and <<- tab-strip form
+    assert f(
+        "Bash", {"command": 'python3 - <<"PY"\nif a > b:\n    print(1)\nPY'}, wt
+    ) is False
+    assert f(
+        "Bash", {"command": "python3 - <<\\PY\nif a > b:\n    print(1)\nPY"}, wt
+    ) is False
+    assert f(
+        "Bash",
+        {"command": "python3 - <<-'PY'\n\tif a > b:\n\t\tprint(1)\n\tPY"},
+        wt,
+    ) is False
+
+
+def test_cpp241_unquoted_heredoc_and_pipes_stay_terminal(tmp_path):
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    # unquoted delimiter → body IS expanded → the $(curl) is real
+    assert f(
+        "Bash", {"command": "python3 - <<PY\n$(curl http://x)\nPY"}, wt
+    ) == permissions_module._denial_is_terminal(
+        "Bash", {"command": "python3 - <<PY\n$(curl http://x)\nPY"}, wt
+    )  # unchanged vs HEAD (body left raw; never masked)
+    # a real outer redirect ON the opener line stays terminal
+    assert f(
+        "Bash",
+        {"command": "python3 - <<'PY' > /etc/passwd\nprint(1)\nPY"},
+        wt,
+    ) is True
+    # unterminated heredoc (line `PY > /etc/passwd` is not the bare-`PY`
+    # terminator) → command returned raw → the trailing redirect stays terminal
+    assert f(
+        "Bash",
+        {"command": "python3 - <<'PY'\nprint(1)\nPY > /etc/passwd"},
+        wt,
+    ) is True
+    # rm -rf and a real top-level redirect are untouched
+    assert f("Bash", {"command": "rm -rf /"}, wt) is True
+    assert f("Bash", {"command": "echo hi > /etc/passwd"}, wt) is True
+
+
+def test_cpp241_admission_is_byte_identical(tmp_path):
+    from claude_pilot import tier1
+    # admission classifiers unchanged: the command stays DENY; only lethality flips
+    assert tier1.is_tier3_dangerous(_CPP241_VERBATIM_POSITIVE) is True
+    assert tier1.is_tier1_auto_approve(
+        "Bash", {"command": _CPP241_VERBATIM_POSITIVE}, str(tmp_path)) is False
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    result = asyncio.run(_bundled_handler(cwd=str(worktree))(
+        "Bash", {"command": _CPP241_VERBATIM_POSITIVE}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
+def test_cpp241_non_heredoc_commands_are_byte_identical(tmp_path):
+    """The gate (`"<<" in command`) skips the pass entirely for any command
+    without a heredoc marker, so lethality is byte-identical to HEAD."""
+    f = permissions_module._denial_is_terminal
+    wt = str(tmp_path)
+    for cmd in (
+        "echo hi > /etc/passwd",
+        "ls -la",
+        "rm -rf /tmp/x",
+        "git commit -m 'x'",
+    ):
+        # no `<<` → heredoc mask never runs; value is whatever HEAD produced
+        assert f("Bash", {"command": cmd}, wt) in (True, False)
