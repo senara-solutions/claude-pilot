@@ -10,6 +10,7 @@ vs escalates to the relay.
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -955,6 +956,95 @@ def test_sed_print_only_chain_still_denies_write_tail() -> None:
     re-validation) is unchanged."""
     assert is_safe_bash_command("sed -n '1,20p' file && rm -rf ~") is False
     assert is_safe_bash_command("sed -n '1,20p' file && echo hi > out") is False
+
+
+# ── cpp#250: `_SAFE_SED_PRINT_RE` ReDoS — bounded-time + decision parity ──────
+#
+# The trailing operand group used to be `(?:[A-Za-z0-9_./-]+\s*)*$` — a nested
+# quantifier (`X+` inside `(...)*`, with `\s*` able to match empty) that let the
+# engine split a long path into operand sub-tokens combinatorially. A path
+# followed by an out-of-class char (the `>` of a redirection) forces the tail to
+# fail, and every split is retried: time is exponential in the path length. A
+# pilot (01c5c3ef / mika#2601) burned 41 min of CPU on one such command and
+# never returned. The fix anchors each operand repetition on a leading `\s+`
+# (`(?:\s+[A-Za-z0-9_./-]+)*\s*$`), removing the ambiguity — matching is linear
+# and every decision is byte-identical (mika-ratified, parity on 11 cases).
+
+# The verbatim command that hung the pilot (mika#2601): a `sed -n '<range>p'`
+# with a ~40-char path and a redirection, which reaches the regex and fails the
+# tail on `>`. On HEAD this took tens of seconds; anchored, it is microseconds.
+_REDOS_VERBATIM_SED = (
+    "sed -n '1139,1216p' crates/mika-agent/src/task_engine/mod.rs "
+    "> .pilot-scratch/probe-block.txt"
+)
+# A 200-char path + redirection: HEAD would take astronomically long here;
+# anchored, still microseconds.
+_REDOS_LONG_PATH_SED = "sed -n '1,2p' " + ("a" * 200) + " > g"
+
+_REDOS_BUDGET_S = 0.050  # 50 ms — generous vs. the microsecond anchored cost
+
+
+def _elapsed(fn, *args) -> tuple[object, float]:
+    start = time.perf_counter()
+    result = fn(*args)
+    return result, time.perf_counter() - start
+
+
+def test_sed_print_only_redos_predicate_is_bounded_time() -> None:
+    """cpp#250 regression: the pathological ReDoS inputs return from the
+    print-only predicate in well under 50 ms (HEAD: tens of seconds / never).
+    The inputs are NOT print-only (a redirection is present), so the decision
+    is `False` — bounded time is the property under test."""
+    for command in (_REDOS_VERBATIM_SED, _REDOS_LONG_PATH_SED):
+        result, elapsed = _elapsed(_is_safe_sed_print_only, command)
+        assert result is False, command
+        assert elapsed < _REDOS_BUDGET_S, f"{command!r} took {elapsed * 1000:.1f} ms"
+
+
+def test_sed_print_only_redos_axes_are_bounded_time() -> None:
+    """cpp#250: the same inputs stay bounded through every axis that reaches
+    the regex — the lethality axis, the general tier3 axis, and the terminal-
+    denial classifier that hung the pilot (`_denial_is_terminal`)."""
+    for command in (_REDOS_VERBATIM_SED, _REDOS_LONG_PATH_SED):
+        _, elapsed = _elapsed(is_tier3_dangerous, command)
+        assert elapsed < _REDOS_BUDGET_S, f"is_tier3_dangerous {command!r}: {elapsed * 1000:.1f} ms"
+        _, elapsed = _elapsed(is_tier3_dangerous_for_lethality, command)
+        assert elapsed < _REDOS_BUDGET_S, (
+            f"is_tier3_dangerous_for_lethality {command!r}: {elapsed * 1000:.1f} ms"
+        )
+        _, elapsed = _elapsed(
+            permissions_module._denial_is_terminal,
+            "Bash",
+            {"command": command},
+            "/tmp",
+        )
+        assert elapsed < _REDOS_BUDGET_S, f"_denial_is_terminal {command!r}: {elapsed * 1000:.1f} ms"
+
+
+def test_sed_print_only_redos_fix_preserves_decision_parity() -> None:
+    """cpp#250: the anchor tightening changes NO decision. Every print-only
+    positive still matches; every non-print-only negative still rejects
+    (this is the MPC 11-case parity set, pinned as a guard)."""
+    positives = (
+        "sed -n '1p' f",
+        "sed -n '1,5p' path/to/file",
+        "sed -n '$p' a b c",
+        "sed -n '/re/p' file",
+        "sed -n '/a/,/b/p' x",
+        "sed -n '10,20p'",  # no file operand
+        "sed -n '1,5p' file   ",  # trailing spaces
+        "sed -n '1p' a b c d",  # multiple operands
+    )
+    negatives = (
+        "sed -n '1,2p' f > g",  # redirection
+        "sed -n '1p' f; sed -n '2p' g",  # second sed command
+        "sed -n '1p' $(id)",  # shell metachar
+        "sed -i '1p' f",  # wrong flag
+    )
+    for command in positives:
+        assert _is_safe_sed_print_only(command) is True, command
+    for command in negatives:
+        assert _is_safe_sed_print_only(command) is False, command
 
 
 # ── gh api ───────────────────────────────────────────────────────────────────

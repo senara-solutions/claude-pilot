@@ -2454,7 +2454,7 @@ def _is_safe_sed_pure_substitution(sub: str) -> bool:
 #     no redirect char) — consistent with every other bounded pipe tool here.
 _SED_ADDR = r"(?:\d+|\$|/(?:[^/\\]|\\.)*/)"
 _SAFE_SED_PRINT_RE = re.compile(
-    rf"^\s*sed\s+-n\s+'{_SED_ADDR}(?:,{_SED_ADDR})?p'\s*(?:[A-Za-z0-9_./-]+\s*)*$"
+    rf"^\s*sed\s+-n\s+'{_SED_ADDR}(?:,{_SED_ADDR})?p'\s*(?:\s+[A-Za-z0-9_./-]+)*\s*$"
 )
 
 
