@@ -974,6 +974,46 @@ def test_bundled_allows_dev_pilot_footprint(cmd: str) -> None:
     assert _effective(cmd) == "allow"
 
 
+# ── cpp#242: bash-cargo closed-list env-assignment prefix + --version/metadata ─
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # (a) closed-list env-assignment prefix (chainable) before `cargo`
+        "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/x cargo test --no-run",
+        "RUST_LOG=debug cargo build",
+        "RUST_BACKTRACE=1 cargo test",
+        "CARGO_TERM_COLOR=always cargo clippy",
+        # (b) new read-only subcommands
+        "cargo --version",
+        "cargo metadata --format-version 1",
+    ],
+)
+def test_cpp242_cargo_env_prefix_and_subcommands_admitted(cmd: str) -> None:
+    # Prime-ratified ADMISSION (2026-09-30). Each must reach `allow` (bash-cargo).
+    assert _effective(cmd) == "allow"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # off-list assignment names stay default-denied (egress axis untouched)
+        "PATH=/tmp cargo build",
+        "HOME=/x cargo test",
+        "LD_PRELOAD=/tmp/x.so cargo build",
+        "HTTPS_PROXY= cargo build",   # proxy-disabling: its OWN axis, unchanged
+        "HTTP_PROXY= cargo build",
+        "FOO=1 cargo build",
+        # the closed prefix is ONLY valid immediately before literal `cargo`:
+        # a prefixed non-cargo binary stays refused (MPC-ratified negative).
+        "CARGO_INCREMENTAL=0 bash -c 'cargo build'",
+    ],
+)
+def test_cpp242_off_list_prefix_and_non_cargo_stay_denied(cmd: str) -> None:
+    assert _effective(cmd) == "deny"
+
+
 def test_bundled_allows_path_bootstrap_compound() -> None:
     # mika#1260: the exact blocked command must now reach allow.
     cmd = (
