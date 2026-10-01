@@ -2026,6 +2026,41 @@ def _maybe_inherit_session_model(
     return rewritten
 
 
+def _maybe_strip_run_in_background(
+    tool_input: dict[str, Any],
+) -> dict[str, Any] | None:
+    """cpp#267: remove a truthy ``run_in_background`` from a subagent dispatch so
+    that in headless every dispatch becomes blocking.
+
+    In headless, a detached background dispatch cannot outlive the session. A
+    pilot that dispatches its reviewers with ``run_in_background: true`` and then
+    "waits" by yielding its turn ends the session: the SDK emits a
+    ``ResultMessage``, claude-pilot closes, and the background reviewers die with
+    it — review lost, no PR, ``PIPELINE_INCOMPLETE`` (founding incident
+    ``624656b1``: 8 background reviewers, ``[done] Success | 113 turns``). In an
+    interactive session the turn is re-woken by the agents' completion
+    notification; in headless nothing wakes the pilot, so "dispatch-then-yield"
+    is lethal. The prompt-level prohibition in ``ce-code-review`` does not hold —
+    the correction belongs at the substrate.
+
+    Stripping the flag forces the dispatch blocking, so it completes within the
+    turn and cannot be orphaned by session close. A single assistant message that
+    carries several ``Agent`` calls still runs them in PARALLEL (the strip only
+    removes the detached/polled background mode, not within-message concurrency),
+    so the review stays parallel-within-a-message; only the dispatch-then-yield
+    death is closed.
+
+    Returns a NEW ``tool_input`` dict with ``run_in_background`` removed when it
+    is present and truthy; returns ``None`` (leave the dispatch untouched) when
+    the key is absent or falsy.
+    """
+    if not tool_input.get("run_in_background"):
+        return None  # absent or falsy → nothing to strip
+    rewritten = dict(tool_input)
+    rewritten.pop("run_in_background", None)
+    return rewritten
+
+
 # ── cpp#257 (gate rework): the REACHED placement — a PreToolUse hook ──────────
 #
 # The first cut of cpp#257 wired the model-inherit rewrite into the
@@ -2057,17 +2092,30 @@ def create_subagent_model_inherit_hook(
     config: PilotConfig | None,
     task_id: str | None = None,
 ) -> HookCallback:
-    """cpp#257: build the ``PreToolUse`` hook that rewrites an ``Agent``/``Task``
-    dispatch to inherit the session model when it forces a strictly-smaller-window
-    model.
+    """cpp#257 + cpp#267: build the ``PreToolUse`` hook that rewrites an
+    ``Agent``/``Task`` dispatch on the reached SDK path.
+
+    Two admission-neutral rewrites, each independently auditable and able to
+    co-occur on one dispatch:
+
+    * cpp#257/263 — when the dispatch forces a strictly-smaller-context-window
+      ``model`` than the session's, drop the ``model`` override so it inherits the
+      session model (``review_degraded`` reason ``agent_dispatch_model_inherit``).
+    * cpp#267 — when the dispatch carries a truthy ``run_in_background``, strip it
+      so that in headless the dispatch is blocking and cannot be orphaned by
+      session close (``review_degraded`` reason
+      ``agent_dispatch_run_in_background_stripped``). A detached background
+      dispatch cannot outlive a headless session, so the reached hook forces it
+      blocking; within-message parallelism is untouched.
 
     Returned callable matches the SDK ``HookCallback`` signature
     ``(input, tool_use_id, context) -> HookJSONOutput``. On a warranted rewrite
     it returns a ``PreToolUse`` hook output carrying ``updatedInput`` (the
-    dispatch with its ``model`` override dropped) and emits a ``review_degraded``
-    audit marker; otherwise it returns ``{}`` (no change). It NEVER returns a
-    ``permissionDecision`` — the rewrite is independent of the permission
-    decision, so admission is unchanged (MPC gate requirement 1).
+    combined result of whichever rewrites applied) and emits one
+    ``review_degraded`` audit marker PER rewrite; otherwise it returns ``{}`` (no
+    change). It NEVER returns a ``permissionDecision`` — both rewrites are
+    independent of the permission decision, so admission is unchanged (MPC gate
+    requirement 1).
     """
 
     async def hook(
@@ -2088,21 +2136,49 @@ def create_subagent_model_inherit_hook(
         if not isinstance(tool_input, dict):
             return {}
 
-        rewritten = _maybe_inherit_session_model(tool_input, config)
+        # Both rewrites compose into ONE ``updatedInput``. Each fires its own
+        # audit event and neither carries a ``permissionDecision``; a single
+        # dispatch may trigger both (forced smaller model AND background) and be
+        # auditable on both axes.
+        rewritten: dict[str, Any] | None = None
+
+        # (1) cpp#257/263 — inherit the session model when a strictly-smaller
+        # window is forced.
+        model_rewrite = _maybe_inherit_session_model(tool_input, config)
+        if model_rewrite is not None:
+            rewritten = model_rewrite
+            audit.emit(
+                "review_degraded",
+                {
+                    "reason": "agent_dispatch_model_inherit",
+                    "placement": "pre_tool_use_hook",
+                    "tool_name": tool_name,
+                    "requested_model": tool_input.get("model"),
+                    "session_model": config.model if config is not None else None,
+                    "task_id": task_id,
+                },
+            )
+
+        # (2) cpp#267 — strip a truthy ``run_in_background`` so a detached
+        # background dispatch cannot outlive a headless session. Compose on top of
+        # a model rewrite if one already happened, so both land in one input.
+        bg_source = rewritten if rewritten is not None else tool_input
+        bg_rewrite = _maybe_strip_run_in_background(bg_source)
+        if bg_rewrite is not None:
+            rewritten = bg_rewrite
+            audit.emit(
+                "review_degraded",
+                {
+                    "reason": "agent_dispatch_run_in_background_stripped",
+                    "placement": "pre_tool_use_hook",
+                    "tool_name": tool_name,
+                    "task_id": task_id,
+                },
+            )
+
         if rewritten is None:
             return {}
 
-        audit.emit(
-            "review_degraded",
-            {
-                "reason": "agent_dispatch_model_inherit",
-                "placement": "pre_tool_use_hook",
-                "tool_name": tool_name,
-                "requested_model": tool_input.get("model"),
-                "session_model": config.model if config is not None else None,
-                "task_id": task_id,
-            },
-        )
         log_tool(str(tool_name), _summarize_input(str(tool_name), rewritten), "AUTO")
         return {
             "hookSpecificOutput": {
