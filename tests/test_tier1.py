@@ -33,6 +33,8 @@ from claude_pilot.tier1 import (
     _is_safe_xargs_command,
     _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
+    _last_assignment_value,
+    _last_real_assignment_value,
     _mask_quoted_operator_chars_for_admission,
     _mask_quoted_redirect_chars,
     _mktemp_scratch_variable_names,
@@ -4288,6 +4290,64 @@ class TestCeScratchSanctionUnit:
     def test_transitive_terminates_on_cycle(self) -> None:
         cmd = "A=$B/x; B=$A/y; mkdir -p \"$A\""
         assert _is_transitive_ce_scratch_mkdir_target(cmd, "$A") is False
+
+    # ── cpp#265: a `VAR=…` token inside a quoted argument is NOT an assignment ──
+    def test_transitive_echo_literal_does_not_poison_last_wins(self) -> None:
+        # mika#1960: the canonical ce-code-review preamble ENDS with
+        # `echo "RUN_DIR=$RUN_DIR"`. The flat scan matched that bracketed
+        # `RUN_DIR=$RUN_DIR` text as a LAST-WINS reassignment of RUN_DIR to a
+        # self-reference, so the transitive resolver missed the real scratch
+        # derivation and the pilot died TERMINAL. Command-start-aware resolution
+        # ignores the quoted token.
+        cmd = (
+            'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+            'RUN_ID="$(date +%Y%m%d-%H%M%S)-$(head -c4 /dev/urandom '
+            "| od -An -tx1 | tr -d ' ')\"; "
+            'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID"; '
+            'mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"; '
+            'echo "RUN_DIR=$RUN_DIR"'
+        )
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN_DIR") is True
+        assert _last_real_assignment_value(cmd, "RUN_DIR") == (
+            "$SCRATCH_ROOT/ce-code-review/$RUN_ID"
+        )
+        # The flat scan is what was fooled (kept unchanged for the admission axis).
+        assert _last_assignment_value(cmd, "RUN_DIR") == '$RUN_DIR"'
+
+    def test_transitive_leading_assignment_prefix_resolved(self) -> None:
+        # An assignment-PREFIX word (`FOO=val cmd`) is still a real command-start
+        # assignment and is resolved.
+        cmd = 'SR=/tmp/ce-scratch echo ignored; mkdir -p "$SR"'
+        assert _last_real_assignment_value(cmd, "SR") == "/tmp/ce-scratch"
+        # A `VAR=` that is NOT at command-start (inside a quoted echo argument) is
+        # ignored — the whole point of cpp#265.
+        assert _last_real_assignment_value('echo "SR=/tmp/evil"; ls', "SR") is None
+
+    def test_transitive_assigned_suffix_var_with_dotdot_rejected(self) -> None:
+        # The literal-tail `..` guard alone misses an INDIRECT traversal that
+        # rides an assigned suffix var; `_suffix_is_contained` resolves it.
+        cmd = 'SR=/tmp/ce; EVIL=../../etc; D="$SR/$EVIL"; mkdir -p "$D"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is False
+
+    def test_transitive_unassigned_suffix_var_stays_safe(self) -> None:
+        # mika#2562 contract preserved: an UNASSIGNED suffix var expands to empty
+        # under the scratch root, so it is still survivable.
+        cmd = (
+            'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+            'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID"; mkdir -p "$RUN_DIR"'
+        )
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN_DIR") is True
+
+    def test_transitive_bounded_time_on_long_chain(self) -> None:
+        import time
+
+        chain = "V0=/tmp/compound-engineering-$(id -u); " + "; ".join(
+            f'V{i}="$V{i - 1}/a"' for i in range(1, 51)
+        )
+        chain += '; mkdir -p "$V50"'
+        start = time.perf_counter()
+        _is_transitive_ce_scratch_mkdir_target(chain, "$V50")
+        assert (time.perf_counter() - start) < 0.05
 
 
 @pytest.fixture

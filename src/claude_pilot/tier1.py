@@ -932,6 +932,24 @@ _TRANSITIVE_VAR_PREFIX_RE = re.compile(
 )
 _TRANSITIVE_SCRATCH_MAX_DEPTH = 8
 
+# cpp#265: a `VAR=value` assignment anchored at the START of a (lstripped)
+# segment — the only position where bash actually performs an assignment. The
+# flat `_ANY_ASSIGNMENT_RE` above also matches `VAR=…` text that merely appears
+# INSIDE a quoted argument (`echo "RUN_DIR=$RUN_DIR"`), which the LAST-WINS
+# transitive resolver then wrongly took as `RUN_DIR`'s final value — the exact
+# mika#1960 death. This anchored form, applied per `_split_compound_command`
+# segment, counts only real assignment-prefix words. No lookbehind is needed
+# (position 0 of a segment is already a command-start).
+_LEADING_ASSIGNMENT_RE = re.compile(
+    r'(?P<var>[A-Za-z_][A-Za-z0-9_]*)='
+    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s;|&()<>]*))'
+)
+# A bare `$VAR`/`${VAR}` reference appearing inside a suffix path component. A
+# `$(…)` command-substitution never matches (the `(` is not a name char), so it
+# is treated as a benign component (cpp#265), not a variable requiring an
+# assignment.
+_VAR_REF_IN_SUFFIX_RE = re.compile(r"\$\{?(?P<var>[A-Za-z_][A-Za-z0-9_]*)\}?")
+
 
 def _last_assignment_value(command: str, var: str) -> str | None:
     """LAST-WINS value of the last same-command ``var=…`` assignment, else None.
@@ -951,6 +969,73 @@ def _last_assignment_value(command: str, var: str) -> str | None:
     return found
 
 
+def _last_real_assignment_value(command: str, var: str) -> str | None:
+    """LAST-WINS value of ``var``'s last REAL same-command assignment, else None.
+
+    cpp#265: unlike ``_last_assignment_value`` — whose flat scan also matches a
+    ``VAR=…`` token that merely appears INSIDE a quoted argument (e.g.
+    ``echo "RUN_DIR=$RUN_DIR"``) and so wrongly overrode the real assignment —
+    this walks ``_split_compound_command`` segments and counts only an
+    assignment in COMMAND-START position: the leading ``VAR=value``
+    assignment-prefix word(s) of a segment, where bash actually assigns. Scans
+    the WHOLE command (assignment and the mkdir that consumes it are different
+    segments) and is LAST-WINS across all of them.
+
+    LETHALITY-ONLY: used exclusively by the transitive scratch resolver
+    (``_value_roots_at_scratch`` / ``_is_transitive_ce_scratch_mkdir_target``),
+    both reached only on the ``for_lethality`` path. The admission axis
+    (``_ce_scratch_variable_names``) keeps the flat ``_last_assignment_value``,
+    so admission is byte-identical to HEAD.
+    """
+    found: str | None = None
+    for seg in _split_compound_command(command):
+        rest = seg.lstrip()
+        while True:
+            m = _LEADING_ASSIGNMENT_RE.match(rest)
+            if m is None:
+                break
+            if m.group("var") == var:
+                if m.group("dq") is not None:
+                    found = m.group("dq")
+                elif m.group("sq") is not None:
+                    found = m.group("sq")
+                else:
+                    found = m.group("bare")
+            rest = rest[m.end() :]
+            # More leading assignment prefixes (`A=1 B=2 cmd`) only if the next
+            # char is whitespace; anything else ends the prefix run.
+            if rest[:1].isspace():
+                rest = rest.lstrip()
+                continue
+            break
+    return found
+
+
+def _suffix_is_contained(value: str, command: str, depth: int = 0) -> bool:
+    """Whether a path-SUFFIX component ``value`` is contained under its scratch
+    root (cpp#265). Contained iff it carries no literal ``..`` and every bare
+    ``$VAR``/``${VAR}`` it names that IS locally assigned is itself contained
+    (bounded recursion).
+
+    An UNASSIGNED suffix var is safe and accepted — bash expands it to empty, so
+    it stays under the scratch root; this preserves the mika#2562 contract
+    (``RUN_DIR="$SCRATCH_ROOT/ce-…/$RUN_ID"`` with ``$RUN_ID`` unassigned is
+    survivable). A ``$(…)`` command-substitution is a benign component (its value
+    does not change the root); only a literal ``..`` can traverse out, and it is
+    rejected at every level — closing the indirect ``EVIL=../../etc;
+    D="$SR/$EVIL"`` traversal the literal-tail check alone would miss.
+    """
+    if depth > _TRANSITIVE_SCRATCH_MAX_DEPTH:
+        return False
+    if ".." in value:
+        return False
+    for m in _VAR_REF_IN_SUFFIX_RE.finditer(value):
+        nxt = _last_real_assignment_value(command, m.group("var"))
+        if nxt is not None and not _suffix_is_contained(nxt, command, depth + 1):
+            return False
+    return True
+
+
 def _is_tmpdir_default_scratch(value: str) -> bool:
     """``${TMPDIR:-/tmp}/<rest>`` treated as a ``/tmp`` scratch root (the canonical
     preamble's fallback), the ``<rest>`` held to the same uid-tolerant charset."""
@@ -961,8 +1046,14 @@ def _is_tmpdir_default_scratch(value: str) -> bool:
 
 
 def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
-    """Whether ``value`` roots (transitively, via same-command LAST-WINS assignments)
-    at a recognized scratch. LEXICAL, bounded depth, refuses ``..`` in a suffix."""
+    """Whether ``value`` roots (transitively, via same-command LAST-WINS
+    assignments) at a recognized scratch. LEXICAL, bounded depth.
+
+    The ROOT chain is followed with ``_last_real_assignment_value`` (cpp#265:
+    command-start-aware, so a ``VAR=…`` token inside a quoted ``echo`` argument
+    no longer poisons the LAST-WINS resolution). The SUFFIX is held contained by
+    ``_suffix_is_contained`` — no literal ``..`` and no assigned var carrying one
+    — while an unassigned suffix var stays safe (mika#2562)."""
     if depth > _TRANSITIVE_SCRATCH_MAX_DEPTH or not value:
         return False
     if _is_uid_tolerant_tmp_scratch(value) or _is_tmpdir_default_scratch(value):
@@ -972,9 +1063,9 @@ def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
         return False
     inner = m.group("vb") or m.group("v")
     tail = m.group("tb") or m.group("t")
-    if ".." in tail:
+    if not _suffix_is_contained(tail, command, depth + 1):
         return False
-    nxt = _last_assignment_value(command, inner)
+    nxt = _last_real_assignment_value(command, inner)
     if nxt is None:
         return False
     return _value_roots_at_scratch(nxt, command, depth + 1)
@@ -988,7 +1079,7 @@ def _is_transitive_ce_scratch_mkdir_target(command: str, dest: str) -> bool:
     m = _CE_SCRATCH_VARREF_RE.match(dest)
     if m is None:
         return False
-    value = _last_assignment_value(command, m.group("var"))
+    value = _last_real_assignment_value(command, m.group("var"))
     if value is None:
         return False
     return _value_roots_at_scratch(value, command, 0)
