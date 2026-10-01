@@ -54,6 +54,7 @@ from .tier1 import (
     is_within_project,
     readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
+    rm_targets_mktemp_scratch,
     sed_i_confined_to_worktree,
 )
 from .transport import invoke_command
@@ -898,9 +899,28 @@ def _denial_is_terminal(tool_name: str, tool_input: dict[str, Any], cwd: str) ->
     # applies we fall THROUGH to the redirect/destination vetoes below, which run
     # on the FULL command, so a confined `sed -i` that ALSO redirects out of the
     # worktree is re-armed there.
+    # cpp#268: a proven-danger match whose ONLY cause is `rm`/`rmdir` segment(s)
+    # whose EVERY operand is a variable the SAME command keeps as a live
+    # `$(mktemp -d)` scratch dir (fresh `/tmp` dir by construction, cpp#201) is
+    # not, on its own, grounds to end the session — the `rm` SINK sibling of the
+    # cpp#201 mktemp redirect SOURCE carve, and the structural twin of the cpp#213
+    # `.pilot-scratch` rm carve. `rm_targets_mktemp_scratch` re-runs the unchanged
+    # `is_tier3_dangerous_for_lethality` on the command with those carved segments
+    # removed, so any OTHER proven-danger cause — a mixed operand list
+    # (`rm -rf "$X" /etc`), a chained destructive verb, a second unconfined `rm`,
+    # a `..` escape, an ambient/unset var (`$HOME`, `$UNSET`), a command-sub
+    # operand (`$(curl …)`), or a variable reassigned out of scratch before the
+    # sink (`X=$(mktemp -d); X=/; rm -rf "$X"` — LAST-WINS) — still returns True
+    # here and stays terminal (fail-closed). Admission is byte-identical to HEAD
+    # (`is_tier3_dangerous` / `is_tier1_auto_approve` / YAML rules never call it);
+    # only lethality flips, so the pilot adapts instead of dying. When the carve
+    # applies we fall THROUGH to the redirect/destination vetoes below, which run
+    # on the FULL command, so a carved `rm` that ALSO redirects out of the
+    # worktree is re-armed there.
     if (
         is_tier3_dangerous_for_lethality(command)
         and not rm_confined_to_pilot_scratch(command, cwd)
+        and not rm_targets_mktemp_scratch(command)
         and not sed_i_confined_to_worktree(command, cwd)
         and not is_readonly_waitloop_script(command)
         and not readonly_procsub_survivable(command)
@@ -1343,7 +1363,9 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
 _TMP_SCRATCH_MKDIR_RE = re.compile(r"^/tmp/(?!.*\.\.)[\w./-]+$")
 
 
-def _is_sanctioned_tmp_scratch(dest: str, command: str = "") -> bool:
+def _is_sanctioned_tmp_scratch(
+    dest: str, command: str = "", *, for_lethality: bool = False
+) -> bool:
     """Whether an (already `mkdir`-classified) raw destination operand is the
     sanctioned ``/tmp`` scratch exception (cpp#143, extended by mika#2562).
 
@@ -1372,6 +1394,17 @@ def _is_sanctioned_tmp_scratch(dest: str, command: str = "") -> bool:
     Both axes are refusal-safe by construction: an unrecognized operand simply
     falls through to the cpp#218 (``$``/``~``-rooted) and cpp#38 (containment)
     vetoes exactly as before.
+
+    cpp#268/#266 re-gate (MPC, head `f44b43d` KO): ``for_lethality`` SKIPS axis A
+    only (the ``$VAR`` case), deferring it to ``_is_transitive_ce_scratch_mkdir_
+    target`` in ``_destination_veto_reason`` — which resolves the var with the
+    INVERTED reads-only resolver (``tier1._last_real_assignment_value``) and so
+    re-terminalizes a var reassigned OUT of scratch by a form the flat axis-A
+    scanner cannot see (``: ${SCRATCH_ROOT:=/etc}``, ``{ SCRATCH_ROOT=/etc; }``,
+    ``let``/``IFS= read``, …). The admission/refusal callers keep
+    ``for_lethality`` False and the flat axis-A, so admission is byte-identical to
+    HEAD; the literal/axis-B exceptions (no var, nothing to reassign) are
+    unchanged on both paths.
     """
     if not dest:
         return False
@@ -1381,7 +1414,10 @@ def _is_sanctioned_tmp_scratch(dest: str, command: str = "") -> bool:
     if _is_uid_tolerant_tmp_scratch(dest):
         return True
     # Axis A: a same-command variable assigned to a uid-tolerant /tmp scratch.
-    if command and _is_ce_scratch_variable_ref(command, dest):
+    # On the LETHALITY path this is deferred to the inverted transitive carve
+    # (see docstring); the flat axis-A would miss a reassignment-out it cannot
+    # enumerate.
+    if not for_lethality and command and _is_ce_scratch_variable_ref(command, dest):
         return True
     return False
 
@@ -1497,7 +1533,9 @@ def _destination_veto_reason(
             if subst_dests:
                 dests = subst_dests
         for dest in dests:
-            if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest, command):
+            if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(
+                dest, command, for_lethality=for_lethality
+            ):
                 continue
             # cpp#195 (both the original fix and this follow-up): `bash-git-
             # show-redirect` (cpp#35/#128, `git show <ref>:<path> >`, predates

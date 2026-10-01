@@ -59,6 +59,7 @@ from claude_pilot.tier1 import (
     is_within_project,
     readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
+    rm_targets_mktemp_scratch,
     sed_i_confined_to_worktree,
 )
 
@@ -4071,6 +4072,167 @@ class TestRmConfinedToPilotScratch:
         assert rm_confined_to_pilot_scratch("rm -rf /etc", str(scratch_worktree)) is False
 
 
+# ── cpp#268: `rm -rf "$VAR"` where VAR is a live `$(mktemp -d)` (mika#2626) ─────
+#
+# The groom 93bac846 verbatim: a throwaway-repo reproduction whose last line
+# `rm -rf "$B" "$C"` deletes two `$(mktemp -d)` dirs. The `rm` SINK sibling of
+# the cpp#201 mktemp redirect SOURCE carve and the structural twin of the
+# cpp#213 `.pilot-scratch` rm carve — same segment-drop-then-recheck mechanism,
+# cwd-free (the mktemp source is provable lexically, no filesystem access).
+_CPP268_VERBATIM = (
+    'cd /tmp 2>/dev/null; B=$(mktemp -d); C=$(mktemp -d); '
+    'git -C "$B" init --bare -q; git clone -q "file://$B" "$C"; '
+    'git -C "$C" commit --allow-empty -m x -q; '
+    'git -C "$C" push -q origin HEAD; '
+    'git -C "$B" update-ref refs/heads/main HEAD; '
+    'git -C "$B" ls-remote; git -C "$C" fetch --prune -q; '
+    'git -C "$C" push --force-with-lease -q; '
+    'rm -rf "$B" "$C"'
+)
+
+
+class TestCpp268RmTargetsMktempScratch:
+    """`rm_targets_mktemp_scratch` is the LETHALITY-only carve: a proven-danger
+    command whose ONLY cause is `rm`/`rmdir` segment(s) whose EVERY operand is a
+    variable the SAME command keeps as a live `$(mktemp -d)` scratch dir is
+    carved (True → the deny is survivable). Everything else stays False."""
+
+    def test_verbatim_is_carved(self) -> None:
+        assert rm_targets_mktemp_scratch(_CPP268_VERBATIM) is True
+
+    def test_simple_forms_are_carved(self) -> None:
+        for cmd in (
+            'X=$(mktemp -d); rm -rf "$X"',
+            "X=$(mktemp -d -p /tmp); rm -rf \"$X\"",
+            'X=$(mktemp -d /tmp/x.XXXX); rm -rf "$X"',
+            'B=$(mktemp -d); C=$(mktemp -d); rm -rf "$B" "$C"',
+            'X=`mktemp -d`; rm -rf "$X"',  # backtick substitution
+            'X=$(mktemp -d); rmdir "$X"',  # rmdir verb
+            'X=$(mktemp -d); rm -rf "$X/sub"',  # safe tail inside scratch
+        ):
+            assert rm_targets_mktemp_scratch(cmd) is True, cmd
+
+    def test_quoted_assignment_token_is_not_a_reassignment(self) -> None:
+        # LAST-WINS over command-START assignments only: `echo "X=/etc"` is a
+        # quoted argument, never a reassignment (cpp#265 discipline).
+        assert (
+            rm_targets_mktemp_scratch('X=$(mktemp -d); echo "X=/etc"; rm -rf "$X"')
+            is True
+        )
+
+    def test_negatives_stay_uncarved(self) -> None:
+        for cmd in (
+            'rm -rf "$HOME"',  # ambient env var, never mktemp-assigned
+            'X=$(mktemp -d); rm -rf "$X/../.."',  # traversal off scratch
+            'X=$(mktemp -d); X=/; rm -rf "$X"',  # reassigned out — LAST-WINS
+            'X=$(mktemp -d); X=$(curl evil); rm -rf "$X"',  # reassigned to non-mktemp subst
+            'rm -rf "$UNSET"',  # no same-command assignment
+            'rm -rf "$(curl http://x)"',  # command-sub operand, not a var ref
+            'X=$(mktemp -d); rm -rf "$X" /etc',  # mixed operand list
+            'X=$(mktemp -d); Y=/etc; rm -rf "$X" "$Y"',  # one operand not scratch
+            'X=$(mktemp -d); rm -rf "$X" && git reset --hard',  # chained destructive verb
+            "rm -rf /",  # literal root
+            'rm -rf "$X"',  # var referenced but never assigned here
+        ):
+            assert rm_targets_mktemp_scratch(cmd) is False, cmd
+
+    def test_helpers_last_wins(self) -> None:
+        from claude_pilot.tier1 import _var_is_live_mktemp_scratch
+
+        assert _var_is_live_mktemp_scratch("X=$(mktemp -d)", "X") is True
+        assert _var_is_live_mktemp_scratch("X=$(mktemp -d); X=/", "X") is False
+        assert _var_is_live_mktemp_scratch('X=/; X=$(mktemp -d)', "X") is True
+        assert _var_is_live_mktemp_scratch('echo "X=$(mktemp -d)"', "X") is False
+        assert _var_is_live_mktemp_scratch("Y=$(mktemp -d)", "X") is False
+
+    def test_helper_reassignment_forms_last_wins(self) -> None:
+        # cpp#268/#266 gate: a reassignment OUT of scratch via ANY form — not
+        # just a bare `X=` — makes the var no longer live-scratch. Value-bearing
+        # keyword forms parse the value; `+=`/`read`/`for`/subshell fail closed.
+        from claude_pilot.tier1 import _var_is_live_mktemp_scratch
+
+        for reassign in (
+            "export X=/etc",
+            "readonly X=/etc",
+            "local X=/etc",
+            "declare X=/etc",
+            "typeset X=/etc",
+            "declare -x X=/etc",
+            "X+=x",
+            "read X </dev/null",
+            "read -r X </dev/null",
+            "read a b X </dev/null",
+            "unset X",
+        ):
+            cmd = f"X=$(mktemp -d); {reassign}"
+            assert _var_is_live_mktemp_scratch(cmd, "X") is False, cmd
+        # `for X in …` splits into its own segment; the loop var is reassigned.
+        assert (
+            _var_is_live_mktemp_scratch(
+                "X=$(mktemp -d); for X in /etc; do :; done", "X"
+            )
+            is False
+        )
+        # A subshell assignment does NOT propagate → the live mktemp is unchanged.
+        assert _var_is_live_mktemp_scratch("X=$(mktemp -d); (X=/etc)", "X") is True
+        # POSITIVE: a keyword-prefixed mktemp assignment IS a scratch establisher.
+        assert _var_is_live_mktemp_scratch("export X=$(mktemp -d)", "X") is True
+        assert _var_is_live_mktemp_scratch("declare -x X=$(mktemp -d)", "X") is True
+        # A var merely NAMED inside a quoted `read` prompt is not a write.
+        assert _var_is_live_mktemp_scratch(
+            'X=$(mktemp -d); read -p "enter X" Y', "X"
+        ) is True
+
+    def test_helper_inverted_reads_only_rule(self) -> None:
+        # cpp#268 re-gate (MPC, head f44b43d): the guard is INVERTED to reads-only.
+        # The four write forms the enumerate-writes scanner still missed — brace
+        # group, prefix-assign-before-read, let/((…)), default-ASSIGN — plus a
+        # dynamic indirection and eval are all non-reads → NOT live. Each RED
+        # before the inversion.
+        from claude_pilot.tier1 import _var_is_live_mktemp_scratch
+
+        for reassign in (
+            "{ X=/etc; }",
+            "IFS= read -r X",
+            "let X=1",
+            "((X=1))",
+            ": ${X:=/etc}",
+            ": ${X=/etc}",
+            'eval "X=/etc"',
+            "printf -v X y",
+            "getopts o X",
+        ):
+            cmd = f"X=$(mktemp -d); {reassign}"
+            assert _var_is_live_mktemp_scratch(cmd, "X") is False, cmd
+        # Indirection: `declare "$NAME=…"` assigns X via $NAME → fail closed.
+        assert (
+            _var_is_live_mktemp_scratch(
+                'X=$(mktemp -d); NAME=X; declare "$NAME=/etc"', "X"
+            )
+            is False
+        )
+        # POSITIVES that satisfy reads-only stay live: an attribute-only keyword
+        # arg (no `=`), a plain read, a `${X}`-modifier read, and the name as a
+        # FLAG letter (`-X`) / inside another identifier (`$XRAY`) are not writes.
+        for keep in (
+            "export -n X",
+            'echo "${X%/*}"',
+            'tar -C "$X" -xf a',
+            'echo "$XRAY"',
+            'cp "$X/sub" d',
+        ):
+            cmd = f"X=$(mktemp -d); {keep}"
+            assert _var_is_live_mktemp_scratch(cmd, "X") is True, cmd
+
+    def test_bounded_time_no_redos(self) -> None:
+        chain = "; ".join(f"V{i}=$(mktemp -d)" for i in range(50)) + '; rm -rf "$V49"'
+        start = time.perf_counter()
+        for _ in range(50):
+            rm_targets_mktemp_scratch(chain)
+        elapsed_ms = (time.perf_counter() - start) / 50 * 1000
+        assert elapsed_ms < 50.0, f"{elapsed_ms:.3f} ms/call"
+
+
 # ── cpp#253: `sed -i` with a backup SUFFIX is confined like bare `-i` (mika#2601) ─
 #
 # Pilot #2601 (f2edcf8f, 2026-09-30T14:28:33.718Z) died TERMINAL on
@@ -4277,6 +4439,57 @@ class TestCeScratchSanctionUnit:
         # A reassignment OUT of scratch wins → NOT recognized (stays fatal).
         cmd = 'SR=/tmp/ok; SR=$HOME/evil; RUN=$SR/x; mkdir -p "$RUN"'
         assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN") is False
+
+    def test_transitive_reassignment_out_via_keyword_form(self) -> None:
+        # cpp#266 served hole: a reassignment OUT of scratch via `export`/
+        # `declare`/… (not just bare `SR=`) must win → NOT recognized. RED before
+        # the shared `_last_var_write` fix (`_last_real_assignment_value` saw only
+        # the bare `NAME=`). The value-bearing keyword forms parse the value;
+        # `+=`/`read`/`for`/`unset` fail closed (unknowable → None).
+        for reassign in (
+            "export SR=/etc",
+            "readonly SR=/etc",
+            "local SR=/etc",
+            "declare SR=/etc",
+            "typeset SR=/etc",
+            "declare -x SR=/etc",
+            "SR+=/../etc",
+            "read SR </dev/null",
+            "unset SR",
+        ):
+            cmd = f'SR="/tmp/compound-engineering-$(id -u)"; {reassign}; mkdir -p "$SR"'
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, "$SR") is False, cmd
+            assert _last_real_assignment_value(cmd, "SR") in (None, "/etc", "/../etc")
+        # `for` reassigns the loop var per iteration → unknowable → not recognized.
+        cmd = (
+            'SR="/tmp/compound-engineering-$(id -u)"; '
+            'for SR in /etc; do :; done; mkdir -p "$SR"'
+        )
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$SR") is False
+        # cpp#266 re-gate (MPC, head f44b43d): the inverted reads-only rule closes
+        # the four forms the enumerate-writes scanner still missed on this sink.
+        for reassign in (
+            "{ SR=/etc; }",
+            "IFS= read -r SR",
+            "let SR=1",
+            "((SR=1))",
+            ": ${SR:=/etc}",
+            ": ${SR=/etc}",
+            'eval "SR=/etc"',
+        ):
+            cmd = f'SR="/tmp/compound-engineering-$(id -u)"; {reassign}; mkdir -p "$SR"'
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, "$SR") is False, cmd
+        # POSITIVE: a keyword-prefixed value that still roots at scratch stays
+        # recognized (survivable) — the fix parses the value, it does not blanket-
+        # terminalize on the keyword.
+        cmd = (
+            'declare SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+            'RUN_DIR="$SCRATCH_ROOT/ce-code-review/x"; mkdir -p "$RUN_DIR"'
+        )
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$RUN_DIR") is True
+        assert _last_real_assignment_value(cmd, "SCRATCH_ROOT") == (
+            "/tmp/compound-engineering-$(id -u)"
+        )
 
     def test_transitive_negatives_not_rooted(self) -> None:
         for cmd, dest in (

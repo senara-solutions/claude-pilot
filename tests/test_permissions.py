@@ -992,6 +992,235 @@ def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+# ── cpp#268: `rm -rf "$VAR"` on a live `$(mktemp -d)` is survivable (mika#2626) ─
+#
+# groom 93bac846 died TERMINAL at turn 12 on a throwaway-repo reproduction whose
+# last line deletes two `$(mktemp -d)` dirs. The refusal is legitimate (`;`-chain,
+# multi-line, `cd` out of worktree) and STAYS — only the lethality is wrong. The
+# `rm` SINK sibling of the cpp#201 mktemp redirect SOURCE carve, cwd-free.
+_CPP268_VERBATIM = (
+    'cd /tmp 2>/dev/null; B=$(mktemp -d); C=$(mktemp -d); '
+    'git -C "$B" init --bare -q; git clone -q "file://$B" "$C"; '
+    'git -C "$C" commit --allow-empty -m x -q; '
+    'git -C "$C" push -q origin HEAD; '
+    'git -C "$B" update-ref refs/heads/main HEAD; '
+    'git -C "$B" ls-remote; git -C "$C" fetch --prune -q; '
+    'git -C "$C" push --force-with-lease -q; '
+    'rm -rf "$B" "$C"'
+)
+
+
+def test_cpp268_rm_on_mktemp_scratch_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#268: an `rm`/`rmdir` whose operands are ALL variables the SAME command
+    keeps as a live `$(mktemp -d)` scratch dir is a SURVIVABLE deny —
+    `_denial_is_terminal` returns ``False`` — while every other shape stays
+    terminal, unchanged.
+
+    Sibling of the cpp#201 mktemp redirect carve and the cpp#213 `.pilot-scratch`
+    rm carve. The command is still REFUSED (admission byte-identical — see
+    ``test_cpp268_admission_is_byte_identical_only_lethality_flips``); only the
+    lethality flips.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    # Positive — the only proven-danger cause is an rm of live mktemp scratch.
+    for cmd in (
+        _CPP268_VERBATIM,
+        'X=$(mktemp -d); rm -rf "$X"',
+        'X=$(mktemp -d -p /tmp); rm -rf "$X"',
+        'X=$(mktemp -d /tmp/x.XXXX); rm -rf "$X"',
+        'B=$(mktemp -d); C=$(mktemp -d); rm -rf "$B" "$C"',
+        'X=`mktemp -d`; rm -rf "$X"',
+        'X=$(mktemp -d); echo "X=/etc"; rm -rf "$X"',  # quoted token not a reassign
+        # cpp#268/#266 gate: `export`/`declare` of a mktemp assignment is STILL a
+        # scratch establisher — the value is parsed, not blanket-terminalized.
+        'export X=$(mktemp -d); rm -rf "$X"',
+        'declare -x X=$(mktemp -d); rm -rf "$X"',
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # Negative — ambient/unset var, traversal, a reassignment out of scratch,
+    # a command-sub operand, a mixed list, or a chained verb stays TERMINAL.
+    for cmd in (
+        'rm -rf "$HOME"',
+        'X=$(mktemp -d); rm -rf "$X/../.."',
+        'X=$(mktemp -d); X=/; rm -rf "$X"',
+        'X=$(mktemp -d); X=$(curl evil); rm -rf "$X"',
+        'rm -rf "$UNSET"',
+        'rm -rf "$(curl http://x)"',
+        'X=$(mktemp -d); rm -rf "$X" /etc',
+        'X=$(mktemp -d); rm -rf "$X" && git reset --hard',
+        "rm -rf /",
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+
+def test_cpp268_reassignment_out_of_scratch_any_form_is_terminal(
+    tmp_path: Path,
+) -> None:
+    """cpp#268/#266 gate (MPC, hole `bdc43ff`): the reassignment guard recognized
+    ONLY a BARE ``NAME=``, so a reassignment of the mktemp source OUT of scratch
+    via any OTHER form left the ``rm`` sink wrongly SURVIVABLE. EACH case below
+    was RED before the shared ``_last_var_write`` fix (terminal→survivable) and
+    is now TERMINAL again. The refusal held throughout; only lethality is
+    re-terminalized. Value-bearing keyword forms parse the value (LAST-WINS);
+    the unknowable forms (``+=``/``read``/``for``/subshell) fail CLOSED.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    for cmd in (
+        'B=$(mktemp -d); export B=/; rm -rf "$B"',
+        'B=$(mktemp -d); export B=/etc; rm -rf "$B"',
+        'B=$(mktemp -d); readonly B=/; rm -rf "$B"',
+        'B=$(mktemp -d); local B=/; rm -rf "$B"',
+        'B=$(mktemp -d); declare B=/; rm -rf "$B"',
+        'B=$(mktemp -d); typeset B=/; rm -rf "$B"',
+        'B=$(mktemp -d); declare -x B=/; rm -rf "$B"',
+        'B=$(mktemp -d); B+=x; rm -rf "$B"',  # append — value unknowable
+        'B=$(mktemp -d); read B </dev/null; rm -rf "$B"',
+        'B=$(mktemp -d); read -r B </dev/null; rm -rf "$B"',
+        'B=$(mktemp -d); read a b B </dev/null; rm -rf "$B"',
+        'B=$(mktemp -d); for B in /etc /; do :; done; rm -rf "$B"',
+        # subshell assignment does NOT propagate → $B unset/original → terminal.
+        '(B=/tmp/ok); rm -rf "$B"',
+        # cpp#268 re-gate (MPC, head f44b43d): FOUR write forms the enumerate-
+        # writes scanner still missed — now closed by the INVERTED reads-only
+        # rule. Each RED (survivable) before the inversion.
+        'B=$(mktemp -d); { B=/etc; }; rm -rf "$B"',          # brace group
+        'B=$(mktemp -d); IFS= read -r B; rm -rf "$B"',       # prefix-assign + read
+        'B=$(mktemp -d); let B=1; rm -rf "$B"',              # let
+        'B=$(mktemp -d); ((B=1)); rm -rf "$B"',              # ((…))
+        'B=$(mktemp -d); : ${B:=/etc}; rm -rf "$B"',         # default-ASSIGN
+        'B=$(mktemp -d); : ${B=/etc}; rm -rf "$B"',          # default-ASSIGN (no :)
+        'B=$(mktemp -d); eval "B=/etc"; rm -rf "$B"',        # quoted eval assignment
+        # indirection: `declare "$NAME=…"` assigns B via $NAME — fail closed.
+        'B=$(mktemp -d); NAME=B; declare "$NAME=/etc"; rm -rf "$B"',
+        # cpp#268 gate n°3 (MPC, head fb9b6b1): a sourced script reassigns the var
+        # in the CURRENT shell, exactly like `eval "$CMD"` — treat `source`/`.` as
+        # opaque, fail closed. Each RED (survivable) before this addition.
+        'B=$(mktemp -d); source x.sh; rm -rf "$B"',          # `source` builtin
+        'B=$(mktemp -d); . ./x.sh; rm -rf "$B"',             # `.` (dot) builtin
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+    # POSITIVE — a non-value attribute change (`export -n`, no `=`) keeps the
+    # mktemp value, a subshell reassignment does not propagate, and `./script`
+    # EXECS in a child (not a source) → all survivable.
+    for cmd in (
+        'B=$(mktemp -d); export -n B; rm -rf "$B"',
+        'B=$(mktemp -d); (B=/etc); rm -rf "$B"',
+        'B=$(mktemp -d); ./build.sh; rm -rf "$B"',
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+
+def test_cpp266_mkdir_reassignment_out_of_scratch_is_terminal(
+    tmp_path: Path,
+) -> None:
+    """cpp#266 served hole (the SAME shared assignment-form gap): on the
+    transitive-scratch ``mkdir`` sink, a reassignment of the recognized
+    ``/tmp`` scratch root OUT of scratch via ``export``/``declare`` was invisible
+    to ``_last_real_assignment_value`` (bare ``NAME=`` only), so ``mkdir -p
+    "$SCRATCH_ROOT"`` on a now-``/etc`` root stayed SURVIVABLE. The shared
+    ``_last_var_write`` fix re-terminalizes it. The POSITIVE ``declare``-form
+    ce-code-review preamble (value parsed, roots at ``/tmp`` scratch) stays
+    survivable.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    wt = str(worktree)
+
+    # NEGATIVE — reassigned OUT of scratch via keyword form → terminal. Each was
+    # SURVIVABLE before the fix (the MPC gate's served hole: the bare `$SCRATCH_
+    # ROOT` ref is the transitive carve's shape, and `_last_real_assignment_value`
+    # saw only the first bare `SCRATCH_ROOT=/tmp/…`, missing the keyword reassign).
+    # The chmod sink in the full gate compound re-terminalizes with the mkdir.
+    for cmd in (
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'export SCRATCH_ROOT=/etc; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'declare SCRATCH_ROOT=/etc; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'readonly SCRATCH_ROOT=/etc; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'declare -x SCRATCH_ROOT=/etc; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'export SCRATCH_ROOT=/etc; mkdir -p "$SCRATCH_ROOT"; '
+        'chmod 700 "$SCRATCH_ROOT"',
+        # cpp#266 re-gate (MPC, head f44b43d): the SAME four forms the enumerate-
+        # writes scanner missed, on the mkdir/chmod sink — now closed by the
+        # inverted reads-only rule (the direct axis-A `_is_sanctioned_tmp_scratch`
+        # defers the `$VAR` case to the inverted transitive carve for_lethality).
+        'SCRATCH_ROOT="/tmp/x"; : ${SCRATCH_ROOT:=/etc}; '
+        'mkdir -p "$SCRATCH_ROOT"; chmod 700 "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        '{ SCRATCH_ROOT=/etc; }; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'let SCRATCH_ROOT=1; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'IFS= read -r SCRATCH_ROOT; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/x"; ((SCRATCH_ROOT=1)); mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/x"; NAME=SCRATCH_ROOT; declare "$NAME=/etc"; '
+        'mkdir -p "$SCRATCH_ROOT"',
+        # cpp#266 gate n°3 (MPC, head fb9b6b1): a sourced script can reassign the
+        # root in the current shell — `source`/`.` treated as opaque, fail closed.
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'source x.sh; mkdir -p "$SCRATCH_ROOT"',
+        'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        '. ./x.sh; mkdir -p "$SCRATCH_ROOT"',
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+    # POSITIVE — the `declare`-form of the official ce-code-review preamble roots
+    # at a recognized `/tmp` scratch (value parsed, not keyword-terminalized) →
+    # survivable, exactly like the bare-assignment form.
+    for cmd in (
+        'declare SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'RUN_DIR="$SCRATCH_ROOT/ce-code-review/x"; mkdir -p "$RUN_DIR"',
+        'export SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; '
+        'RUN_DIR="$SCRATCH_ROOT/ce-code-review/x"; mkdir -p "$RUN_DIR"',
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+
+def test_cpp268_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#268 sovereign boundary: the ADMISSION verdict for the mktemp-scratch rm
+    case is byte-identical to HEAD — the command is STILL denied. `rm -rf` is
+    still tier3-dangerous, never tier1-auto-approved, and the policy still
+    default-denies it. Only `_denial_is_terminal` flips terminal→survivable, and
+    the egress/redirect vetoes on the FULL command are unaffected.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    cmd = 'X=$(mktemp -d); rm -rf "$X"'
+
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(
+        _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 # ── cpp#237: a read-only wait-loop script is a SURVIVABLE deny (mika#2105) ─────
 #
 # The verbatim mika#2105 command (pilot e1a6c78b, 2026-09-29T15:13:20Z) that died
