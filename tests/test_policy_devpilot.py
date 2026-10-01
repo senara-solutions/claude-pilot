@@ -2732,6 +2732,54 @@ class TestCeScratchCanonicalPreambleLethality:
         assert result.interrupt is True                   # last-wins → non-scratch → fatal
 
 
+# ── cpp#265: the OFFICIAL ce-code-review preamble ENDS `echo "RUN_DIR=$RUN_DIR"` ──
+#
+# The one-line preamble the skill emits ends with `echo "RUN_DIR=$RUN_DIR"; python3
+# …/run-log.py … --run-dir "$RUN_DIR" …`. The flat `_last_assignment_value` scan
+# matched the bracketed `RUN_DIR=$RUN_DIR` text INSIDE the echo argument as a
+# LAST-WINS reassignment of RUN_DIR to a self-reference, so the transitive scratch
+# resolver (mika#2562) missed the real `$SCRATCH_ROOT/…` derivation and the pilot
+# (mika#1960, 819e8f6b) died TERMINAL entering /ce:code-review. Command-start-aware
+# resolution (`_last_real_assignment_value`) ignores the quoted token. LETHALITY
+# ONLY — the deny stays; admission is byte-identical.
+_CE_PREAMBLE_WITH_ECHO = (
+    'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)"; mkdir -p "$SCRATCH_ROOT"; '
+    'chmod 700 "$SCRATCH_ROOT"; '
+    "RUN_ID=\"$(date +%Y%m%d-%H%M%S)-$(head -c4 /dev/urandom | od -An -tx1 "
+    "| tr -d ' ')\"; "
+    'RUN_DIR="$SCRATCH_ROOT/ce-code-review/$RUN_ID"; mkdir -p "$RUN_DIR"; '
+    'chmod 700 "$RUN_DIR"; echo "RUN_DIR=$RUN_DIR"; '
+    'python3 .../ce-code-review/scripts/run-log.py event --run-dir "$RUN_DIR" '
+    "--start scope"
+)
+
+
+class TestCpp265TransitiveScratchDerivationWithEcho:
+    def test_verbatim_preamble_is_survivable_but_still_refused(self, tmp_path) -> None:
+        _, handler = _wt_handler(tmp_path)
+        result = asyncio.run(
+            handler("Bash", _bash(_CE_PREAMBLE_WITH_ECHO), _mock_ctx())
+        )
+        assert isinstance(result, PermissionResultDeny)   # deny unchanged
+        assert result.interrupt is False                  # survivable (was fatal #265)
+
+    def test_admission_byte_identical_with_echo(self, tmp_path) -> None:
+        cwd = str(tmp_path)
+        assert (
+            _destination_veto_reason(_CE_PREAMBLE_WITH_ECHO, cwd, for_lethality=False)
+            is not None
+        )
+
+    def test_indirect_dotdot_via_assigned_suffix_var_stays_fatal(
+        self, tmp_path
+    ) -> None:
+        _, handler = _wt_handler(tmp_path)
+        cmd = 'SR=/tmp/ce; EVIL=../../etc; D="$SR/$EVIL"; mkdir -p "$D"'
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny)
+        assert result.interrupt is True
+
+
 # ── cpp#224: make the axis-A ADMISSION last-wins (TIGHTENING) ──────────────────
 #
 # Pre-existing defect (found during cpp#223): axis-A recognition
