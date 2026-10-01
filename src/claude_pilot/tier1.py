@@ -339,6 +339,129 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
     )
 
 
+# ── cpp#236 (ADMISSION): an operator char inside a quoted token is not an ──────
+# operator for TIER3_PATTERNS.
+#
+# The generic redirect entry of `TIER3_PATTERNS` (`:231`,
+# `(?<!<)>{1,2}(?!\(|&[\d-])`) is quote-blind, so it reads a `>` that bash treats
+# as ordinary text — one written INSIDE a single- or double-quoted token — as a
+# shell redirect. `is_tier3_dangerous` then returns True, which flips a policy
+# `allow` to a deny at the chain-safety gate
+# (`permissions._bash_allow_is_chain_safe`, the `and not is_tier3_dangerous(seg)`
+# clause). Pilots searching for Mika plan callouts — whose shape is
+# `> - **Plan:**` — were refused once per turn and burned their whole budget
+# (mika#2194, mika#2606, 2026-09-30).
+#
+# This masks (blanks, length-preserving) every `<`/`>`/`|`/`&` that a shlex-grade
+# single-pass scanner finds INSIDE a top-level single- or double-quoted token,
+# then runs the UNCHANGED `TIER3_PATTERNS` on the masked string. It is the
+# ADMISSION analog of the LETHALITY-path `_mask_lethality_redirect_chars`
+# (`:1049`), and deliberately differs from it in two ways:
+#
+#   1. It masks four operator chars, not only `<`/`>` — the generalization Prime
+#      ratified: a quoted `<`, `|`, or `&` is no more a shell operator than a
+#      quoted `>`. (Only the `>`/`<(` cases change `is_tier3_dangerous` today —
+#      no `TIER3_PATTERNS` entry matches a bare `|`/`&` — but masking all four
+#      keeps the admission classifier consistent and future-proof.)
+#   2. It NEVER masks inside a `$(…)` command substitution or a `` `…` `` backtick
+#      region (it still tracks them, so quote state stays correct and the
+#      `'"'"'` idiom and nested quotes do not desync the scanner). `$(…)`/
+#      backtick are out of tier3 since mika#946; this fix leaves their handling
+#      byte-identical, which is why `echo "$(cat /etc/shadow)" > x` stays refused
+#      (the `> x` is a real TOP-level redirect, outside any quote).
+#
+# Linear (one pass, O(1) per char via `sub_bt_depth`), no regex → not a ReDoS
+# surface (cpp#250). FAIL-CLOSED: an unbalanced quote/substitution (stack not
+# empty at end) returns the command UNCHANGED, so a dangling-quote command stays
+# flagged — the safe direction for an admission (refusal) classifier.
+_ADMISSION_QUOTED_OPERATOR_CHARS = frozenset("<>|&")
+
+
+def _mask_quoted_operator_chars_for_admission(command: str) -> str:
+    r"""Blank every ``<``/``>``/``|``/``&`` that sits inside a TOP-level single-
+    or double-quoted token, leaving every real outer operator intact. A char
+    inside a ``$(…)`` command substitution or a ``` `…` ``` backtick region is
+    left untouched (those are out of tier3 since mika#946). Length-preserving
+    (one space per masked char), purely lexical, single linear pass.
+
+    Unterminated quote/substitution → the command is returned UNCHANGED
+    (fail-closed toward refusal — the safe direction for admission).
+    """
+    out = list(command)
+    stack: list[str] = []          # "DQ" | "SQ" | "SUB" | "BT"
+    sub_paren: list[int] = []      # nested-paren depth, one entry per SUB frame
+    sub_bt_depth = 0               # SUB/BT frames currently open (O(1) "in sub?")
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        top = stack[-1] if stack else "TOP"
+        if top == "SQ":            # single quotes: no escapes; only ' closes
+            if ch == "'":
+                stack.pop()
+            elif ch in _ADMISSION_QUOTED_OPERATOR_CHARS and sub_bt_depth == 0:
+                out[i] = " "
+            i += 1
+            continue
+        if top == "BT":            # backtick substitution: \X escapes; ` closes.
+            if ch == "\\" and i + 1 < n:   # Never masked (substitution body).
+                i += 2
+                continue
+            if ch == "`":
+                stack.pop()
+                sub_bt_depth -= 1
+            i += 1
+            continue
+        # top in TOP / DQ / SUB : \X is an atomic escape pair
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            stack.append("SUB")
+            sub_paren.append(0)
+            sub_bt_depth += 1
+            i += 2
+            continue
+        if ch == "`":
+            stack.append("BT")
+            sub_bt_depth += 1
+            i += 1
+            continue
+        if ch == '"':
+            if top == "DQ":
+                stack.pop()
+            else:
+                stack.append("DQ")
+            i += 1
+            continue
+        if ch == "'":
+            if top in ("TOP", "SUB"):   # inside "..." a ' is a literal char
+                stack.append("SQ")
+            i += 1
+            continue
+        if top == "SUB":           # substitution body: track parens, never mask
+            if ch == "(":
+                sub_paren[-1] += 1
+            elif ch == ")":
+                if sub_paren[-1] > 0:
+                    sub_paren[-1] -= 1
+                else:
+                    stack.pop()
+                    sub_paren.pop()
+                    sub_bt_depth -= 1
+            i += 1
+            continue
+        if top == "DQ":
+            if ch in _ADMISSION_QUOTED_OPERATOR_CHARS and sub_bt_depth == 0:
+                out[i] = " "
+            i += 1
+            continue
+        # TOP: a real outer operator — leave intact.
+        i += 1
+    if stack:
+        return command
+    return "".join(out)
+
+
 # DOCTRINE: LLM-classifier permission decision (mika#1733 AC2, mika#1193)
 #
 # Applies per senara-solutions/mika @
@@ -355,10 +478,17 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
 # `validate_dispatch_readiness`, `is_unauthorized_webhook_dispatch` (see the
 # tier-1 anchor above for the retirement reference — mika#1193).
 def is_tier3_dangerous(command: str) -> bool:
+    # cpp#236: an operator char (`<`/`>`/`|`/`&`) inside a top-level quoted token
+    # is ordinary text to bash, not a shell operator — mask it before the
+    # pattern search so the quote-blind generic-redirect entry does not
+    # false-positive (e.g. `grep '> - **Plan:**' f`). `$(…)`/backtick bodies are
+    # left byte-identical (out of tier3 since mika#946); an unbalanced quote
+    # returns the command unchanged (fail-closed → stays flagged).
+    masked = _mask_quoted_operator_chars_for_admission(command)
     # Strip universal fd-to-/dev/null silencing before the dangerous-pattern
     # check (see _FD_DEVNULL_RE comment). The strip is invisible to all other
     # patterns; only the bare-`>` redirect pattern is affected.
-    stripped = _FD_DEVNULL_RE.sub("", command)
+    stripped = _FD_DEVNULL_RE.sub("", masked)
     return any(p.search(stripped) for p in TIER3_PATTERNS)
 
 
