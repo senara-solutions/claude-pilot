@@ -38,7 +38,7 @@ import asyncio
 import sys
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from .agent import (
@@ -48,7 +48,7 @@ from .agent import (
     _system_prompt_with_hint,
     _text_of,
 )
-from .permissions import create_permission_handler
+from .permissions import create_permission_handler, create_subagent_model_inherit_hook
 from .types import PilotConfig
 from .ui import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
 
@@ -91,6 +91,21 @@ def build_shell_options(
         can_use_tool=handler,
         system_prompt=_system_prompt_with_hint(),
         disallowed_tools=["ScheduleWakeup"],
+        # cpp#257: same reached PreToolUse placement as agent.py (parity) — the
+        # Agent/Task model-inherit rewrite on a path the dispatch actually
+        # traverses, admission-neutral (updatedInput, no permissionDecision).
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Agent|Task",
+                    hooks=[
+                        create_subagent_model_inherit_hook(
+                            config=config, task_id=task_id
+                        )
+                    ],
+                )
+            ]
+        },
     )
 
 

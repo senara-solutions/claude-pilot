@@ -362,6 +362,9 @@ async def _run(
             task_id=task_id,
             permission_handler=handler,
             guardrails=guardrails,
+            # cpp#257: the PreToolUse model-inherit hook needs the session model,
+            # which lives on the PilotConfig (not guardrails' ResolvedGuardrailConfig).
+            pilot_config=config,
         )
     )
     shutdown_task = asyncio.create_task(shutdown_event.wait())

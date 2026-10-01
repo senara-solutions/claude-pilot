@@ -20,7 +20,13 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
-from claude_agent_sdk.types import ToolPermissionContext
+from claude_agent_sdk.types import (
+    HookCallback,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    ToolPermissionContext,
+)
 
 from . import audit, per_spawn, permission_events
 from .guardrails import SessionGuardrails
@@ -1891,6 +1897,221 @@ def _record_decision(
         terminal=terminal,
     )
     return result
+
+
+# ── cpp#257: Agent dispatch model-inherit guard ──────────────────────────────
+#
+# A pilot session runs on a large-context model (the pilot logs
+# ``[init] ... model claude-opus-5[1m]`` — a 1M-token window). A CE skill
+# (ce-code-review's multi-agent depth gate on a large diff, or ce-simplify-code)
+# then dispatches a subagent via the ``Agent`` tool and FORCES a smaller-window
+# model (``model: "sonnet"`` / ``"haiku"``, 200k). The subagent loads the mika
+# project/base context (CLAUDE.md + skills + tool schemas + system prompt),
+# which ALREADY exceeds 200k, so the dispatch fails ``Prompt is too long``
+# REGARDLESS of the prompt body — a one-word probe fails too. The quality gate
+# (which must never be skipped) then falls back to an in-session pass: it
+# degrades SILENTLY (cpp#257, mika#2606).
+#
+# The minimal, samidarko-ratified harness guard: when an ``Agent``/``Task``
+# dispatch forces a model whose context window is STRICTLY SMALLER than the
+# session model's, REWRITE the dispatch to drop the override so it INHERITS the
+# session model — whose window is large enough to carry the base context, which
+# is what makes the >200k-base dispatch fit. We never upgrade, never rewrite a
+# same-or-larger request, and touch no other tool (Bash admission/lethality is
+# untouched). The ROOT fix lives in the CE plugin (a skill should not force a
+# small-window model for a context-inheriting dispatch) and is a separate,
+# out-of-scope cross-repo change; this guard is the harness-side backstop.
+#
+# NOTE: this guard only acts if the ``Agent`` dispatch routes through
+# ``can_use_tool`` (cf. docs/solutions/tooling-decisions/
+# harness-runtime-tools-bypass-can-use-tool.md — some harness primitives do
+# not). The cpp#257 probe observed the ``Agent`` call in the permission stream,
+# so it does.
+
+# Tool names the SDK uses for subagent dispatch. ``Agent`` is the current name
+# (observed in the cpp#257 transcripts); ``Task`` is the legacy alias, kept for
+# compat across SDK minors.
+_SUBAGENT_DISPATCH_TOOLS: frozenset[str] = frozenset({"Agent", "Task"})
+
+# Context-window sizes (tokens) inferred from a model id or short alias.
+#
+# The classification is a RELATIVE ordering for the guard's "is the forced model
+# a strictly-smaller-context model than the session's" question — not a precise
+# token count. Three tiers:
+#
+# * ``[1m]`` beta suffix → 1M window on ANY base model (the Claude Code / pilot
+#   explicit 1M-context opt-in, e.g. ``claude-opus-5[1m]``, ``sonnet[1m]``).
+#   Checked first so the suffix wins regardless of base family.
+# * ``opus`` (with OR without ``[1m]``) → the large-context tier. Opus is the
+#   pilot's designated large-context session model (its native window is 1M —
+#   see docs/solutions), and a plain ``claude-opus-5`` session dispatching a
+#   forced ``sonnet``/``haiku`` is EXACTLY the cpp#257 failure shape. cpp#257
+#   gate note: classifying plain ``claude-opus-5`` at the small 200k tier made a
+#   ``sonnet`` override look "not smaller" and suppressed the rewrite — so opus
+#   is the large tier whether or not the ``[1m]`` suffix is present.
+# * ``sonnet`` / ``haiku`` WITHOUT the ``[1m]`` opt-in → the 200k small tier
+#   (the harness default context window without the beta; the forced
+#   ``model: "sonnet"`` of the cpp#257 report runs here and fails "Prompt is too
+#   long" on a >200k base context).
+_MODEL_WINDOW_1M: int = 1_000_000
+_MODEL_WINDOW_DEFAULT: int = 200_000
+
+
+def _model_context_window(model: str | None) -> int | None:
+    """Best-effort context-window (tokens) for a model id or alias.
+
+    Returns ``None`` when the model is unknown/unparseable — the caller then
+    falls back to the known-small heuristic rather than guessing a size.
+    """
+    if not isinstance(model, str):
+        return None
+    m = model.strip().lower()
+    if not m:
+        return None
+    if "[1m]" in m:
+        return _MODEL_WINDOW_1M
+    # opus is the large-context session tier with OR without the [1m] suffix
+    # (cpp#257 gate secondary note): a plain ``claude-opus-5`` session must not
+    # be misclassified so low that a forced ``sonnet`` looks "not smaller".
+    if "opus" in m:
+        return _MODEL_WINDOW_1M
+    if "sonnet" in m or "haiku" in m:
+        return _MODEL_WINDOW_DEFAULT
+    return None
+
+
+def _maybe_inherit_session_model(
+    tool_input: dict[str, Any],
+    config: PilotConfig | None,
+) -> dict[str, Any] | None:
+    """cpp#257: rewrite a subagent dispatch to inherit the session model when it
+    forces a model whose context window is strictly smaller than the session's.
+
+    Returns a NEW ``tool_input`` dict with the ``model`` override removed when a
+    rewrite is warranted; returns ``None`` (leave the dispatch untouched) when:
+
+    - there is no ``model`` override (the dispatch already inherits);
+    - the requested model can't be classified (never guess);
+    - the requested window is the same or larger than the session's;
+    - the request is not the known-small failure class AND the session model is
+      unknown.
+
+    Fail-safe: when the session model can't be determined, a KNOWN small-window
+    override (sonnet / haiku / opus-without-[1m], 200k) is still dropped — the
+    pilot's default session model is the large-window one, and a forced small
+    window is exactly the cpp#257 failure class.
+    """
+    requested = tool_input.get("model")
+    if not isinstance(requested, str) or not requested.strip():
+        return None  # no override → already inherits the session model
+
+    requested_window = _model_context_window(requested)
+    if requested_window is None:
+        return None  # can't classify the request → never touch
+
+    session_model = config.model if config is not None else None
+    session_window = _model_context_window(session_model)
+
+    if session_window is not None:
+        # Both known: only rewrite a STRICTLY smaller-window override.
+        if requested_window >= session_window:
+            return None
+    else:
+        # Session unknown → fail-safe: only drop a KNOWN small-window override.
+        if requested_window > _MODEL_WINDOW_DEFAULT:
+            return None
+
+    rewritten = dict(tool_input)
+    rewritten.pop("model", None)
+    return rewritten
+
+
+# ── cpp#257 (gate rework): the REACHED placement — a PreToolUse hook ──────────
+#
+# The first cut of cpp#257 wired the model-inherit rewrite into the
+# ``can_use_tool`` handler (below). The MPC gate measured that placement INERT:
+# across four deployed pilots, 26 ``Agent`` dispatches all RAN but NONE reached
+# ``can_use_tool`` (``[tool:request]`` logged Bash/Edit/Write, zero Agent) —
+# subagent dispatch is authorized UPSTREAM of the permission callback (the SDK's
+# allowed-tools list / settings), so a guard on ``can_use_tool`` never sees it.
+# Same class as cpp#256's cargo commands. See
+# docs/solutions/tooling-decisions/harness-runtime-tools-bypass-can-use-tool.md.
+#
+# The SDK path that an ``Agent``/``Task`` dispatch DOES traverse is the
+# ``PreToolUse`` hook: the CLI fires it for every tool call regardless of the
+# permission decision, and a hook returning ``updatedInput`` rewrites the
+# forwarded tool input. Crucially this hook returns NO ``permissionDecision`` —
+# it is independent of admission, so it changes the dispatch's INPUT (drop the
+# ``model`` override) without ever changing whether the dispatch is allowed. The
+# admission axis (tier1 / policy / egress / lethality) is untouched.
+#
+# This is the live mechanism; the ``can_use_tool`` branch below is kept only as
+# a harmless backstop for any (future) SDK/config where an ``Agent`` dispatch
+# WOULD route through the permission callback — it is admission-neutral there too
+# (it only ever drops a strictly-smaller ``model`` override and Allows), and it
+# no-ops after this hook has already dropped the override.
+
+
+def create_subagent_model_inherit_hook(
+    *,
+    config: PilotConfig | None,
+    task_id: str | None = None,
+) -> HookCallback:
+    """cpp#257: build the ``PreToolUse`` hook that rewrites an ``Agent``/``Task``
+    dispatch to inherit the session model when it forces a strictly-smaller-window
+    model.
+
+    Returned callable matches the SDK ``HookCallback`` signature
+    ``(input, tool_use_id, context) -> HookJSONOutput``. On a warranted rewrite
+    it returns a ``PreToolUse`` hook output carrying ``updatedInput`` (the
+    dispatch with its ``model`` override dropped) and emits a ``review_degraded``
+    audit marker; otherwise it returns ``{}`` (no change). It NEVER returns a
+    ``permissionDecision`` — the rewrite is independent of the permission
+    decision, so admission is unchanged (MPC gate requirement 1).
+    """
+
+    async def hook(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> HookJSONOutput:
+        # The hook matcher ("Agent|Task") already scopes this, but re-check the
+        # tool name defensively — a shape change must degrade to "no rewrite"
+        # rather than touch a tool it should not. ``input_data`` is a PreToolUse
+        # payload; read it as a plain mapping (guarded) to stay robust to SDK
+        # shape drift.
+        payload: dict[str, Any] = dict(input_data) if isinstance(input_data, dict) else {}
+        tool_name = payload.get("tool_name")
+        if tool_name not in _SUBAGENT_DISPATCH_TOOLS:
+            return {}
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return {}
+
+        rewritten = _maybe_inherit_session_model(tool_input, config)
+        if rewritten is None:
+            return {}
+
+        audit.emit(
+            "review_degraded",
+            {
+                "reason": "agent_dispatch_model_inherit",
+                "placement": "pre_tool_use_hook",
+                "tool_name": tool_name,
+                "requested_model": tool_input.get("model"),
+                "session_model": config.model if config is not None else None,
+                "task_id": task_id,
+            },
+        )
+        log_tool(str(tool_name), _summarize_input(str(tool_name), rewritten), "AUTO")
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": rewritten,
+            }
+        }
+
+    return hook
 
 
 def create_permission_handler(
