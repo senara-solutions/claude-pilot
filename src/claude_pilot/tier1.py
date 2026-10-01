@@ -940,10 +940,408 @@ _TRANSITIVE_SCRATCH_MAX_DEPTH = 8
 # mika#1960 death. This anchored form, applied per `_split_compound_command`
 # segment, counts only real assignment-prefix words. No lookbehind is needed
 # (position 0 of a segment is already a command-start).
-_LEADING_ASSIGNMENT_RE = re.compile(
-    r'(?P<var>[A-Za-z_][A-Za-z0-9_]*)='
-    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s;|&()<>]*))'
+#
+# cpp#268/#266 gate (hole: only a BARE `NAME=` was recognized as a
+# reassignment, so `X=$(mktemp -d); export X=/etc; rm -rf "$X"` wrongly stayed
+# survivable). `_LEADING_ASSIGN_OP_RE` below folds BOTH the `=` and the append
+# `+=` operators into one command-start matcher, and the `$(mktemp …)` /
+# `` `mktemp …` `` value is kept WHOLE in its own `mk` branch so the cpp#268
+# path can tell a scratch establisher from a non-scratch reassignment in the
+# same pass — every other value falls to the ordinary dq/sq/bare branches (so a
+# reassignment OUT of scratch is still seen, byte-identically to the old
+# `_LEADING_ASSIGNMENT_RE` for the cpp#266 path). Linear, no nested quantifier
+# (cpp#250 — no ReDoS).
+_LEADING_ASSIGN_OP_RE = re.compile(
+    r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)(?P<op>\+?=)"
+    r"(?:(?P<mk>\$\(\s*mktemp\b[^)]*\)|`\s*mktemp\b[^`]*`)"
+    r"""|"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s;|&()<>]*))"""
 )
+# An optional declaration-keyword PREFIX at command start — `export`,
+# `readonly`, `local`, `declare`, `typeset` — each with optional short flags
+# (`-x`, `-gx`) or `--`. cpp#268/#266: the value after `NAME=` is then parsed by
+# `_LEADING_ASSIGN_OP_RE` exactly like a bare assignment, so `export
+# X=$(mktemp -d)` stays a scratch establisher while `export X=/etc` /
+# `declare SCRATCH_ROOT=/etc` are seen as reassignments OUT of scratch
+# (LAST-WINS) — not blanket-terminalized on the keyword.
+_DECL_KEYWORD_PREFIX_RE = re.compile(
+    r"(?:export|readonly|local|declare|typeset)\b(?:\s+(?:--|-[A-Za-z]+))*\s+"
+)
+# cpp#268/#266 re-gate (MPC, head `f44b43d` KO): the reassignment guard is now
+# INVERTED to fail-closed. Enumerating write FORMS was whack-a-mole — it always
+# missed the next one (`{ B=…; }` brace group, `IFS= read B` prefix-assignment-
+# before-read, `let B=…`, `((B=…))`, default-ASSIGN `: ${B:=…}`, dynamic
+# `declare "$NAME=…"`). The rule now: between a var's LAST scratch-ESTABLISHING
+# assignment (the positive `$(mktemp -d)` / scratch-root source — still a
+# positive recognition) and the sink, the name may appear ONLY AS A READ — a
+# bare parameter expansion `$B` / `${B}` / `"$B"` / `"${B}"` using a
+# NON-assigning operator (`:-` `:+` `:?` `-` `+` `?` `#` `##` `%` `%%` `/` `^`
+# `,` `:off:len` or a plain `${B}`). ANY OTHER occurrence of the name — an
+# assignment in any form (`B=`, keyword `export/declare/… B=`, append `B+=`), a
+# default-ASSIGN `${B:=…}`/`${B=…}`, `read`/`IFS= read`/`mapfile`/`readarray`/
+# `getopts B`, `let B=…`/`((B=…))`/`$((B=…))`, `printf -v B`, `unset B`,
+# `for B in …`, a brace-group assignment `{ B=…; }`, `eval`, a dynamic
+# `"$NAME=…"` indirection, or the name used as a command-position token — makes
+# the sink TERMINAL (fail-closed). A subshell `( … )` assignment does NOT
+# propagate to the current shell, so it is skipped (not a write). Reads-only,
+# everything else terminal. Linear, no nested quantifier (cpp#250 — no ReDoS).
+_DECL_KEYWORDS = frozenset({"export", "readonly", "local", "declare", "typeset"})
+_INVERT_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _last_establishing_assignment(
+    command: str, var: str
+) -> tuple[int, int, str, str] | None:
+    """The LAST command-START assignment ``var=<value>`` bash performs in the
+    CURRENT shell, as ``(segment_index, end_offset_within_segment, kind, value)``
+    — else ``None``. This is the POSITIVE source recognition (MPC keeps it); the
+    inverted reads-only rule is applied AFTER it by ``_live_scratch_source``.
+
+    Only a plain ``=`` assignment establishes (an append ``+=`` does not — it
+    modifies, and so is caught as a non-read occurrence by the scan below). The
+    assignment may be bare or declaration-keyword-prefixed (``export``/
+    ``readonly``/``local``/``declare``/``typeset`` [-flags]); ``kind`` is
+    ``"mktemp"`` for a ``$(mktemp …)`` / `` `mktemp …` `` value (kept whole,
+    cpp#201/#268) and ``"value"`` otherwise (the raw value, for the cpp#265/#266
+    transitive scratch-root check). LAST-WINS across ``_split_compound_command``
+    segments; a subshell ``(…)`` segment does NOT propagate and never
+    establishes; a ``VAR=…`` token inside a quoted argument (``echo "X=$B"``) is
+    not a command-start assignment (cpp#265). Linear (cpp#250 — no ReDoS).
+    """
+    result: tuple[int, int, str, str] | None = None
+    for idx, seg in enumerate(_split_compound_command(command)):
+        rest = seg.lstrip()
+        base = len(seg) - len(rest)
+        # A subshell assignment does not reach the current shell → never a source.
+        if rest.startswith("("):
+            continue
+        # A brace group DOES run in the current shell; step over the `{`.
+        if rest.startswith("{"):
+            inner = rest[1:].lstrip()
+            base += len(rest) - len(inner)
+            rest = inner
+        # Optional declaration-keyword prefix (export/readonly/local/declare/
+        # typeset [-flags]); its `NAME=value` parses exactly like a bare one.
+        km = _DECL_KEYWORD_PREFIX_RE.match(rest)
+        if km is not None:
+            base += km.end()
+            rest = rest[km.end() :]
+        # The command-start assignment-prefix word run (`A=1 B=2 cmd`).
+        while True:
+            am = _LEADING_ASSIGN_OP_RE.match(rest)
+            if am is None:
+                break
+            if am.group("var") == var and am.group("op") == "=":
+                if am.group("mk") is not None:
+                    result = (idx, base + am.end(), "mktemp", am.group("mk"))
+                elif am.group("dq") is not None:
+                    result = (idx, base + am.end(), "value", am.group("dq"))
+                elif am.group("sq") is not None:
+                    result = (idx, base + am.end(), "value", am.group("sq"))
+                else:
+                    result = (idx, base + am.end(), "value", am.group("bare"))
+            base += am.end()
+            rest = rest[am.end() :]
+            # More leading assignment prefixes only if the next char is
+            # whitespace; anything else ends the prefix run.
+            if rest[:1].isspace():
+                stripped = rest.lstrip()
+                base += len(rest) - len(stripped)
+                rest = stripped
+                continue
+            break
+    return result
+
+
+def _invert_skip_paren(text: str, i: int) -> int:
+    """Index just past the ``)`` that closes the ``(`` at ``text[i]`` (quote-aware;
+    an unterminated group runs to the end). Used to skip a non-propagating
+    subshell and to bound an arithmetic ``((…))`` span."""
+    n = len(text)
+    depth = 0
+    j = i
+    in_single = False
+    in_double = False
+    while j < n:
+        c = text[j]
+        if in_single:
+            if c == "'":
+                in_single = False
+            j += 1
+            continue
+        if in_double:
+            if c == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if c == '"':
+                in_double = False
+            j += 1
+            continue
+        if c == "'":
+            in_single = True
+        elif c == '"':
+            in_double = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _invert_brace_end(text: str, i: int) -> int:
+    """Index just past the ``}`` that closes the ``{`` at ``text[i]`` (depth-counted)."""
+    n = len(text)
+    depth = 0
+    j = i
+    while j < n:
+        c = text[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _invert_arith_mentions_var(text: str, var: str) -> bool:
+    """Whether identifier ``var`` appears (as a read OR a write) anywhere in an
+    arithmetic span ``text`` — arithmetic assigns/reads in the current shell, so
+    ANY mention fails CLOSED (``let``/``((…))``/``$((…))``)."""
+    return (
+        re.search(r"(?<![A-Za-z0-9_])" + re.escape(var) + r"(?![A-Za-z0-9_])", text)
+        is not None
+    )
+
+
+def _invert_brace_nonread(text: str, i: int, var: str) -> tuple[int, bool]:
+    """Classify the ``${…}`` expansion opening at ``text[i]`` (``$`` then ``{``).
+
+    Returns ``(end_index, is_nonread_of_var)``. It is a non-read of ``var`` ONLY
+    when the expansion names ``var`` AND applies a default-ASSIGN operator
+    (``${B:=…}`` / ``${B=…}``). Every other operator (``:-`` `:+` `:?` `-` `+`
+    `?` `#` `##` `%` `%%` `/` `^` `,` `:off:len`, a bare ``${B}``, the length
+    ``${#B}``, the indirect ``${!B}``) is a READ; an expansion of any OTHER var
+    is a read with respect to ``var``."""
+    end = _invert_brace_end(text, i + 1)
+    n = len(text)
+    j = i + 2
+    while j < n and text[j] in "!#":  # length / indirect prefix
+        j += 1
+    m = _INVERT_IDENT_RE.match(text, j)
+    if m is None or m.group(0) != var:
+        return end, False
+    k = m.end()
+    if k < n:
+        c = text[k]
+        if c == "=":
+            return end, True
+        if c == ":" and k + 1 < n and text[k + 1] == "=":
+            return end, True
+    return end, False
+
+
+def _var_has_nonread_occurrence(text: str, var: str) -> bool:
+    """Whether ``text`` contains any occurrence of ``var`` that is NOT a read-only
+    parameter expansion — the inverted cpp#268/#266 rule (see the block comment
+    above ``_DECL_KEYWORDS``). ``text`` is one command region AFTER the
+    establishing assignment; a ``True`` here fails the var closed → terminal.
+
+    A read is ``$B`` / ``${B}`` (incl. non-assigning ``${B…}`` operators), in or
+    out of double quotes. Everything else is a non-read: an assignment ``B=`` /
+    ``B+=`` / keyword ``export B=`` / default-ASSIGN ``${B:=…}``, ``read``/
+    ``for``/``unset``/``getopts``/``mapfile`` naming ``var``, ``printf -v B``,
+    arithmetic ``((B…))``/``$((B…))``/``let B…``, a dynamic ``"$NAME=…"``
+    indirection (any expansion immediately followed by ``=``), ``eval``, or the
+    bare name as a command/argument token. A subshell ``(…)`` is skipped (no
+    propagation). A bare name that is an ARGUMENT of a declaration keyword with
+    NO ``=`` (``export -n B``, ``readonly B``) is an attribute change, not a
+    value write, and stays a read.
+
+    A bare identifier is classified ONLY at a TOKEN boundary (``token_start``):
+    the name has to be the identifier itself, not a letter glued inside a larger
+    word — so the ``C`` in a flag ``-C`` or an option ``--Charlie``, the value of
+    ``NAME=C``, or a path component is NOT an occurrence of ``$C`` (a real
+    reference always carries a ``$``). Linear scan (cpp#250 — no ReDoS)."""
+    n = len(text)
+    i = 0
+    in_single = False
+    in_double = False
+    cmd_head: str | None = None
+    at_cmd_start = True
+    token_start = True
+
+    def _consume_dollar(i: int) -> tuple[int, bool]:
+        if text[i + 1 : i + 3] == "((":  # arithmetic $((…)) — any mention terminal
+            end = _invert_skip_paren(text, i + 1)
+            return end, _invert_arith_mentions_var(text[i:end], var)
+        if text[i + 1 : i + 2] == "(":  # command substitution — opaque subshell
+            return _invert_skip_paren(text, i + 1), False
+        if text[i + 1 : i + 2] == "{":
+            end, nonread = _invert_brace_nonread(text, i, var)
+            if nonread:
+                return end, True
+            if end < n and text[end] == "=" and text[end : end + 2] != "==":
+                return end, True  # dynamic `${NAME}=…` assignment LHS
+            return end, False
+        m = _INVERT_IDENT_RE.match(text, i + 1)
+        end = m.end() if m is not None else min(i + 2, n)
+        if end < n and text[end] == "=" and text[end : end + 2] != "==":
+            return end, True  # dynamic `$NAME=…` assignment LHS (indirection)
+        return end, False
+
+    while i < n:
+        c = text[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if c == '"':
+                in_double = False
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == "$":
+                ni, nonread = _consume_dollar(i)
+                if nonread:
+                    return True
+                i = ni
+                continue
+            i += 1
+            continue
+        if c.isspace():
+            token_start = True
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+            token_start = False
+            i += 1
+            continue
+        if c == '"':
+            in_double = True
+            token_start = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            token_start = False
+            i += 2
+            continue
+        if c == "`":  # backtick command substitution — opaque
+            j = text.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            token_start = False
+            continue
+        if c == "." and at_cmd_start and (i + 1 >= n or text[i + 1] in " \t"):
+            # the `.` (dot) builtin sources a script into the CURRENT shell, which
+            # can reassign the var opaquely — same as `source`/`eval`, fail closed.
+            # `./script` (dot glued to `/`) is an exec in a child, not a source.
+            return True
+        if c == "$":
+            ni, nonread = _consume_dollar(i)
+            if nonread:
+                return True
+            i = ni
+            token_start = False
+            continue
+        if c == "(" and text[i + 1 : i + 2] == "(":  # arithmetic ((…))
+            end = _invert_skip_paren(text, i)
+            if _invert_arith_mentions_var(text[i:end], var):
+                return True
+            i = end
+            token_start = True
+            at_cmd_start = True
+            continue
+        if c == "(":  # subshell — assignment inside does not propagate
+            i = _invert_skip_paren(text, i)
+            token_start = True
+            at_cmd_start = True
+            continue
+        if c in "{}":  # brace-group boundary resets to command start
+            token_start = True
+            at_cmd_start = True
+            i += 1
+            continue
+        if c.isalpha() or c == "_":
+            m = _INVERT_IDENT_RE.match(text, i)
+            if m is None:  # unreachable (c is an identifier start) — mypy narrowing
+                token_start = False
+                i += 1
+                continue
+            word = m.group(0)
+            j = m.end()
+            is_assign = text[j : j + 1] == "=" or text[j : j + 2] == "+="
+            if not token_start:  # a letter glued inside a larger word (flag -C,
+                i = j  # value of NAME=…, path segment) — not a `$`-backed ref
+                continue
+            if word == var and is_assign:
+                return True  # `B=` / `B+=` write
+            if is_assign:  # prefix/other assignment: its value is non-token-start
+                i = j + (2 if text[j : j + 2] == "+=" else 1)
+                token_start = False
+                continue
+            if at_cmd_start:
+                cmd_head = word
+                at_cmd_start = False
+                if word in ("eval", "source"):  # indirection / sourced script
+                    return True  # reassigns the current shell opaquely — fail closed
+            if word == var:
+                if cmd_head in _DECL_KEYWORDS and word != cmd_head:
+                    pass  # `export -n B` / `readonly B` — attribute, value kept
+                else:
+                    return True  # `read B` / `for B` / bare command-position token
+            i = j
+            token_start = False
+            continue
+        token_start = False
+        i += 1
+    return False
+
+
+def _var_reassigned_nonread_after(
+    command: str, var: str, est_seg: int, est_end: int
+) -> bool:
+    """Whether ``var`` has any non-read occurrence between its establishing
+    assignment (segment ``est_seg``, ending at offset ``est_end`` within it) and
+    the end of ``command`` — the inverted reads-only scan over every segment at
+    or after the source."""
+    for idx, seg in enumerate(_split_compound_command(command)):
+        if idx < est_seg:
+            continue
+        region = seg[est_end:] if idx == est_seg else seg
+        if _var_has_nonread_occurrence(region, var):
+            return True
+    return False
+
+
+def _live_scratch_source(command: str, var: str) -> tuple[str, str | None] | None:
+    """The scratch source establishing ``var``, as ``(kind, value)``, when ``var``
+    is LIVE scratch at the sink; else ``None``. SHARED by both lethality carves —
+    the cpp#268 mktemp-rm path (``_var_is_live_mktemp_scratch``) and the
+    cpp#265/#266 transitive-scratch mkdir/chmod path
+    (``_last_real_assignment_value``).
+
+    INVERTED rule (MPC re-gate of head `f44b43d`): (1) find ``var``'s LAST
+    scratch-ESTABLISHING command-start assignment; (2) require EVERY occurrence of
+    the name between it and the sink to be a read-only parameter expansion. If any
+    occurrence is a write/modify in ANY form — enumerated or not — the var fails
+    CLOSED → ``None`` (not scratch → terminal). This replaces the former
+    enumerate-write-forms scanner, which always missed the next form (brace
+    group, prefix-assign-before-``read``, ``let``, default-ASSIGN, …)."""
+    est = _last_establishing_assignment(command, var)
+    if est is None:
+        return None
+    seg_idx, end_offset, kind, value = est
+    if _var_reassigned_nonread_after(command, var, seg_idx, end_offset):
+        return None
+    return (kind, value)
 # A bare `$VAR`/`${VAR}` reference appearing inside a suffix path component. A
 # `$(…)` command-substitution never matches (the `(` is not a name char), so it
 # is treated as a benign component (cpp#265), not a variable requiring an
@@ -986,29 +1384,21 @@ def _last_real_assignment_value(command: str, var: str) -> str | None:
     both reached only on the ``for_lethality`` path. The admission axis
     (``_ce_scratch_variable_names``) keeps the flat ``_last_assignment_value``,
     so admission is byte-identical to HEAD.
+
+    cpp#268/#266 re-gate (MPC, head `f44b43d` KO): resolution delegates to the
+    SHARED ``_live_scratch_source``, which applies the INVERTED reads-only rule —
+    it finds ``var``'s LAST scratch-establishing command-start assignment and then
+    FAIL-CLOSES (returns ``None`` → non-scratch → terminal) if the name appears in
+    ANY non-read form between source and sink (a brace-group assignment
+    ``{ SR=/etc; }``, a default-ASSIGN ``: ${SR:=/etc}``, ``let``/``IFS= read``,
+    an append ``SR+=…``, a keyword ``export SR=/etc``, …). Only a value-bearing
+    establishing assignment whose name is read-only thereafter returns its value
+    for the scratch-root check (LAST-WINS). The admission axis
+    (``_ce_scratch_variable_names``) keeps the flat ``_last_assignment_value``, so
+    admission is byte-identical to HEAD.
     """
-    found: str | None = None
-    for seg in _split_compound_command(command):
-        rest = seg.lstrip()
-        while True:
-            m = _LEADING_ASSIGNMENT_RE.match(rest)
-            if m is None:
-                break
-            if m.group("var") == var:
-                if m.group("dq") is not None:
-                    found = m.group("dq")
-                elif m.group("sq") is not None:
-                    found = m.group("sq")
-                else:
-                    found = m.group("bare")
-            rest = rest[m.end() :]
-            # More leading assignment prefixes (`A=1 B=2 cmd`) only if the next
-            # char is whitespace; anything else ends the prefix run.
-            if rest[:1].isspace():
-                rest = rest.lstrip()
-                continue
-            break
-    return found
+    w = _live_scratch_source(command, var)
+    return None if w is None else w[1]
 
 
 def _suffix_is_contained(value: str, command: str, depth: int = 0) -> bool:
@@ -3576,6 +3966,119 @@ def rm_confined_to_pilot_scratch(command: str, cwd: str) -> bool:
     for seg in _split_compound_command(command):
         operands = _rm_segment_operands(seg)
         if operands and all(is_within_pilot_scratch(op, cwd) for op in operands):
+            carved = True
+            continue
+        survivors.append(seg)
+    if not carved:
+        return False
+    return not is_tier3_dangerous_for_lethality("\n".join(survivors))
+
+
+# ── cpp#268: `rm -rf "$VAR"` where VAR is a live `$(mktemp -d)` is not lethal ──
+#
+# groom 93bac846 (mika#2626) died TERMINAL at turn 12 reproducing a git defect in
+# a throwaway repo. The command's LAST line is the killer:
+#
+#   cd /tmp 2>/dev/null; B=$(mktemp -d); C=$(mktemp -d); git -C "$B" init … ;
+#   … ; rm -rf "$B" "$C"
+#
+# The refusal itself is LEGITIMATE (`;`-chain, multi-line, `cd` out of worktree)
+# and STAYS — only the LETHALITY is wrong. `B`/`C` are assigned, in the SAME
+# command, from `$(mktemp -d)`: a fresh directory under `$TMPDIR`/`/tmp` by
+# construction, exactly the cpp#201 mktemp idiom the redirect carve already
+# trusts (`_is_mktemp_scratch_redirect_target`). This is the `rm`/`rmdir` SINK
+# sibling of that SOURCE carve, and the exact structural twin of the cpp#213
+# `.pilot-scratch` rm carve above — same segment-drop-then-recheck mechanism.
+#
+# Resolution is the SHARED `_live_scratch_source` (cpp#265/#266 discipline): it
+# finds the LAST command-START mktemp assignment of the var (a `VAR=…` token
+# INSIDE a quoted argument like `echo "B=$B"` is NOT one), then applies the
+# INVERTED reads-only rule (MPC re-gate of head `f44b43d`) — the name may appear
+# ONLY as a read between source and sink; ANY other occurrence in ANY form,
+# enumerated or not — `B=/` (bare), `export B=/etc` (keyword), `{ B=/etc; }`
+# (brace group), `: ${B:=/etc}` (default-ASSIGN), `B+=…`, `let B=…`/`((B=…))`,
+# `read B`/`IFS= read B`, `for B in …`, `printf -v B`, a dynamic `"$NAME=…"`
+# indirection, `eval` — fails CLOSED and keeps the command TERMINAL. A subshell
+# `(B=/etc)` does not propagate (skipped). Linear, no nested quantifier (cpp#250 —
+# no ReDoS).
+#
+# LETHALITY-ONLY: consulted solely from `permissions._denial_is_terminal`. The
+# command stays REFUSED either way — `is_tier3_dangerous` / `is_tier1_auto_
+# approve` / every YAML rule never call this; only `_denial_is_terminal` flips
+# True→False, and only when the carve's remainder is itself non-dangerous.
+
+def _var_is_live_mktemp_scratch(command: str, var: str) -> bool:
+    """Whether ``var``'s LAST command-START assignment in ``command`` is a
+    ``$(mktemp …)`` / `` `mktemp …` `` substitution — a fresh ``/tmp`` scratch
+    dir by construction (cpp#201/#268) — i.e. assigned from mktemp and NOT
+    reassigned to a non-scratch value before the sink (LAST-WINS, cpp#265/#266).
+
+    Delegates to the SHARED ``_live_scratch_source``, which keeps the mktemp
+    substitution value whole (its own ``mk`` branch) so the final value's
+    mktemp-ness is decidable, and counts ONLY a command-START establishing
+    assignment — so a ``VAR=…`` inside a quoted argument (``echo "B=$B"``) is
+    never a reassignment (cpp#265). cpp#268/#266 re-gate (MPC, head `f44b43d`
+    KO): the INVERTED reads-only rule fails CLOSED on ANY non-read occurrence of
+    the name between the mktemp source and the sink — an assignment in any form
+    (``export B=/etc``, ``{ B=/etc; }``, ``B+=…``), a default-ASSIGN
+    ``: ${B:=/etc}``, ``let``/``((B=…))``, ``read``/``IFS= read``/``for``/
+    ``unset``/``getopts``, ``printf -v B``, a dynamic ``"$NAME=…"`` indirection,
+    ``eval`` — so the var is live ONLY when its last establishing assignment is a
+    mktemp substitution AND the name is read-only thereafter. A subshell
+    ``(B=/etc)`` does not propagate (skipped), so the mktemp stays live.
+
+    No establishing assignment at all → ``False`` (an unset/ambient ``$VAR`` stays
+    terminal). LETHALITY-ONLY: reached only from the rm-lethality carve.
+    """
+    w = _live_scratch_source(command, var)
+    return w is not None and w[0] == "mktemp"
+
+
+def _rm_operand_is_mktemp_scratch(command: str, operand: str) -> bool:
+    """Whether a single (shlex-stripped) ``rm``/``rmdir`` *operand* is a bare
+    ``$VAR``/``${VAR}`` reference — optionally with a safe, ``..``-free relative
+    tail — rooted at a variable the SAME ``command`` keeps as a live
+    ``$(mktemp -d)`` scratch dir (cpp#268).
+
+    Reuses ``_MKTEMP_SCRATCH_TARGET_RE`` (the cpp#201 target-side shape: anchored
+    both ends, no ``..`` anywhere in the tail, so a traversal out of the mktemp
+    dir — ``"$X/../.."`` — never matches) and defers the source/last-wins
+    decision to ``_var_is_live_mktemp_scratch``. A command-substitution operand
+    (``$(curl …)``), an ambient var (``$HOME``), or a mixed literal (``/etc``)
+    is not a bare var reference and returns ``False`` (stays terminal)."""
+    m = _MKTEMP_SCRATCH_TARGET_RE.match(operand)
+    if m is None:
+        return False
+    if ".." in m.group("tail"):
+        return False
+    return _var_is_live_mktemp_scratch(command, m.group("var"))
+
+
+def rm_targets_mktemp_scratch(command: str) -> bool:
+    """Whether *command*'s tier3-for-lethality danger is due SOLELY to
+    ``rm``/``rmdir`` segments whose EVERY operand is a variable the SAME command
+    keeps as a live ``$(mktemp -d)`` scratch dir (cpp#268).
+
+    Consulted ONLY by ``permissions._denial_is_terminal`` — the LETHALITY
+    decision. Never touches admission (`is_tier3_dangerous`,
+    `is_tier1_auto_approve`, YAML rules); the command stays refused either way.
+
+    Mechanism is the exact twin of `rm_confined_to_pilot_scratch` (cpp#213):
+    each fully-mktemp-scratch ``rm``/``rmdir`` segment is removed and the
+    remainder is re-checked with the unchanged `is_tier3_dangerous_for_lethality`
+    — so a mixed operand list (`rm -rf "$X" /etc`), a chained destructive verb,
+    a second unconfined ``rm``, a ``..`` escape, or a reassigned-out variable all
+    leave a still-dangerous remainder (or are never carved) and stay TERMINAL.
+    Returns ``False`` when no segment was carved, or the remainder is still
+    proven-dangerous. Fail-closed throughout via `_rm_segment_operands` and
+    `_rm_operand_is_mktemp_scratch`."""
+    survivors: list[str] = []
+    carved = False
+    for seg in _split_compound_command(command):
+        operands = _rm_segment_operands(seg)
+        if operands and all(
+            _rm_operand_is_mktemp_scratch(command, op) for op in operands
+        ):
             carved = True
             continue
         survivors.append(seg)
