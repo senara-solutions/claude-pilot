@@ -4343,6 +4343,30 @@ def _sed_i_edit_and_backup_confined(target: str, suffix: str, cwd: str) -> bool:
     return True
 
 
+def _sed_i_suffix_is_benign_backup(suffix: str) -> bool:
+    """Whether a GNU ``-i<SUFFIX>`` backup suffix is a benign no-slash/no-``..``
+    suffix that cannot project the backup onto an attacker-chosen path (cpp#271).
+
+    GNU sed with a non-``*`` suffix writes the backup by APPENDING the suffix to
+    the edited filename, so a suffix carrying a path separator (`../../etc/x`,
+    `/tmp/x`) or a `..` component is a WRITE VECTOR and must disqualify the
+    ``/dev/null`` carve below (fail-closed). The ``*`` wildcard is already
+    excluded upstream by `_sed_inplace_suffix`. The empty suffix (bare ``-i``,
+    no backup) is benign.
+    """
+    return "/" not in suffix and ".." not in suffix
+
+
+# A shlex token that is actually a shell REDIRECT operator, not a sed file
+# operand — `2>/dev/null`, `>out`, `>/etc/x`, `1>>log`, `2>&1`. `shlex.split`
+# does not model redirects, so it mis-tokenizes these as positionals; the
+# cpp#271 sole-`/dev/null` check filters them out before counting real file
+# operands. Any genuine out-of-worktree redirect target is independently
+# re-armed by `_denial_is_terminal`'s redirect/destination veto, which runs on
+# the FULL command after this carve.
+_SED_REDIRECT_TOKEN_RE = re.compile(r"^\d*[<>]")
+
+
 def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     """Whether *command*'s tier3-for-lethality danger is due SOLELY to
     ``sed -i`` substitution segment(s) whose EVERY file target resolves
@@ -4360,6 +4384,27 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     (`sed -i '…' a.rs /etc/passwd`), or a second unconfined danger all leave a
     proven-danger remainder that still fires. Returns ``False`` (stays terminal)
     when no segment was confined or the remainder is still proven-dangerous.
+
+    cpp#271 — the cpp#203 x cpp#255 intersection. `/dev/null` is a kernel-owned
+    inert sink: `sed -i` on it writes nothing durable, the sanction cpp#203
+    (`_SED_I_DEVNULL_RE`) already grants the BARE `-i` form inside
+    `is_tier3_dangerous_for_lethality`. cpp#203 covered only bare `-i`; this
+    suffix parser (cpp#253/#255) covered the suffix forms only for WORKTREE
+    targets — so `sed -i.bak … /dev/null` (pilot 94770602, mika#2624) fell
+    between the two and stayed terminal. Here the cpp#255 suffix parser carries
+    the cpp#203 `/dev/null` axis: when a segment's SOLE file target is
+    `/dev/null`, it is inert regardless of the `-i` suffix form, PROVIDED the
+    suffix is a benign no-slash/no-`..` backup suffix (GNU would write the
+    backup as `/dev/null` + suffix, so a path-bearing suffix is a write vector
+    and stays terminal, fail-closed). SOLE-target mirrors cpp#203's own
+    constraint (`/dev/null` must be the only file operand), so a mixed list
+    (`sed -i … /dev/null real.rs`) is byte-identical to pre-cpp#271: `/dev/null`
+    is NOT treated inert there, so the per-target confinement below rejects it
+    (absolute) and the segment stays terminal. The long `--in-place` form is not
+    recognized by `_sed_inplace_suffix` and is not in `TIER3_PATTERNS`, so it is
+    governed entirely by the unchanged tier3 path, not by this carve. cpp#203
+    (bare `-i` /dev/null) and cpp#255 (suffix + worktree target) behaviour are
+    both unchanged — this only ADDS the sole-`/dev/null` x suffix intersection.
     """
     survivors: list[str] = []
     carved = False
@@ -4367,6 +4412,20 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
         result = _sed_i_target_operands(seg)
         if result is not None:
             targets, suffix = result
+            # cpp#271: a segment whose SOLE sed-i target is the inert /dev/null
+            # sink is survivable for any benign backup suffix — the cpp#203 axis
+            # carried across the suffix forms. No cwd resolution: /dev/null is a
+            # kernel device, never resolved on disk. shlex mis-tokenizes a shell
+            # redirect (`2>/dev/null`, `>out`) as a positional, so those tokens
+            # are filtered before the sole-target test; a real out-of-worktree
+            # redirect target is re-armed by `_denial_is_terminal`'s redirect
+            # veto on the FULL command after this carve (fail-safe).
+            real_targets = [t for t in targets if not _SED_REDIRECT_TOKEN_RE.match(t)]
+            if real_targets == ["/dev/null"] and _sed_i_suffix_is_benign_backup(
+                suffix
+            ):
+                carved = True
+                continue
             if all(
                 _sed_i_edit_and_backup_confined(t, suffix, cwd) for t in targets
             ):

@@ -960,6 +960,122 @@ def test_cpp253_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+def test_cpp271_sed_suffix_devnull_is_survivable_but_still_refused(
+    tmp_path: Path,
+) -> None:
+    """cpp#271 (pilot 94770602, mika#2624): the cpp#203 x cpp#255 intersection.
+    A `sed -i<SUFFIX>` (`-i.bak`, `-i~`, …) whose ONLY file target is the inert
+    `/dev/null` sink is a SURVIVABLE deny (`_denial_is_terminal` ``False``), just
+    like cpp#203's bare-`-i` /dev/null carve — regardless of the `-i` suffix
+    form. The SUFFIX must NOT be a write vector: a `/`- or `..`-bearing suffix
+    stays TERMINAL. Admission is byte-identical (see
+    ``test_cpp271_admission_is_byte_identical_only_lethality_flips``).
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "src").mkdir()
+    wt = str(worktree)
+
+    # Positive — SUFFIX form x inert /dev/null target is survivable.
+    for cmd in (
+        "sed -i.bak 's|a|XX|' /dev/null",  # the isolated intersection factor
+        "sed -i~ 's|a|XX|' /dev/null",  # `~` backup suffix
+        "sed -i.orig 's/a/b/' /dev/null",  # another dotted suffix
+        "sed -ibak 's|a|XX|' /dev/null",  # GNU: no dot required
+        "sed -ni.bak 's|a|XX|' /dev/null",  # clustered `-n` + suffix
+        "sed -i 's|a|XX|' /dev/null",  # cpp#203 bare-`-i` regression guard
+        "sed --in-place=.bak 's|a|XX|' /dev/null",  # long form: already survivable
+        "echo hi && sed -i.bak 's|a|XX|' /dev/null",  # harmless prefix + carve
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+    # Negative — a SUFFIX carrying a path is a write vector and stays TERMINAL,
+    # as does any mixed-with-escape / chained-danger shape.
+    for cmd in (
+        "sed -i../../etc/x 's|a|XX|' /dev/null",  # suffix carries `/` and `..`
+        "sed -i/tmp/x 's|a|XX|' /dev/null",  # suffix carries `/`
+        "sed -i.. 's|a|XX|' /dev/null",  # suffix is `..` (no slash) → still rejected
+        "sed -i.bak 's/a/b/' /etc/passwd",  # real out-of-worktree target
+        "sed -i.bak 's/a/b/' ../../x",  # `..` traversal target
+        "sed -i.bak 's/a/b/' /dev/null /etc/passwd",  # 2nd target out of worktree
+        # cpp#203 sole-operand constraint kept: /dev/null + a 2nd target (even an
+        # in-worktree one) is NOT the sole-/dev/null shape, so /dev/null is not
+        # treated inert and the segment stays terminal (byte-identical to HEAD).
+        "sed -i.bak 's/a/b/' /dev/null src/x.rs",
+        "sed -i.bak 'y/a/b/' /dev/null",  # non-substitution script → fail closed
+        "sed -i.bak 's/a/b/w /etc/x' /dev/null",  # `w` write flag → fail closed
+        "sed -i.bak 's|a|XX|' /dev/null && rm -rf /etc",  # chained destructive verb
+        # A REAL out-of-worktree redirect alongside the sole /dev/null target is
+        # re-armed by the full-command redirect veto (fail-safe): the sole-target
+        # carve ignores the redirect token, but the redirect itself stays fatal.
+        "sed -i.bak 's/a/b/' /dev/null >/etc/passwd",
+        "sed -i.bak 's/a/b/' /dev/null > ../../x",
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+    # A benign stderr-silencing redirect to /dev/null stays survivable (the
+    # verbatim's `2>/dev/null` shape), the sole real target still being /dev/null.
+    assert (
+        f("Bash", {"command": "sed -i.bak 's/a/b/' /dev/null 2>/dev/null"}, wt)
+        is False
+    )
+
+
+def test_cpp271_verbatim_94770602_is_survivable(tmp_path: Path) -> None:
+    """cpp#271 AC2: the verbatim 3-line script that killed pilot 94770602
+    (mika#2624) — a `cd`, a `sed -i.bak … /dev/null` probing a multi-line regex,
+    and a `grep` — becomes survivable. The refusal is legitimate (the script is
+    still DENIED); it must no longer end the session.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "crates" / "mika-agent" / "src").mkdir(parents=True)
+    verbatim = (
+        "cd /data/workspace/mika-platform/.claude/worktrees/"
+        "fix-2624-loop-substrate-mika-dev-sort-du/mika\n"
+        "sed -i.bak 's|^        for (rel, content) in production_sources() {\\n"
+        "            if HOLD_CLASSIFICATION|XX|' /dev/null 2>/dev/null; true\n"
+        'grep -n "for (rel, content) in production_sources()" '
+        "crates/mika-agent/src/canonical_tokens.rs"
+    )
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": verbatim}, str(worktree)
+        )
+        is False
+    )
+
+
+def test_cpp271_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """cpp#271 sovereign boundary: admission for `sed -i.bak … /dev/null` is
+    byte-identical to HEAD — the command is STILL denied. `sed -i.bak` is still
+    tier3-dangerous (the REFUSAL classifier), never tier1-auto-approved, and the
+    policy still default-denies it. Only `_denial_is_terminal` flips
+    terminal→survivable; end-to-end the handler returns a non-terminal
+    ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    cmd = "sed -i.bak 's|a|XX|' /dev/null"
+
+    assert is_tier3_dangerous(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    result = asyncio.run(
+        _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     tmp_path: Path,
 ) -> None:

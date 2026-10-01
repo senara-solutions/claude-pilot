@@ -41,6 +41,7 @@ from claude_pilot.tier1 import (
     _quote_spans,
     _redirect_targets,
     _rm_segment_operands,
+    _sed_i_suffix_is_benign_backup,
     _sed_i_target_operands,
     _sed_inplace_suffix,
     _split_compound_command,
@@ -4322,6 +4323,64 @@ class TestCpp253SedInplaceSuffix:
         assert elapsed < _REDOS_BUDGET_S, (
             f"_sed_i_target_operands: {elapsed * 1000:.1f} ms"
         )
+
+
+class TestCpp271SedSuffixDevnullIntersection:
+    """cpp#271 (pilot 94770602, mika#2624): the cpp#203 x cpp#255 intersection.
+    `/dev/null` is an inert sed-i target regardless of the `-i` suffix form, so
+    `sed -i.bak … /dev/null` is carved by `sed_i_confined_to_worktree` (consulted
+    only by `_denial_is_terminal`). The SUFFIX must not be a write vector: a `/`-
+    or `..`-bearing suffix stays terminal. `is_tier3_dangerous_for_lethality` and
+    the cpp#203/#255 behaviours are unchanged — this only ADDS the intersection.
+    """
+
+    def test_benign_backup_suffix_predicate(self) -> None:
+        # The benign-suffix gate: a no-slash/no-`..` suffix (incl. empty) is a
+        # benign backup; a `/`- or `..`-bearing suffix is a write vector.
+        for suffix in ("", ".bak", ".orig", "~", "bak", ".bak-2"):
+            assert _sed_i_suffix_is_benign_backup(suffix), suffix
+        for suffix in ("../../etc/x", "/tmp/x", "..", ".bak/../x", "/"):
+            assert not _sed_i_suffix_is_benign_backup(suffix), suffix
+
+    def test_confined_carve_covers_suffix_forms_on_sole_devnull(self) -> None:
+        # The full lexical carve: SUFFIX x SOLE /dev/null is survivable (no cwd
+        # needed for /dev/null — it never resolves on disk). The bare `-i` form
+        # stays survivable too (cpp#203 behaviour unchanged, now also this route).
+        for cmd in (
+            "sed -i.bak 's|a|XX|' /dev/null",
+            "sed -i~ 's|a|XX|' /dev/null",
+            "sed -i.orig 's/a/b/' /dev/null",
+            "sed -ibak 's|a|XX|' /dev/null",
+            "sed -ni.bak 's|a|XX|' /dev/null",
+            "sed -i 's|a|XX|' /dev/null",
+        ):
+            assert sed_i_confined_to_worktree(cmd, "/nonexistent") is True, cmd
+
+    def test_path_bearing_suffix_and_mixed_targets_stay_terminal(self) -> None:
+        # Negatives that do NOT depend on a resolvable cwd: a path-bearing suffix,
+        # a non-substitution script, a `w` write flag, a chained danger, and — the
+        # cpp#203-unchanged invariant — a MIXED target list where /dev/null is NOT
+        # the sole operand (so /dev/null is not treated inert and the absolute
+        # path fails confinement) all keep the command terminal.
+        for cmd in (
+            "sed -i../../etc/x 's|a|XX|' /dev/null",  # suffix carries `/`+`..`
+            "sed -i/tmp/x 's|a|XX|' /dev/null",  # suffix carries `/`
+            "sed -i.. 's|a|XX|' /dev/null",  # suffix is `..`
+            "sed -i.bak 'y/a/b/' /dev/null",  # non-substitution script
+            "sed -i.bak 's/a/b/w /etc/x' /dev/null",  # `w` write flag
+            "sed -i.bak 's|a|XX|' /dev/null && rm -rf /etc",  # chained danger
+            "sed -i.bak 's/a/b/' /dev/null src/x.rs",  # mixed → /dev/null not sole
+            "sed -i 's/a/b/' /dev/null realfile.rs",  # cpp#203 mixed, unchanged
+        ):
+            assert sed_i_confined_to_worktree(cmd, "/nonexistent") is False, cmd
+
+    def test_lethality_classifier_itself_unchanged(self) -> None:
+        # cpp#271 does NOT touch `is_tier3_dangerous_for_lethality`: the suffix
+        # form stays flagged there (cpp#203's own invariant test still holds);
+        # survivability now comes from the `_denial_is_terminal` carve above it.
+        assert is_tier3_dangerous_for_lethality("sed -i.bak 's/a/b/' /dev/null") is True
+        # The bare-`-i` /dev/null carve inside the classifier is unchanged.
+        assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/null") is False
 
 
 # ── ce-* /tmp scratch: uid token + same-command var tracing (mika#2562) ────────
