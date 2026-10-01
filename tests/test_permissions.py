@@ -3863,3 +3863,342 @@ def test_cpp258_denial_is_terminal_bounded_time_on_2000_char_operand(
     start = time.perf_counter()
     permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
     assert (time.perf_counter() - start) * 1000 < 50.0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#257: Agent dispatch inherits the session model when the forced model's
+# context window is smaller.
+#
+# A pilot on `claude-opus-5[1m]` (1M window) dispatches a subagent that forces
+# `model: "sonnet"` (200k). The subagent loads the project base context, which
+# already exceeds 200k, so the dispatch fails `Prompt is too long` regardless of
+# the prompt body — and the never-skip quality gate degrades to a silent
+# in-session fallback. The guard rewrites the dispatch to DROP the override so it
+# inherits the (larger-window) session model, which is what makes the >200k-base
+# dispatch fit.
+#
+# NOTE (cpp#257 gate rework): `_maybe_inherit_session_model` IS the rewrite logic
+# shared by the live PreToolUse hook and the `can_use_tool` backstop; these unit
+# tests pin the window classification and the rewrite decision directly. The gate
+# KO established that the `can_use_tool` placement is INERT for Agent dispatch
+# (authorized upstream of the permission callback), so the REACHED placement is a
+# PreToolUse hook. The reachability-proof test
+# (`test_cpp257_pre_tool_use_hook_reached_via_sdk_control_request_...`) drives the
+# SDK's own hook-dispatch entrypoint (`Query._handle_control_request` with a
+# `hook_callback` control request) — NOT a direct call to the hook function — and
+# asserts the forwarded input has no `model` and the audit marker fired. The
+# `test_cpp257_handler_rewrites_...` test still exercises the `can_use_tool`
+# backstop function directly.
+# ────────────────────────────────────────────────────────────────────────────
+
+from claude_pilot.permissions import (  # noqa: E402
+    _maybe_inherit_session_model,
+    _model_context_window,
+    create_subagent_model_inherit_hook,
+)
+
+
+def _config_with_model(model: str | None):
+    # PilotConfig requires a non-empty `command`; only `model` is load-bearing
+    # for these tests.
+    return PilotConfig(command="claude", model=model)
+
+
+def test_cpp257_model_window_classification() -> None:
+    # The [1m] beta suffix means a 1M window on any base model.
+    assert _model_context_window("claude-opus-5[1m]") == 1_000_000
+    assert _model_context_window("sonnet[1m]") == 1_000_000
+    # opus is the large-context session tier WITH OR WITHOUT the [1m] suffix
+    # (cpp#257 gate secondary note): a plain `claude-opus-5` session must not be
+    # misclassified at the small tier, or a forced `sonnet` would look "not
+    # smaller" and the rewrite would never fire.
+    assert _model_context_window("claude-opus-5") == 1_000_000
+    assert _model_context_window("claude-opus-4-8") == 1_000_000
+    # sonnet / haiku WITHOUT the [1m] opt-in are the 200k small tier (the harness
+    # default window — the cpp#257 forced `model: "sonnet"` runs here).
+    assert _model_context_window("sonnet") == 200_000
+    assert _model_context_window("haiku") == 200_000
+    # Unknown / unparseable → None (never guessed).
+    assert _model_context_window("some-unknown-model") is None
+    assert _model_context_window("") is None
+    assert _model_context_window(None) is None
+
+
+def test_cpp257_sonnet_override_is_rewritten_to_inherit() -> None:
+    """sonnet (200k) < session opus-5[1m] (1M) → drop the override so the
+    dispatch inherits the 1M session model."""
+    config = _config_with_model("claude-opus-5[1m]")
+    tool_input = {
+        "description": "Code reuse review",
+        "subagent_type": "general-purpose",
+        "model": "sonnet",
+        "run_in_background": True,
+    }
+    rewritten = _maybe_inherit_session_model(tool_input, config)
+    assert rewritten is not None, "a strictly-smaller forced model must be rewritten"
+    assert "model" not in rewritten, "the model override must be dropped (inherit)"
+    # Every other field is preserved; the original dict is not mutated.
+    assert rewritten["description"] == "Code reuse review"
+    assert rewritten["subagent_type"] == "general-purpose"
+    assert rewritten["run_in_background"] is True
+    assert tool_input["model"] == "sonnet"
+
+
+def test_cpp257_haiku_override_is_rewritten_to_inherit() -> None:
+    config = _config_with_model("claude-opus-5[1m]")
+    rewritten = _maybe_inherit_session_model({"model": "haiku"}, config)
+    assert rewritten is not None
+    assert "model" not in rewritten
+
+
+def test_cpp257_no_model_override_passes_through_unchanged() -> None:
+    """No `model` key → the dispatch already inherits the session model; the
+    guard must not touch it."""
+    config = _config_with_model("claude-opus-5[1m]")
+    assert _maybe_inherit_session_model({"description": "x"}, config) is None
+    assert _maybe_inherit_session_model({"model": ""}, config) is None
+    assert _maybe_inherit_session_model({"model": "   "}, config) is None
+
+
+def test_cpp257_session_model_override_passes_through_unchanged() -> None:
+    """A dispatch that forces the SAME model as the session (same window) is not
+    strictly smaller → unchanged."""
+    config = _config_with_model("claude-opus-5[1m]")
+    assert _maybe_inherit_session_model({"model": "claude-opus-5[1m]"}, config) is None
+
+
+def test_cpp257_larger_or_equal_window_override_passes_through_unchanged() -> None:
+    """A forced model whose window is >= the session's is never rewritten (we
+    never upgrade/downgrade a same-or-larger request)."""
+    # Session is sonnet (200k); a forced opus-5[1m] (1M) is larger → untouched.
+    config = _config_with_model("sonnet")
+    assert _maybe_inherit_session_model({"model": "claude-opus-5[1m]"}, config) is None
+    # Session is sonnet (200k); a forced haiku (200k) is equal → untouched.
+    assert _maybe_inherit_session_model({"model": "haiku"}, config) is None
+
+
+def test_cpp257_fail_safe_drops_known_small_override_when_session_unknown() -> None:
+    """When the session model can't be determined (config None, or model None /
+    unknown), a KNOWN small-window override (sonnet/haiku) is still dropped — the
+    pilot's default session model is the large-window one, and a forced small
+    window is exactly the cpp#257 failure class."""
+    for config in (None, _config_with_model(None), _config_with_model("mystery-model")):
+        rewritten = _maybe_inherit_session_model({"model": "sonnet"}, config)
+        assert rewritten is not None, f"fail-safe must drop a known-small override (config={config})"
+        assert "model" not in rewritten
+
+
+def test_cpp257_fail_safe_leaves_unknown_and_large_overrides_when_session_unknown() -> None:
+    """Fail-safe is tight: with the session unknown it ONLY drops a known-small
+    override, never a large-window one (opus-5[1m]) or an unclassifiable one."""
+    assert _maybe_inherit_session_model({"model": "claude-opus-5[1m]"}, None) is None
+    assert _maybe_inherit_session_model({"model": "mystery-model"}, None) is None
+
+
+def test_cpp257_over_200k_base_fits_after_rewrite_to_inherit() -> None:
+    """The probe's finding, asserted as the rewrite behavior: a dispatch that
+    WOULD carry a >200k base context fails on a forced `sonnet` (200k window),
+    but once the override is dropped it inherits `claude-opus-5[1m]` (1M window),
+    whose window exceeds the base — so the rewrite is what makes it fit.
+
+    A live 200k dispatch can't run here; this pins the window arithmetic and the
+    rewrite decision the fix relies on.
+    """
+    session_model = "claude-opus-5[1m]"
+    config = _config_with_model(session_model)
+    base_context_tokens = 430_000  # cpp#257: measured parent contexts were 430-490k
+
+    requested_window = _model_context_window("sonnet")
+    session_window = _model_context_window(session_model)
+    assert requested_window is not None and session_window is not None
+    # The forced small window cannot hold the base context → "Prompt is too long".
+    assert base_context_tokens > requested_window
+    # The rewrite drops the override so the dispatch inherits the 1M window, which
+    # DOES hold the base context.
+    rewritten = _maybe_inherit_session_model({"model": "sonnet"}, config)
+    assert rewritten is not None and "model" not in rewritten
+    assert base_context_tokens < session_window
+
+
+class _RecordingTransport:
+    """Minimal duck-typed SDK ``Transport``: captures the control responses the
+    ``Query`` writes back. Not an ABC subclass on purpose — ``Query.__init__``
+    only stores it and ``_handle_control_request`` only calls ``write``, so the
+    abstract-method contract is irrelevant to the path under test."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    async def write(self, data: str) -> None:
+        self.writes.append(data)
+
+
+def _build_pilot_pretooluse_hooks(config):
+    """The EXACT ``options.hooks`` the pilot registers (mirrors agent.py /
+    shell.py): a single PreToolUse matcher on ``Agent|Task`` bound to the
+    cpp#257 model-inherit hook."""
+    from claude_agent_sdk import HookMatcher
+
+    return {
+        "PreToolUse": [
+            HookMatcher(
+                matcher="Agent|Task",
+                hooks=[
+                    create_subagent_model_inherit_hook(config=config, task_id="t-cpp257")
+                ],
+            )
+        ]
+    }
+
+
+def test_cpp257_pre_tool_use_hook_reached_via_sdk_control_request_rewrites_sonnet(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """REACHABILITY PROOF (cpp#257 gate requirement 2).
+
+    Drives the SDK's OWN hook-dispatch entrypoint — ``Query._handle_control_request``
+    with a ``hook_callback`` ``SDKControlRequest`` — which is the exact method the
+    Claude Code CLI's control channel invokes when a ``PreToolUse`` hook fires on a
+    real ``Agent`` dispatch (`claude_agent_sdk/_internal/query.py`). This is NOT a
+    direct call to the hook function: the hook is registered through the SDK's own
+    ``_hooks_to_internal_format`` + the callback-id wiring ``Query.initialize()``
+    performs, then invoked by the SDK via ``self.hook_callbacks[callback_id](...)``.
+
+    Asserts: (a) the forwarded ``updatedInput`` has the ``model`` override dropped
+    (so the dispatch inherits the 1M session model and the >200k base context fits,
+    curing "Prompt is too long"), (b) NO ``permissionDecision`` is emitted (the
+    rewrite is admission-neutral), and (c) the ``review_degraded`` audit marker
+    fired on the hook path.
+    """
+    import json as _json
+
+    from claude_agent_sdk._internal.query import Query
+    from claude_agent_sdk.types import _hooks_to_internal_format
+
+    config = _config_with_model("claude-opus-5[1m]")
+
+    # Convert the pilot's real options.hooks via the SDK's own converter, exactly
+    # as ClaudeSDKClient does before handing them to Query.
+    internal_hooks = _hooks_to_internal_format(_build_pilot_pretooluse_hooks(config))
+
+    query = Query(
+        transport=_RecordingTransport(),
+        is_streaming_mode=True,
+        hooks=internal_hooks,
+    )
+    # Register the callback id(s) exactly as Query.initialize() does
+    # (query.py: `self.hook_callbacks[callback_id] = callback`). We mirror that
+    # loop rather than running the full initialize() handshake (which needs a
+    # live transport round-trip); the INVOCATION path under test is unchanged.
+    for _event, matchers in query.hooks.items():
+        for matcher in matchers:
+            for callback in matcher.get("hooks", []):
+                cb_id = f"hook_{query.next_callback_id}"
+                query.next_callback_id += 1
+                query.hook_callbacks[cb_id] = callback
+    assert query.hook_callbacks, "the pilot PreToolUse hook registered through the SDK"
+    callback_id = next(iter(query.hook_callbacks))
+
+    # The control request the CLI sends when the PreToolUse hook fires on a real
+    # Agent dispatch forcing model: sonnet.
+    control_request = {
+        "type": "control_request",
+        "request_id": "req-cpp257",
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": {
+                    "description": "Code reuse review",
+                    "subagent_type": "general-purpose",
+                    "model": "sonnet",
+                    "prompt": "review this diff",
+                },
+                "tool_use_id": "toolu_cpp257",
+                "session_id": "sess-cpp257",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp",
+            },
+            "tool_use_id": "toolu_cpp257",
+        },
+    }
+
+    asyncio.run(query._handle_control_request(control_request))
+
+    # The SDK wrote exactly one control_response carrying the hook output.
+    assert len(query.transport.writes) == 1
+    frame = _json.loads(query.transport.writes[0])
+    assert frame["type"] == "control_response"
+    assert frame["response"]["subtype"] == "success", frame
+    hook_specific = frame["response"]["response"]["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+
+    updated = hook_specific["updatedInput"]
+    assert "model" not in updated, "the forced small-window model override must be dropped"
+    # Every other dispatch field is preserved.
+    assert updated["subagent_type"] == "general-purpose"
+    assert updated["description"] == "Code reuse review"
+    assert updated["prompt"] == "review this diff"
+
+    # Admission is UNCHANGED: the hook carries no permission decision.
+    assert "permissionDecision" not in hook_specific
+    assert "decision" not in frame["response"]["response"]
+
+    # The audit marker fired on the hook path (cpp#257 observability).
+    stderr = capsys.readouterr().err
+    assert permissions_module.audit.AUDIT_TAG in stderr
+    assert "agent_dispatch_model_inherit" in stderr
+    assert "pre_tool_use_hook" in stderr
+
+
+def test_cpp257_pre_tool_use_hook_leaves_larger_or_equal_override_untouched(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reached hook does nothing (empty output, no admission touch, no audit)
+    for a same-or-larger override — proving it is not a blanket Agent rewriter."""
+    import json as _json
+
+    from claude_agent_sdk._internal.query import Query
+    from claude_agent_sdk.types import _hooks_to_internal_format
+
+    config = _config_with_model("claude-opus-5[1m]")
+    internal_hooks = _hooks_to_internal_format(_build_pilot_pretooluse_hooks(config))
+    query = Query(
+        transport=_RecordingTransport(), is_streaming_mode=True, hooks=internal_hooks
+    )
+    for _event, matchers in query.hooks.items():
+        for matcher in matchers:
+            for callback in matcher.get("hooks", []):
+                cb_id = f"hook_{query.next_callback_id}"
+                query.next_callback_id += 1
+                query.hook_callbacks[cb_id] = callback
+    callback_id = next(iter(query.hook_callbacks))
+
+    control_request = {
+        "type": "control_request",
+        "request_id": "req-cpp257b",
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                # Same window as the session → not strictly smaller → untouched.
+                "tool_input": {"subagent_type": "general-purpose", "model": "claude-opus-5[1m]"},
+                "tool_use_id": "toolu_cpp257b",
+                "session_id": "s",
+                "transcript_path": "/tmp/t.jsonl",
+                "cwd": "/tmp",
+            },
+            "tool_use_id": "toolu_cpp257b",
+        },
+    }
+    asyncio.run(query._handle_control_request(control_request))
+
+    frame = _json.loads(query.transport.writes[0])
+    assert frame["response"]["subtype"] == "success"
+    # Empty hook output → no updatedInput, no permission decision.
+    assert frame["response"]["response"] == {}
+    assert "agent_dispatch_model_inherit" not in capsys.readouterr().err

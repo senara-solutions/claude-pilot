@@ -16,7 +16,12 @@ import sys
 import time
 from typing import Any, Literal
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, CLIJSONDecodeError
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    CLIJSONDecodeError,
+    HookMatcher,
+)
 from claude_agent_sdk.types import (
     AssistantMessage,
     RateLimitEvent,
@@ -30,10 +35,10 @@ from claude_agent_sdk.types import (
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
 from .heartbeat import emit_heartbeat, emit_heartbeat_throttled
 from .inbox_writer import post_handoff
-from .permissions import CanUseTool
+from .permissions import CanUseTool, create_subagent_model_inherit_hook
 from .tier1 import DENIED_BASH_PATTERNS_HINT
 from .transcript_writer import record_sdk_message
-from .types import ResultJson
+from .types import PilotConfig, ResultJson
 from .ui import (
     log_cache_usage,
     log_deny_resume,
@@ -366,6 +371,7 @@ async def run_agent(
     task_id: str | None,
     permission_handler: CanUseTool,
     guardrails: SessionGuardrails,
+    pilot_config: PilotConfig | None = None,
 ) -> int:
     """Run the agent session. Returns the intended process exit code.
 
@@ -389,6 +395,7 @@ async def run_agent(
             task_id=task_id,
             permission_handler=permission_handler,
             guardrails=guardrails,
+            pilot_config=pilot_config,
         )
         return exit_code
     finally:
@@ -406,6 +413,7 @@ async def _run_agent_inner(
     task_id: str | None,
     permission_handler: CanUseTool,
     guardrails: SessionGuardrails,
+    pilot_config: PilotConfig | None = None,
 ) -> int:
     """Actual agent session body. Extracted so :func:`run_agent` can wrap it
     with lifecycle heartbeats without reindenting the whole implementation."""
@@ -436,6 +444,32 @@ async def _run_agent_inner(
         # best-effort. The LOAD-BEARING guard is the system-prompt hint above;
         # this is harmless if it no-ops and structural if the runtime honors it.
         disallowed_tools=["ScheduleWakeup"],
+        # cpp#257: the REACHED placement of the Agent-dispatch model-inherit
+        # guard. A subagent dispatch (Agent/Task) is authorized UPSTREAM of
+        # ``can_use_tool`` (the SDK allowed-tools list / settings), so the
+        # permission-callback guard the first cut used never fired in production
+        # (MPC gate measurement: 0/26 Agent dispatches reached the callback). The
+        # PreToolUse hook DOES fire for every tool call: it rewrites the dispatch
+        # to drop a strictly-smaller ``model`` override so it inherits the larger-
+        # window session model — returning ``updatedInput`` WITHOUT a
+        # ``permissionDecision``, so admission is unchanged. See
+        # ``permissions.create_subagent_model_inherit_hook``.
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Agent|Task",
+                    hooks=[
+                        create_subagent_model_inherit_hook(
+                            # NB: the session model lives on the PilotConfig, NOT
+                            # on ``guardrails.config`` (a ResolvedGuardrailConfig
+                            # of timings). cpp#257: threaded in from cli.py.
+                            config=pilot_config,
+                            task_id=task_id,
+                        )
+                    ],
+                )
+            ]
+        },
         # cpp#187: raise the SDK reader's per-message buffer guard from its
         # 1MB default to a named ceiling. The guard (subprocess_cli.py
         # `guard()`) bounds a SINGLE incoming NDJSON line — one SDK message —
