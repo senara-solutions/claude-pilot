@@ -932,6 +932,40 @@ _TRANSITIVE_VAR_PREFIX_RE = re.compile(
 )
 _TRANSITIVE_SCRATCH_MAX_DEPTH = 8
 
+# cpp#272: the repo-PRESCRIBED disposable-scratch root — `.pilot-scratch/` in the
+# pilot's worktree (the SAME root cpp#213/#38's `rm` sink already confines to,
+# `rm_confined_to_pilot_scratch`). It joins the derived-scratch resolver alongside
+# the `/tmp` roots (cpp#266) and `$(mktemp -d)` (cpp#270) in TWO spellings:
+#
+#   * WORKTREE-RELATIVE `.pilot-scratch/<path>` — no leading `/`, no `..` anywhere.
+#   * `$PWD/.pilot-scratch/<path>` / `${PWD}/.pilot-scratch/<path>` — rooted at the
+#     pilot's cwd (`$PWD`, a fixed shell-set root) then `.pilot-scratch`. `$PWD`
+#     needs no same-command assignment (unlike an ordinary prefix var), but the
+#     TAIL after it must ITSELF root at `.pilot-scratch` — so `$PWD/foo` (not under
+#     `.pilot-scratch`) and `$PWD/../x` (`..` tail) are NOT scratch.
+#
+# LEXICAL only (cpp#143: never resolve to GRANT — this recognizes a fixed textual
+# root, like the `/tmp`/mktemp recognizers). A literal `..` is rejected at every
+# level; a `$`-bearing component is not a literal `.pilot-scratch` root and falls
+# through to the transitive var resolution. Consulted ONLY on the `for_lethality`
+# path (same as the whole transitive resolver) — admission is byte-identical.
+_PILOT_SCRATCH_REL_RE = re.compile(r"^\.pilot-scratch(?:/[\w./-]*)?$")
+_PWD_PREFIX_RE = re.compile(r"^\$(?:\{PWD\}|PWD)/(?P<tail>.+)$")
+
+
+def _is_pilot_scratch_rel(value: str) -> bool:
+    """Whether ``value`` is a worktree-relative ``.pilot-scratch`` scratch root
+    (``.pilot-scratch`` or ``.pilot-scratch/<path>``) carrying no ``..`` — the
+    repo-prescribed disposable-scratch root (cpp#272, twin of cpp#213's `rm`
+    sink). LEXICAL; a ``$``-bearing path is not a literal root and returns
+    ``False`` (it stays for the transitive var resolution in
+    ``_value_roots_at_scratch``)."""
+    if not isinstance(value, str) or not value:
+        return False
+    if ".." in value:
+        return False
+    return _PILOT_SCRATCH_REL_RE.match(value) is not None
+
 # cpp#265: a `VAR=value` assignment anchored at the START of a (lstripped)
 # segment — the only position where bash actually performs an assignment. The
 # flat `_ANY_ASSIGNMENT_RE` above also matches `VAR=…` text that merely appears
@@ -1435,7 +1469,9 @@ def _is_tmpdir_default_scratch(value: str) -> bool:
     return _is_uid_tolerant_tmp_scratch("/tmp" + m.group("rest"))
 
 
-def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
+def _value_roots_at_scratch(
+    value: str, command: str, depth: int = 0, cwd: str | None = None
+) -> bool:
     """Whether ``value`` roots (transitively, via same-command LAST-WINS
     assignments) at a recognized scratch. LEXICAL, bounded depth.
 
@@ -1443,11 +1479,33 @@ def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
     command-start-aware, so a ``VAR=…`` token inside a quoted ``echo`` argument
     no longer poisons the LAST-WINS resolution). The SUFFIX is held contained by
     ``_suffix_is_contained`` — no literal ``..`` and no assigned var carrying one
-    — while an unassigned suffix var stays safe (mika#2562)."""
+    — while an unassigned suffix var stays safe (mika#2562).
+
+    cpp#272: the worktree ``.pilot-scratch/`` root joins ``/tmp`` (cpp#266) and
+    ``$(mktemp -d)`` (cpp#270). Unlike those SYSTEM roots (lexical by cpp#143
+    doctrine), ``.pilot-scratch`` is WORKTREE-RELATIVE, so — when a ``cwd`` is
+    supplied (the ``for_lethality`` sink path) — its recognition is additionally
+    held to fs-aware containment via ``is_within_pilot_scratch``, the SAME
+    symlink-aware, fail-closed ``<cwd>/.pilot-scratch`` notion cpp#213/#38's `rm`
+    sink uses: an outbound-symlink ``.pilot-scratch`` or an unresolvable cwd keeps
+    it terminal. With ``cwd=None`` (direct unit calls) it stays purely lexical.
+    """
     if depth > _TRANSITIVE_SCRATCH_MAX_DEPTH or not value:
         return False
     if _is_uid_tolerant_tmp_scratch(value) or _is_tmpdir_default_scratch(value):
         return True
+    if _is_pilot_scratch_rel(value):  # cpp#272: worktree `.pilot-scratch/<path>`
+        return cwd is None or is_within_pilot_scratch(value, cwd)
+    # cpp#272: `$PWD/<tail>` / `${PWD}/<tail>` — `$PWD` is the pilot's worktree
+    # cwd, a fixed root bash always sets, so (UNLESS the command reassigns PWD —
+    # then it is resolved as an ordinary var below, fail-closed) it needs no
+    # same-command assignment. The TAIL after it must ITSELF root at
+    # `.pilot-scratch`, so `$PWD/.pilot-scratch/x` and `$PWD/$D/x` (D rooting at
+    # `.pilot-scratch`) are recognized while `$PWD/../x` (`..` tail) and
+    # `$PWD/foo` (not under `.pilot-scratch`) are not.
+    pm = _PWD_PREFIX_RE.match(value)
+    if pm is not None and _last_establishing_assignment(command, "PWD") is None:
+        return _value_roots_at_scratch(pm.group("tail"), command, depth + 1, cwd)
     m = _TRANSITIVE_VAR_PREFIX_RE.match(value)
     if m is None:
         return False
@@ -1458,13 +1516,19 @@ def _value_roots_at_scratch(value: str, command: str, depth: int = 0) -> bool:
     nxt = _last_real_assignment_value(command, inner)
     if nxt is None:
         return False
-    return _value_roots_at_scratch(nxt, command, depth + 1)
+    return _value_roots_at_scratch(nxt, command, depth + 1, cwd)
 
 
-def _is_transitive_ce_scratch_mkdir_target(command: str, dest: str) -> bool:
+def _is_transitive_ce_scratch_mkdir_target(
+    command: str, dest: str, cwd: str | None = None
+) -> bool:
     """LETHALITY-ONLY: whether the (shlex-stripped) ``dest`` is a bare ``$VAR``
     whose LAST same-command assignment roots (transitively) at a recognized
     scratch. Consulted only from the ``for_lethality`` veto path; the deny stays.
+
+    ``cwd`` (cpp#272) is threaded to ``_value_roots_at_scratch`` so a
+    ``.pilot-scratch`` root is held to fs-aware containment; ``None`` keeps the
+    recognition lexical (direct unit calls), unchanged for `/tmp`/mktemp roots.
     """
     m = _CE_SCRATCH_VARREF_RE.match(dest)
     if m is None:
@@ -1472,7 +1536,36 @@ def _is_transitive_ce_scratch_mkdir_target(command: str, dest: str) -> bool:
     value = _last_real_assignment_value(command, m.group("var"))
     if value is None:
         return False
-    return _value_roots_at_scratch(value, command, 0)
+    return _value_roots_at_scratch(value, command, 0, cwd)
+
+
+def _is_transitive_ce_scratch_redirect_target(
+    command: str, dest: str, cwd: str | None = None
+) -> bool:
+    """LETHALITY-ONLY: whether the (already-disqualified) redirect target ``dest``
+    is rooted at a variable whose LAST same-command assignment roots (transitively)
+    at a recognized scratch — a `/tmp` root (cpp#266), ``$(mktemp -d)`` (cpp#270),
+    or the worktree ``.pilot-scratch/`` / ``$PWD/.pilot-scratch/`` root (cpp#272) —
+    followed by a safe, ``..``-free relative tail.
+
+    The redirect twin of ``_is_transitive_ce_scratch_mkdir_target``: it reuses the
+    SAME derived-scratch resolver (``_value_roots_at_scratch``) and the SAME
+    inverted reads-only reassignment rule (``_last_real_assignment_value`` →
+    ``_live_scratch_source``), so a var reassigned OUT of scratch stays terminal.
+    It uses ``_MKTEMP_SCRATCH_TARGET_RE`` (``$VAR``/``${VAR}`` + optional tail,
+    optional surrounding quote) so a redirect carrying a suffix
+    (``> "$D/a.txt"``) is handled, where the bare-``$VAR``-only mkdir predicate is
+    not. Consulted ONLY from the ``for_lethality`` veto path; the deny stays.
+    """
+    m = _MKTEMP_SCRATCH_TARGET_RE.match(dest)
+    if m is None:
+        return False
+    if ".." in m.group("tail"):
+        return False
+    value = _last_real_assignment_value(command, m.group("var"))
+    if value is None:
+        return False
+    return _value_roots_at_scratch(value, command, 0, cwd)
 
 
 def _is_contained_redirect_target(dest: str) -> bool:

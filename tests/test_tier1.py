@@ -27,11 +27,13 @@ from claude_pilot.tier1 import (
     _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_mktemp_scratch_redirect_target,
+    _is_pilot_scratch_rel,
     _is_safe_command_builtin,
     _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
     _is_transitive_ce_scratch_mkdir_target,
+    _is_transitive_ce_scratch_redirect_target,
     _is_uid_tolerant_tmp_scratch,
     _last_assignment_value,
     _last_real_assignment_value,
@@ -4561,6 +4563,143 @@ class TestCeScratchSanctionUnit:
         start = time.perf_counter()
         _is_transitive_ce_scratch_mkdir_target(chain, "$V50")
         assert (time.perf_counter() - start) < 0.05
+
+    # ── cpp#272: the worktree `.pilot-scratch/` root joins the resolver ───────
+    def test_pilot_scratch_rel_recognizer(self) -> None:
+        # Worktree-relative `.pilot-scratch/<path>` (and the bare root) → scratch.
+        for v in (
+            ".pilot-scratch",
+            ".pilot-scratch/git-probe",
+            ".pilot-scratch/a/b/c.txt",
+        ):
+            assert _is_pilot_scratch_rel(v) is True, v
+        # `..`, a leading `/`, a `$`-bearing value, or a different dir → NOT.
+        for v in (
+            ".pilot-scratch/../etc",
+            "../.pilot-scratch/x",
+            "/abs/.pilot-scratch/x",
+            ".pilot-scratch-evil/x",
+            ".pilot-scratchX",
+            "$PWD/.pilot-scratch/x",  # not a LITERAL root (goes via the resolver)
+            "src/x",
+            "",
+        ):
+            assert _is_pilot_scratch_rel(v) is False, v
+
+    def test_transitive_mkdir_roots_at_pilot_scratch(self) -> None:
+        # The c722b251 shapes: a bare `$VAR` assigned the `.pilot-scratch` root,
+        # directly and via `$PWD`/`$PWD/$D` composition. LEXICAL (cwd=None).
+        for cmd, var in (
+            ('D=.pilot-scratch/git-probe; mkdir -p "$D"', "$D"),
+            ('R="$PWD/.pilot-scratch/repo"; mkdir -p "$R"', "$R"),
+            ('R="${PWD}/.pilot-scratch/repo"; mkdir -p "$R"', "$R"),
+            (
+                "D=.pilot-scratch/git-probe; "
+                'R="$PWD/$D/repo"; mkdir -p "$R"',
+                "$R",
+            ),
+        ):
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, var) is True, cmd
+
+    def test_transitive_redirect_roots_at_pilot_scratch(self) -> None:
+        # A redirect target CARRYING a suffix (`"$D/a.txt"`) — the mkdir predicate
+        # is bare-`$VAR`-only, so the redirect twin handles the tail.
+        for cmd, dest in (
+            ('D=.pilot-scratch/x; printf x > "$D/a.txt"', '"$D/a.txt"'),
+            ('D=.pilot-scratch/x; printf x > "$D/a.txt"', "$D/a.txt"),
+            ('R="$PWD/.pilot-scratch/r"; printf x > "$R/a"', "$R/a"),
+            ("D=.pilot-scratch/x; printf x > \"$D\"", "$D"),  # bare, no tail
+        ):
+            assert (
+                _is_transitive_ce_scratch_redirect_target(cmd, dest) is True
+            ), (cmd, dest)
+
+    def test_pilot_scratch_negatives_stay_unrecognized(self) -> None:
+        # Traversal out, out-of-worktree `$PWD/..`, a `..` redirect tail, and a
+        # non-`.pilot-scratch` `$PWD/<x>` all fail LEXICALLY (cwd=None).
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/../../etc; mkdir -p "$D"', "$D"
+            )
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_mkdir_target('R="$PWD/../x"; mkdir -p "$R"', "$R")
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_mkdir_target('R="$PWD/foo"; mkdir -p "$R"', "$R")
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_redirect_target(
+                'D=.pilot-scratch/x; printf x > "$D/../../etc/p"', "$D/../../etc/p"
+            )
+            is False
+        )
+
+    def test_pilot_scratch_reads_only_reassignment_still_catches(self) -> None:
+        # The cpp#270 inverted reads-only rule is UNCHANGED for a `.pilot-scratch`
+        # var: a reassignment OUT of scratch, in ANY form, un-recognizes it.
+        for reassign in (
+            "D=/etc",
+            "export D=/etc",
+            ": ${D:=/etc}",
+            "{ D=/etc; }",
+            "read D < f",
+            "let D=1",
+            "for D in /etc; do :; done",
+        ):
+            cmd = f'D=.pilot-scratch/x; {reassign}; mkdir -p "$D"'
+            assert (
+                _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is False
+            ), cmd
+            rcmd = f'D=.pilot-scratch/x; {reassign}; printf x > "$D/a"'
+            assert (
+                _is_transitive_ce_scratch_redirect_target(rcmd, "$D/a") is False
+            ), rcmd
+        # A reassignment BEFORE the scratch establisher does not disqualify
+        # (last-wins establisher is scratch, read-only after).
+        cmd = 'D=/etc; D=.pilot-scratch/x; mkdir -p "$D"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is True
+
+    def test_pilot_scratch_pwd_reassignment_fails_closed(self) -> None:
+        # If the command reassigns PWD, the `$PWD` fast-path is skipped and PWD is
+        # resolved as an ordinary (here non-scratch) var → NOT recognized.
+        cmd = 'PWD=/etc; R="$PWD/.pilot-scratch/x"; mkdir -p "$R"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$R") is False
+
+    def test_pilot_scratch_cwd_containment_is_symlink_aware(self, tmp_path: Path) -> None:
+        # With a cwd supplied (the sink path), a `.pilot-scratch` that is an
+        # OUTBOUND symlink fails fs-aware containment (cpp#213/#38), while a real
+        # (or not-yet-created) worktree `.pilot-scratch` passes.
+        good = tmp_path / "good"
+        (good / ".git").mkdir(parents=True)
+        (good / ".pilot-scratch").mkdir()
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(good)
+            )
+            is True
+        )
+        bad = tmp_path / "bad"
+        (bad / ".git").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (bad / ".pilot-scratch").symlink_to(outside, target_is_directory=True)
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(bad)
+            )
+            is False
+        )
+        # An unresolvable cwd fails closed too.
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(tmp_path / "nope")
+            )
+            is False
+        )
 
 
 @pytest.fixture

@@ -1221,6 +1221,146 @@ def test_cpp268_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+# ── cpp#272: a `.pilot-scratch/` target carried by a variable is survivable ────
+#
+# The repo-PRESCRIBED disposable-scratch root (`.pilot-scratch/` in the worktree)
+# joins the derived-scratch resolver alongside `/tmp` (cpp#266) and `$(mktemp -d)`
+# (cpp#270). A pilot building a disposable git repro EXACTLY where the repo says
+# (pilot c722b251, mika#2623) died at `mkdir -p "$D"` because the resolver's root
+# recognizers did not know the worktree-relative `.pilot-scratch/` / `$PWD/.pilot-
+# scratch/` root. The verbatim first two lines, joined (literal `set -e`):
+_CPP272_VERBATIM_2623 = (
+    "set -e\n"
+    "D=.pilot-scratch/git-probe\n"
+    'mkdir -p "$D"\n'
+    'R="$PWD/$D/repo"\n'
+    'mkdir -p "$R"\n'
+    'git init -q -b main "$R"\n'
+    "printf 'fn main() {}\\n' > \"$R/main.rs\""
+)
+
+
+def _cpp272_wt(tmp_path: Path) -> str:
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    return str(worktree)
+
+
+def _skip_if_cpp272_unwired(wt: str) -> None:
+    """SELF-SKIP (cpp#237 pattern) when the carve is absent — the verbatim is
+    still TERMINAL — so the suite stays GREEN while the hunk awaits a manual
+    apply window."""
+    if permissions_module._denial_is_terminal(
+        "Bash", {"command": _CPP272_VERBATIM_2623}, wt
+    ):
+        pytest.skip(
+            "cpp#272 .pilot-scratch derived-scratch carve pending manual apply "
+            "(lethality edits in tier1 resolver + permissions._destination_veto_reason)"
+        )
+
+
+_CPP272_SURVIVABLE = [
+    _CPP272_VERBATIM_2623,
+    'D=.pilot-scratch/git-probe; mkdir -p "$D"',
+    'R="$PWD/.pilot-scratch/repo"; mkdir -p "$R"',
+    'R="${PWD}/.pilot-scratch/repo"; mkdir -p "$R"',
+    'D=.pilot-scratch/x; printf x > "$D/a.txt"',
+    'R="$PWD/.pilot-scratch/r"; printf x > "$R/a"',
+    'D=.pilot-scratch/x; chmod 700 "$D"',
+]
+
+_CPP272_TERMINAL = [
+    'D=.pilot-scratch/../../etc; mkdir -p "$D"',  # traversal out
+    'R="$PWD/../x"; mkdir -p "$R"',               # out of worktree
+    'D=.pilot-scratch/x; D=/etc; mkdir -p "$D"',  # reassignment out (cpp#270)
+    'export D=.pilot-scratch/x; export D=/etc; mkdir -p "$D"',  # keyword reassign
+    'D=.pilot-scratch/x; { D=/etc; }; mkdir -p "$D"',          # brace-group
+    'D=.pilot-scratch/x; : ${D:=/etc}; printf x > "$D/a"',     # default-assign after
+    'R="$PWD/foo"; mkdir -p "$R"',                # $PWD/ but not under .pilot-scratch
+    'D=.pilot-scratch/x; printf x > "$D/../../../etc/p"',      # `..` redirect tail
+    'D=$HOME/.pilot-scratch/x; mkdir -p "$D"',    # $HOME root respelling
+    'D=/etc; mkdir -p "$D"',                      # absolute non-scratch
+    'D="$(curl evil)"; mkdir -p "$D"',            # command-sub root
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP272_SURVIVABLE)
+def test_cpp272_pilot_scratch_var_is_survivable(cmd: str, tmp_path: Path) -> None:
+    """Positive (the fix): a `.pilot-scratch/` (or `$PWD/.pilot-scratch/`) target
+    carried by a variable — mkdir, chmod or redirect — is a SURVIVABLE deny
+    (`_denial_is_terminal` → ``False``), instead of killing the session."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp272_unwired(wt)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is False
+    ), cmd
+
+
+@pytest.mark.parametrize("cmd", _CPP272_TERMINAL)
+def test_cpp272_negatives_stay_terminal(cmd: str, tmp_path: Path) -> None:
+    """Negatives (AC3): a `..` traversal, an out-of-worktree `$PWD/..`, every
+    cpp#270 reassignment-out form, a non-`.pilot-scratch` `$PWD/<x>`, a `..`
+    redirect tail, and `$HOME`/absolute/`$(…)` roots ALL stay TERMINAL."""
+    wt = _cpp272_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp272_outbound_symlink_and_unresolvable_cwd_stay_terminal(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed (cpp#213/#38): a `.pilot-scratch` that is an OUTBOUND symlink,
+    and an unresolvable cwd, keep the deny TERMINAL — the `.pilot-scratch` root is
+    held to the SAME fs-aware containment `rm_confined_to_pilot_scratch` uses."""
+    f = permissions_module._denial_is_terminal
+    bad = tmp_path / "bad"
+    (bad / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (bad / ".pilot-scratch").symlink_to(outside, target_is_directory=True)
+    for cmd in (
+        'D=.pilot-scratch/x; mkdir -p "$D"',
+        'R="$PWD/.pilot-scratch/x"; mkdir -p "$R"',
+        'D=.pilot-scratch/x; printf y > "$D/a"',
+    ):
+        assert f("Bash", {"command": cmd}, str(bad)) is True, cmd
+    missing = str(tmp_path / "does-not-exist")
+    assert f("Bash", {"command": 'D=.pilot-scratch/x; mkdir -p "$D"'}, missing) is True
+
+
+def test_cpp272_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """Sovereign boundary: admission for the `.pilot-scratch` var case is
+    byte-identical to HEAD — the command is STILL denied. Nothing is
+    tier1-auto-approved, the policy still default-denies, and the REFUSAL path
+    (`for_lethality=False`) still returns a destination veto. Only
+    `_denial_is_terminal` flips terminal→survivable; end-to-end the handler
+    returns a non-terminal ``PermissionResultDeny``, never an allow."""
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve
+
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp272_unwired(wt)
+    cmd = 'D=.pilot-scratch/git-probe; mkdir -p "$D"'
+
+    # Admission UNCHANGED — the REFUSAL path still vetoes (the `$`-rooted mkdir).
+    assert (
+        permissions_module._destination_veto_reason(cmd, wt, for_lethality=False)
+        is not None
+    )
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(_bundled_handler(cwd=wt)("Bash", {"command": cmd}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
 # ── cpp#237: a read-only wait-loop script is a SURVIVABLE deny (mika#2105) ─────
 #
 # The verbatim mika#2105 command (pilot e1a6c78b, 2026-09-29T15:13:20Z) that died
