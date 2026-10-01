@@ -4202,3 +4202,236 @@ def test_cpp257_pre_tool_use_hook_leaves_larger_or_equal_override_untouched(
     # Empty hook output → no updatedInput, no permission decision.
     assert frame["response"]["response"] == {}
     assert "agent_dispatch_model_inherit" not in capsys.readouterr().err
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# cpp#267 — the PreToolUse Agent hook ALSO strips run_in_background.
+#
+# A detached background dispatch cannot outlive a headless session: a pilot that
+# dispatches reviewers with `run_in_background: true` then yields its turn ends
+# the session (SDK ResultMessage), and the background agents die with it — review
+# lost, no PR, PIPELINE_INCOMPLETE (founding incident 624656b1). The same reached
+# PreToolUse hook as cpp#257/263 now forces every dispatch blocking.
+#
+# Prime requires rewrite ⊥ effect-verification: the REWRITE-test (the hook strips
+# run_in_background) and the INVARIANT-test (no detached background task outlives
+# the session) are SEPARATE, not the same assertion. The invariant is proven at
+# the level that governs it — after the hook, no Agent dispatch the pilot forwards
+# carries `run_in_background: true` — and reachability is proven through the SDK's
+# OWN hook path (`Query._handle_control_request` with a `hook_callback` control
+# request), NOT a direct call to the hook function.
+# ════════════════════════════════════════════════════════════════════════════
+
+from claude_pilot.permissions import _maybe_strip_run_in_background  # noqa: E402
+
+# ── REWRITE-test: the hook's rewrite logic strips a truthy run_in_background ──
+
+
+def test_cpp267_run_in_background_is_stripped_when_truthy() -> None:
+    """REWRITE-test (cpp#267): a present-and-truthy ``run_in_background`` is
+    removed; every other dispatch field is preserved and the input is not
+    mutated."""
+    tool_input = {
+        "description": "Code review",
+        "subagent_type": "general-purpose",
+        "run_in_background": True,
+        "prompt": "review this diff",
+    }
+    rewritten = _maybe_strip_run_in_background(tool_input)
+    assert rewritten is not None, "a truthy run_in_background must be stripped"
+    assert "run_in_background" not in rewritten, "the background flag must be dropped"
+    assert rewritten["description"] == "Code review"
+    assert rewritten["subagent_type"] == "general-purpose"
+    assert rewritten["prompt"] == "review this diff"
+    # The original is untouched (new dict returned).
+    assert tool_input["run_in_background"] is True
+
+
+def test_cpp267_run_in_background_absent_or_falsy_passes_through_unchanged() -> None:
+    """The strip is tight: absent, ``False``, or any falsy value → no rewrite
+    (the dispatch is already blocking)."""
+    assert _maybe_strip_run_in_background({"description": "x"}) is None
+    assert _maybe_strip_run_in_background({"run_in_background": False}) is None
+    assert _maybe_strip_run_in_background({"run_in_background": None}) is None
+    assert _maybe_strip_run_in_background({"run_in_background": 0}) is None
+    assert _maybe_strip_run_in_background({"run_in_background": ""}) is None
+
+
+# ── INVARIANT-test: no background dispatch survives session end (SDK path) ────
+
+
+def test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """INVARIANT PROOF (cpp#267) — SEPARATE from the rewrite-test above.
+
+    The invariant that actually governs the lethality is: *in headless, no
+    detached background task outlives the session*. Asserted at the level that
+    governs it — after the reached PreToolUse hook, NO ``Agent`` dispatch the
+    pilot forwards carries ``run_in_background: true`` — so there is no detached
+    task left in flight for session close to orphan.
+
+    Reachability is proven through the SDK's OWN hook-dispatch entrypoint
+    (``Query._handle_control_request`` with a ``hook_callback``
+    ``SDKControlRequest``), exactly as the cpp#257 reachability test — NOT a
+    direct call to the hook function (a direct green call attests the function,
+    not the path the CLI actually drives).
+
+    The session model is left UNKNOWN here so the model-inherit rewrite does not
+    fire — this isolates the background-strip invariant from the model rewrite.
+    """
+    import json as _json
+
+    from claude_agent_sdk._internal.query import Query
+    from claude_agent_sdk.types import _hooks_to_internal_format
+
+    # No model on the config → _maybe_inherit_session_model won't fire for a
+    # no-model dispatch; the ONLY rewrite under test is the background strip.
+    config = _config_with_model(None)
+    internal_hooks = _hooks_to_internal_format(_build_pilot_pretooluse_hooks(config))
+    query = Query(
+        transport=_RecordingTransport(), is_streaming_mode=True, hooks=internal_hooks
+    )
+    for _event, matchers in query.hooks.items():
+        for matcher in matchers:
+            for callback in matcher.get("hooks", []):
+                cb_id = f"hook_{query.next_callback_id}"
+                query.next_callback_id += 1
+                query.hook_callbacks[cb_id] = callback
+    assert query.hook_callbacks, "the pilot PreToolUse hook registered through the SDK"
+    callback_id = next(iter(query.hook_callbacks))
+
+    # The founding incident shape: a reviewer dispatched in the background.
+    control_request = {
+        "type": "control_request",
+        "request_id": "req-cpp267",
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": {
+                    "description": "ce-code-review reviewer",
+                    "subagent_type": "general-purpose",
+                    "run_in_background": True,
+                    "prompt": "review this diff",
+                },
+                "tool_use_id": "toolu_cpp267",
+                "session_id": "sess-cpp267",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp",
+            },
+            "tool_use_id": "toolu_cpp267",
+        },
+    }
+
+    asyncio.run(query._handle_control_request(control_request))
+
+    frame = _json.loads(query.transport.writes[0])
+    assert frame["type"] == "control_response"
+    assert frame["response"]["subtype"] == "success", frame
+    hook_specific = frame["response"]["response"]["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+
+    updated = hook_specific["updatedInput"]
+    # THE INVARIANT: the forwarded dispatch is blocking — no detached task is left
+    # in flight for session close to orphan.
+    assert updated.get("run_in_background") in (None, False), (
+        "no Agent dispatch forwarded by the pilot may carry a truthy "
+        "run_in_background — a detached background task must not outlive a "
+        "headless session"
+    )
+    assert "run_in_background" not in updated
+    # The dispatch still runs; only the detached/polled mode was removed.
+    assert updated["subagent_type"] == "general-purpose"
+    assert updated["description"] == "ce-code-review reviewer"
+    assert updated["prompt"] == "review this diff"
+
+    # Admission is UNCHANGED: the hook carries no permission decision.
+    assert "permissionDecision" not in hook_specific
+    assert "decision" not in frame["response"]["response"]
+
+    # The strip is mechanically auditable (cpp#267 AC2 / Prime control (i)).
+    stderr = capsys.readouterr().err
+    assert permissions_module.audit.AUDIT_TAG in stderr
+    assert "agent_dispatch_run_in_background_stripped" in stderr
+    assert "pre_tool_use_hook" in stderr
+
+
+# ── COMBINED: model-inherit AND background-strip co-occur on one dispatch ─────
+
+
+def test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both cpp#263 (model inherit) and cpp#267 (background strip) apply to ONE
+    dispatch — the exact 624656b1 shape (forced sonnet + run_in_background on a
+    1M session). Driven through the SDK hook path; asserts the single forwarded
+    ``updatedInput`` has BOTH the model override dropped AND run_in_background
+    stripped, that BOTH audit events fired, and that no ``permissionDecision`` is
+    added (cpp#263 model-inherit stays intact)."""
+    import json as _json
+
+    from claude_agent_sdk._internal.query import Query
+    from claude_agent_sdk.types import _hooks_to_internal_format
+
+    config = _config_with_model("claude-opus-5[1m]")
+    internal_hooks = _hooks_to_internal_format(_build_pilot_pretooluse_hooks(config))
+    query = Query(
+        transport=_RecordingTransport(), is_streaming_mode=True, hooks=internal_hooks
+    )
+    for _event, matchers in query.hooks.items():
+        for matcher in matchers:
+            for callback in matcher.get("hooks", []):
+                cb_id = f"hook_{query.next_callback_id}"
+                query.next_callback_id += 1
+                query.hook_callbacks[cb_id] = callback
+    callback_id = next(iter(query.hook_callbacks))
+
+    control_request = {
+        "type": "control_request",
+        "request_id": "req-cpp267c",
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": {
+                    "description": "Code reuse review",
+                    "subagent_type": "general-purpose",
+                    "model": "sonnet",  # strictly smaller window → cpp#263 rewrite
+                    "run_in_background": True,  # headless-lethal → cpp#267 strip
+                    "prompt": "review this diff",
+                },
+                "tool_use_id": "toolu_cpp267c",
+                "session_id": "sess-cpp267c",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp",
+            },
+            "tool_use_id": "toolu_cpp267c",
+        },
+    }
+
+    asyncio.run(query._handle_control_request(control_request))
+
+    frame = _json.loads(query.transport.writes[0])
+    assert frame["response"]["subtype"] == "success", frame
+    hook_specific = frame["response"]["response"]["hookSpecificOutput"]
+    updated = hook_specific["updatedInput"]
+    # BOTH rewrites landed in the one forwarded input.
+    assert "model" not in updated, "cpp#263: the smaller-window override must be dropped"
+    assert "run_in_background" not in updated, "cpp#267: the background flag must be stripped"
+    assert updated["subagent_type"] == "general-purpose"
+    assert updated["description"] == "Code reuse review"
+    assert updated["prompt"] == "review this diff"
+
+    # No admission touch from either rewrite.
+    assert "permissionDecision" not in hook_specific
+    assert "decision" not in frame["response"]["response"]
+
+    # BOTH audit events fired — each rewrite is independently auditable.
+    stderr = capsys.readouterr().err
+    assert "agent_dispatch_model_inherit" in stderr, "cpp#263 model-inherit audit intact"
+    assert "agent_dispatch_run_in_background_stripped" in stderr, "cpp#267 strip audited"
