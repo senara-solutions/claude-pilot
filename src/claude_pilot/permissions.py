@@ -1065,6 +1065,109 @@ def _segment_write_kind(seg: str) -> str | None:
     return None
 
 
+def _subst_aware_word_split(seg: str) -> list[str] | None:
+    """Word-split a segment like the shell, but treat a command substitution
+    (``$(…)`` or `` `…` ``) as an OPAQUE LEXICAL UNIT: the whitespace INSIDE a
+    substitution never ends a word (cpp#258). Surrounding quotes are removed the
+    way ``shlex`` / bash would; the substitution's own bytes are kept verbatim,
+    inner whitespace included. Returns ``None`` when a quote or a substitution is
+    left unbalanced — the operand is then UNEVALUABLE, and the (lethality-only)
+    caller treats that as survivable rather than a proven escape.
+
+    Why this exists: ``shlex.split`` (``_shlex_operands``) splits an UNQUOTED
+    ``$(id -u)`` on its internal space, truncating ``mkdir -p
+    /tmp/compound-engineering-$(id -u)/x`` to the operand ``/tmp/compound-
+    engineering-$(id`` — a token the uid-tolerant scratch whitelist (axis B,
+    mika#2562) no longer recognizes, so a PARSE DEFECT was read as a PROVEN
+    containment escape and killed the pilot (mika#1833). Respecting the
+    substitution hands the whole operand to the EXISTING whitelist instead.
+
+    LINEAR — a single left-to-right pass, no regex and no backtracking — so a
+    2000-char operand with deeply nested ``$(`` is O(n) with no ReDoS surface
+    (the cpp#250 lesson: a substitution scanner must never be a backtracking
+    regex). This is a lethality-path containment *reader*, not a shell parser:
+    it does not evaluate anything, it only keeps a substitution's bytes together
+    so the whole literal operand reaches the unchanged downstream checks.
+    """
+    tokens: list[str] = []
+    cur: list[str] = []
+    has_cur = False  # a word has started (so `""`/`''` yields an empty token)
+    depth = 0  # `$( … )` nesting depth
+    in_backtick = False
+    in_squote = False
+    in_dquote = False
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if in_squote:
+            # single quotes are fully literal until the closing quote
+            cur.append(c)
+            if c == "'":
+                in_squote = False
+            i += 1
+            continue
+        # A command substitution opens even inside double quotes (bash expands
+        # `$(…)` there); its internal whitespace must not split the word.
+        if c == "$" and i + 1 < n and seg[i + 1] == "(":
+            depth += 1
+            cur.append("$(")
+            has_cur = True
+            i += 2
+            continue
+        if depth > 0:
+            # Verbatim copy inside `$(…)`, tracking only paren nesting so a
+            # nested `$(…)` or a literal `(`/`)` closes at the right place.
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            cur.append(c)
+            has_cur = True
+            i += 1
+            continue
+        if c == "`":
+            in_backtick = not in_backtick
+            cur.append(c)
+            has_cur = True
+            i += 1
+            continue
+        if in_backtick:
+            cur.append(c)
+            has_cur = True
+            i += 1
+            continue
+        if c == "'" and not in_dquote:
+            in_squote = True
+            has_cur = True
+            i += 1
+            continue
+        if c == '"':
+            in_dquote = not in_dquote
+            has_cur = True
+            i += 1
+            continue
+        if in_dquote:
+            cur.append(c)
+            has_cur = True
+            i += 1
+            continue
+        if c.isspace():
+            if has_cur:
+                tokens.append("".join(cur))
+                cur = []
+                has_cur = False
+            i += 1
+            continue
+        cur.append(c)
+        has_cur = True
+        i += 1
+    if in_squote or in_dquote or depth > 0 or in_backtick:
+        return None  # unbalanced → unevaluable
+    if has_cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
 def _shlex_operands(seg: str) -> list[str] | None:
     """POSIX shell word-split of a segment (quotes removed the way bash would),
     or ``None`` on a tokenization error (unbalanced quotes) so the caller fails
@@ -1345,6 +1448,48 @@ def _destination_veto_reason(
                 f"write-capable segment ({kind}) destination could not be "
                 "parsed — denied fail-closed"
             )
+        # cpp#258 — LETHALITY ONLY. `_extract_write_destinations` splits a
+        # `mkdir` operand with `shlex`, which breaks an UNQUOTED command
+        # substitution (`$(id -u)`, `` `id -u` ``) on its INTERNAL whitespace:
+        # `mkdir -p /tmp/compound-engineering-$(id -u)/x` truncates to the
+        # operand `/tmp/compound-engineering-$(id`, which the uid-tolerant
+        # scratch whitelist (axis B, mika#2562) no longer recognizes — so a
+        # PARSE DEFECT was read as a PROVEN containment escape and killed the
+        # pilot entering `/ce:code-review` (mika#1833, pilot 39ae2723). Only the
+        # LETHALITY question is wrong; the deny is correct and stays. Re-extract
+        # the operands respecting substitutions (`_subst_aware_word_split`) and
+        # run the WHOLE operands through the SAME downstream checks below:
+        #
+        #   * The uid-tolerant positive (`$(id -u)`/`` `id -u` `` inside a
+        #     `/tmp/…` scratch) now reaches `_is_sanctioned_tmp_scratch` as a
+        #     WHOLE token and is recognized → survivable (still refused).
+        #   * Every NEGATIVE stays TERMINAL by the unchanged checks on the whole
+        #     operand: a non-uid substitution (`/tmp/$(curl evil)/x`), a `..`
+        #     traversal, an absolute non-/tmp path (`/etc/x`) all fail the
+        #     sanctioned test and veto via `is_within_project`; a `$`/`~`-rooted
+        #     operand (`"$HOME/x"`, cpp#218) vetoes before resolution. The uid
+        #     whitelist is NOT widened — only the extractor stops truncating.
+        #   * An UNBALANCED substitution makes the operand UNEVALUABLE
+        #     (`_subst_aware_word_split` returns ``None``); a denial a classifier
+        #     cannot parse defaults to survivable, never "proven escape"
+        #     (`_denial_is_terminal`'s own doctrine).
+        #
+        # Gated on ``for_lethality`` AND on a substitution actually being
+        # present, so every REFUSAL caller (`for_lethality=False`) and every
+        # substitution-free `mkdir` is byte-identical to HEAD: admission is
+        # untouched, only `_denial_is_terminal` can flip True→False here.
+        if (
+            for_lethality
+            and kind == "bash-mkdir"
+            and ("$(" in seg or "`" in seg)
+        ):
+            subst_tokens = _subst_aware_word_split(seg)
+            if subst_tokens is None:
+                # Unbalanced substitution — operand unevaluable → survivable.
+                continue
+            subst_dests = [t for t in subst_tokens[1:] if not t.startswith("-")]
+            if subst_dests:
+                dests = subst_dests
         for dest in dests:
             if kind == "bash-mkdir" and _is_sanctioned_tmp_scratch(dest, command):
                 continue
