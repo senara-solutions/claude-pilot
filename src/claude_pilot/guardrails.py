@@ -365,6 +365,16 @@ class SessionGuardrails:
         # docstring above `PROMPT_CACHE_CREATION_SUBSTANTIAL_TOKENS`). Reset to
         # 0 by ANY turn that does not — a genuine hit or a too-small miss.
         self._consecutive_cache_dead_misses: int = 0
+        # cpp#259: messages emitted by a SUBAGENT (Agent tool — they carry a
+        # `parent_tool_use_id`). Counted separately, and NEVER fed to the main
+        # pilot's stall / turn / empty counters: a multi-agent review dispatches
+        # N reviewers whose tool-less thinking/synthesis turns would otherwise
+        # each increment `_consecutive_stall_turns` and trip `stall_detected` on
+        # a session that is working (founding case 73e6f3ee: 8 reviewers, 177 of
+        # 197 post-dispatch messages were subagent messages, killed at the
+        # stall threshold). This counter exists only for logging/observability;
+        # it never arms a guardrail.
+        self._subagent_message_count: int = 0
         self._reset_idle_timer()
 
     @property
@@ -374,6 +384,17 @@ class SessionGuardrails:
     @property
     def turns(self) -> int:
         return self._turn_count
+
+    @property
+    def subagent_messages(self) -> int:
+        """Number of SUBAGENT AssistantMessages observed this session (cpp#259).
+
+        These carry a `parent_tool_use_id` (the Agent tool that spawned them)
+        and are deliberately excluded from `turns` and the stall/empty
+        counters — see `on_assistant_message`. Exposed for logging only; it
+        never arms a guardrail, and `turns` stays comparable to the SDK's
+        `maxTurns` (which counts only the main loop)."""
+        return self._subagent_message_count
 
     @property
     def pr_created(self) -> bool:
@@ -689,6 +710,7 @@ class SessionGuardrails:
         content: list[dict[str, Any]] | Any,
         message_id: str | None = None,
         usage: dict[str, Any] | None = None,
+        parent_tool_use_id: str | None = None,
     ) -> TurnBoundaryEvent | None:
         """Called on each AssistantMessage from the SDK.
 
@@ -715,7 +737,32 @@ class SessionGuardrails:
         accumulating, so they are evaluated (once per turn — see
         `_maybe_evaluate_cache_dead_guardrail`) as soon as they are known,
         which may be on this call or a later continuation of the same turn.
+
+        cpp#259: `parent_tool_use_id` is the SDK `AssistantMessage.parent_tool_use_id`
+        — non-None iff this message was emitted by a SUBAGENT spawned via the
+        Agent tool. A subagent message must NOT arm the MAIN pilot's guardrails:
+        it does not advance `_turn_count` (so `turns` / the `[cache] turn N`
+        line stay comparable to the SDK `maxTurns`, which counts only the main
+        loop), and its tool-less thinking/synthesis turns must not increment
+        `_consecutive_stall_turns` toward `stall_detected`. A multi-agent review
+        interleaves N reviewers' messages; counting them as main turns killed a
+        working session at the stall threshold (founding case 73e6f3ee). The
+        message is still proof of life, though — a subagent-only busy period must
+        not look idle to the watchdog — so the idle deadline is rearmed, and the
+        message is tallied in `_subagent_message_count` for observability. The
+        early return means no `TurnBoundaryEvent` is produced for a subagent
+        message, by design: boundary events drive main-loop logging only.
         """
+        if parent_tool_use_id is not None:
+            self._subagent_message_count += 1
+            # Liveness only (cpp#259 AC2): keep the idle/heartbeat path from
+            # seeing a subagent-only stretch as idle, WITHOUT touching the main
+            # pilot's turn / stall / empty counters or the wait-state machine
+            # (the main is awaiting the Agent tool_result; only that result,
+            # arriving as a UserMessage without a subagent parent, retires it).
+            self._bump_idle_deadline()
+            return None
+
         blocks = content if isinstance(content, list) else []
         has_tool_use = any(_block_type(b) == "tool_use" for b in blocks)
         has_thinking = any(_block_type(b) == "thinking" for b in blocks)
