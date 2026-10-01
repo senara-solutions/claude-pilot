@@ -1928,3 +1928,166 @@ async def test_close_final_turn_carries_cache_usage(
     assert event is not None
     assert event.cache_read_input_tokens == 0
     assert event.cache_creation_input_tokens == 60_000
+
+
+# ── Subagent messages do not arm the main pilot's guardrails (cpp#259) ────────
+#
+# `guardrails.on_assistant_message` receives EVERY SDK AssistantMessage,
+# including those from SUBAGENTS spawned by the Agent tool (they carry a
+# `parent_tool_use_id`). A multi-agent review dispatches N reviewers whose
+# tool-less thinking/synthesis turns were each incrementing the MAIN pilot's
+# `_consecutive_stall_turns` and `_turn_count`. At the stall threshold this
+# KILLED a working session (founding case 73e6f3ee: 8 reviewers, 177 of 197
+# post-dispatch messages were subagent messages, `stall_detected` fired, "turns"
+# 170→192 in 10s). The fix: a message with a non-None `parent_tool_use_id` is
+# counted separately and never touches the main counters, but still rearms the
+# idle deadline (it is proof of life).
+
+
+def _subagent(
+    guardrails: SessionGuardrails,
+    content: list,
+    message_id: str,
+    parent: str = "agent_tool_1",
+) -> TurnBoundaryEvent | None:
+    """Deliver an AssistantMessage emitted by a subagent (Agent tool)."""
+    return guardrails.on_assistant_message(
+        content, message_id=message_id, parent_tool_use_id=parent
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_control_73e6f3ee_shape_does_not_trip_stall(
+    guardrails: SessionGuardrails,
+) -> None:
+    """cpp#259 AC3 (positive control). Replay the 73e6f3ee shape: the main pilot
+    dispatches 8 reviewers via the Agent tool (→ AWAITING_TOOL) and then 8
+    interleaved subagent messages arrive, each tool-less (thinking + synthesis).
+    Pre-fix each was a distinct main turn with no tool call and tripped
+    `stall_detected` at 5. Post-fix none of them arms the main counter, so a
+    working session survives — and the main is still shown awaiting its tools."""
+    agent_tools = [
+        ToolUseBlock(id=f"agent_{i}", name="Agent", input={"prompt": f"review {i}"})
+        for i in range(8)
+    ]
+    guardrails.on_assistant_message(agent_tools, message_id="main_1")
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL
+    assert guardrails.turns == 1
+
+    for i in range(8):
+        _subagent(
+            guardrails,
+            [_think(f"reviewer {i} thinking"), _text(f"verdict {i}")],
+            message_id=f"sub_{i}",
+            parent=f"agent_{i}",
+        )
+
+    assert not guardrails.aborted, (
+        "8 interleaved subagent messages must not trip stall_detected on a "
+        "working session (73e6f3ee)"
+    )
+    assert guardrails.turns == 1, "subagent messages must not advance the main turn count"
+    assert guardrails.subagent_messages == 8
+    assert guardrails._wait_state is _WaitState.AWAITING_TOOL, (
+        "the main is still awaiting the Agent tool_results"
+    )
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_negative_control_five_main_tool_less_turns_still_trip_stall(
+    guardrails: SessionGuardrails,
+) -> None:
+    """cpp#259 AC4 (negative control). 5 MAIN turns (no parent_tool_use_id) with
+    no tool calls must STILL trip `stall_detected` — cpp#4 is not regressed by
+    the subagent filter."""
+    for i in range(5):
+        guardrails.on_assistant_message([_text(f"narrating turn {i}")], message_id=f"main_{i}")
+    assert guardrails.aborted
+    assert guardrails.abort_reason is not None
+    assert guardrails.abort_reason.guardrail == "stall_detected"
+    assert guardrails.turns == 5
+
+
+@pytest.mark.asyncio
+async def test_subagent_interleave_does_not_rescue_a_genuine_main_stall(
+    guardrails: SessionGuardrails,
+) -> None:
+    """cpp#259 AC4, sharper. Subagent messages neither ARM nor DISARM the main
+    stall counter. Here a genuine main stall (5 tool-less main turns) is
+    interleaved with TOOL-BEARING subagent messages: if those subagent tool
+    turns were counted as main turns they would reset `_consecutive_stall_turns`
+    to 0 every step and the stall would never fire — masking a dead session.
+    They are filtered, so the stall still trips at the 5th main turn."""
+    for i in range(5):
+        guardrails.on_assistant_message([_text(f"narrating {i}")], message_id=f"main_{i}")
+        _subagent(guardrails, [_tool(name="Read")], message_id=f"sub_{i}")
+    assert guardrails.aborted
+    assert guardrails.abort_reason is not None
+    assert guardrails.abort_reason.guardrail == "stall_detected"
+    assert guardrails.turns == 5
+    assert guardrails.subagent_messages == 5
+
+
+@pytest.mark.asyncio
+async def test_turn_count_and_cache_boundary_exclude_subagents() -> None:
+    """cpp#259 AC5: the `[cache] turn N` line is driven by
+    `TurnBoundaryEvent.just_closed_turn`, which must equal the MAIN turn count
+    (comparable again to the SDK `maxTurns`, which counts only the main loop).
+    A flurry of subagent messages between two main turns must not inflate it."""
+    guardrails = SessionGuardrails(_config())
+    # Main turn 1 opens (dispatches the Agent tool); no boundary emitted yet.
+    assert guardrails.on_assistant_message([_tool(name="Agent")], message_id="main_1") is None
+    # 20 subagent messages — each would have been counted as a "turn" pre-fix,
+    # so the next boundary would have read turn 21 instead of turn 1.
+    for i in range(20):
+        _subagent(guardrails, [_think(f"r{i}")], message_id=f"sub_{i}")
+    # Main turn 2 closes turn 1.
+    event = guardrails.on_assistant_message([_text("synthesis")], message_id="main_2")
+    assert event is not None
+    assert event.just_closed_turn == 1, (
+        "the cache line must carry the MAIN count, not inflated by 20 subagent messages"
+    )
+    assert guardrails.turns == 2
+    assert guardrails.subagent_messages == 20
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_message_rearms_the_idle_deadline() -> None:
+    """cpp#259 AC2: a subagent message is proof of life. The filter must not make
+    a subagent-only busy stretch look idle to the watchdog — the idle deadline
+    still advances on every subagent message, across ~1.7x the idle budget,
+    without advancing the main turn count."""
+    guardrails = SessionGuardrails(_idle_config(idle_ms=300))
+
+    for _ in range(100):
+        before = guardrails._last_activity_at
+        await asyncio.sleep(0.005)
+        _subagent(guardrails, [_think("reviewer working")], message_id="sub")
+        _assert_deadline_advanced(guardrails, before, "a subagent message")
+
+    assert guardrails.aborted is False
+    assert guardrails.turns == 0, "no main turn ever opened"
+    assert guardrails.subagent_messages == 100
+    guardrails.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_messages_counter_starts_at_zero(
+    guardrails: SessionGuardrails,
+) -> None:
+    """The separately-named subagent counter is 0 before any message (cpp#259)."""
+    assert guardrails.subagent_messages == 0
+
+
+@pytest.mark.asyncio
+async def test_subagent_message_returns_no_boundary_event(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A subagent message never produces a `TurnBoundaryEvent` — boundary events
+    drive main-loop per-turn logging (`[cache] turn N`, silent-turn markers),
+    which must not fire for subagent activity (cpp#259)."""
+    guardrails.on_assistant_message([_tool(name="Agent")], message_id="main_1")
+    event = _subagent(guardrails, [_think("x"), _text("y")], message_id="sub_1")
+    assert event is None

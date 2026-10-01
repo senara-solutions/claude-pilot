@@ -631,6 +631,16 @@ async def _run_agent_inner(
                                 # cache_creation_input_tokens. See
                                 # SessionGuardrails.on_assistant_message.
                                 usage=getattr(message, "usage", None),
+                                # cpp#259: non-None iff this message came from a
+                                # SUBAGENT (Agent tool). The guardrail excludes
+                                # subagent messages from the MAIN pilot's stall
+                                # and turn counters — N reviewers' tool-less turns
+                                # were tripping stall_detected on a working
+                                # session (73e6f3ee), and inflating the
+                                # `[cache] turn N` count past maxTurns.
+                                parent_tool_use_id=getattr(
+                                    message, "parent_tool_use_id", None
+                                ),
                             )
                             if event is not None:
                                 # event.just_closed_turn is the turn that just ENDED;
