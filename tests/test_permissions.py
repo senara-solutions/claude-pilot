@@ -3633,3 +3633,233 @@ def test_cpp241_non_heredoc_commands_are_byte_identical(tmp_path):
     ):
         # no `<<` → heredoc mask never runs; value is whatever HEAD produced
         assert f("Bash", {"command": cmd}, wt) in (True, False)
+
+
+# ── cpp#258: an UNQUOTED `$(id -u)` mkdir operand is cut by shlex and read as a
+# proven escape — LETHALITY ONLY (mika#1833, pilot 39ae2723) ────────────────────
+#
+# `_extract_mkdir_destinations` splits with `shlex`, which breaks an UNQUOTED
+# command substitution on its INTERNAL whitespace: `mkdir -p
+# /tmp/compound-engineering-$(id -u)/ce-code-review/x` truncates to the operand
+# `/tmp/compound-engineering-$(id`, which the uid-tolerant scratch whitelist
+# (axis B, mika#2562) no longer recognizes, so `_destination_veto_reason(...,
+# for_lethality=True)` treated a PARSE DEFECT as a PROVEN containment escape and
+# killed the pilot entering `/ce:code-review`. The fix re-extracts operands
+# respecting `$(…)`/`` `…` `` on the LETHALITY path only; the deny stays a deny
+# (admission byte-identical), only `_denial_is_terminal` flips True→False for the
+# uid-tolerant scratch. The whitelist is NOT widened — the extractor just stops
+# truncating. The lethality carve lives in `permissions._destination_veto_reason`,
+# the same [Security Weaken]-sensitive region as cpp#213/#237/#252; if that hunk
+# is ever gated out these end-to-end assertions SELF-SKIP (the substitution-aware
+# tokenizer itself is still exercised directly below, unconditionally).
+
+# The verbatim command that killed pilot 39ae2723 (mika#1833, 2026-10-01T01:10Z).
+_CPP258_VERBATIM_1833 = (
+    "mkdir -p /tmp/compound-engineering-$(id -u)/ce-code-review/20261001-cr1833 "
+    "&& echo /tmp/compound-engineering-$(id -u)/ce-code-review/20261001-cr1833"
+)
+
+# Positives: an UNQUOTED uid-tolerant /tmp scratch mkdir. Each is SURVIVABLE
+# (non-terminal) after the fix, and was TERMINAL on HEAD.
+_CPP258_SURVIVABLE = [
+    _CPP258_VERBATIM_1833,
+    "mkdir -p /tmp/compound-engineering-$(id -u)/ce-code-review/x",
+    "mkdir -p /tmp/compound-engineering-`id -u`/x",
+    # already-survivable sibling shapes, re-pinned so the carve never regresses
+    # the quoted / $UID forms mika#2562 already admits.
+    'mkdir -p "/tmp/compound-engineering-$(id -u)/ce-code-review/x"',
+    "mkdir -p /tmp/compound-engineering-$UID/x",
+    "mkdir -p /tmp/compound-engineering-${UID}/x",
+    "mkdir -p /tmp/compound-engineering-$(id -u)",
+]
+
+# Negatives: every one stays TERMINAL. A non-uid substitution, a traversal, an
+# absolute non-/tmp path, a `$`/`~`-root, a decorated uid subst, and a segment
+# mixing a good uid operand with a genuine escape.
+_CPP258_TERMINAL = [
+    "mkdir -p /etc/x",
+    "mkdir -p /tmp/$(curl evil)/x",
+    'mkdir -p "$HOME/x"',
+    "mkdir -p /tmp/compound-engineering-$(id -u)/../../etc/x",
+    "mkdir -p /tmp/x-$(whoami)/y",
+    "mkdir -p /tmp/compound-engineering-$(id -u; rm -rf /)/x",
+    "mkdir -p /tmp/compound-engineering-$(id -u)/x /etc/evil",
+    "mkdir -p /tmp/compound-engineering-$(id -u)/x && mkdir -p /etc/evil",
+]
+
+
+def _cpp258_wt(tmp_path: Path) -> str:
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    return str(worktree)
+
+
+def _skip_if_cpp258_unwired(wt: str) -> None:
+    """SELF-SKIP (cpp#237 pattern) when the lethality carve is absent — the
+    verbatim 39ae2723 command is still TERMINAL — so the suite stays GREEN while
+    the hunk awaits a manual apply window."""
+    if permissions_module._denial_is_terminal(
+        "Bash", {"command": _CPP258_VERBATIM_1833}, wt
+    ):
+        pytest.skip(
+            "cpp#258 substitution-aware mkdir lethality carve pending manual "
+            "apply (lethality edit in permissions._destination_veto_reason)"
+        )
+
+
+@pytest.mark.parametrize("cmd", _CPP258_SURVIVABLE)
+def test_cpp258_uid_tolerant_mkdir_is_survivable(cmd: str, tmp_path: Path) -> None:
+    """Positive (the fix): an UNQUOTED `$(id -u)`/`` `id -u` `` (or `$UID`) /tmp
+    scratch mkdir is a SURVIVABLE deny — `_denial_is_terminal` returns ``False`` —
+    instead of killing the session on a truncated-operand containment veto."""
+    wt = _cpp258_wt(tmp_path)
+    _skip_if_cpp258_unwired(wt)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is False
+    ), cmd
+
+
+@pytest.mark.parametrize("cmd", _CPP258_TERMINAL)
+def test_cpp258_non_uid_and_escapes_stay_terminal(cmd: str, tmp_path: Path) -> None:
+    """Negatives: a non-uid substitution, a `..` traversal, an absolute non-/tmp
+    path, a `$`/`~`-rooted operand, a decorated uid subst, and a segment mixing a
+    good uid operand with a real escape ALL stay TERMINAL. The uid whitelist is
+    not widened; only truncation is fixed, so the whole operand still vetoes."""
+    wt = _cpp258_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp258_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """Sovereign boundary: admission for the verbatim is byte-identical to HEAD —
+    the command is STILL denied. It is never tier1-auto-approved, the policy still
+    default-denies it, and `_destination_veto_reason` on the REFUSAL path
+    (``for_lethality=False``) still returns a veto (unchanged code). Only
+    `_denial_is_terminal` flips terminal→survivable; end-to-end the handler
+    returns a non-terminal ``PermissionResultDeny``, never an allow."""
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve
+
+    wt = _cpp258_wt(tmp_path)
+    _skip_if_cpp258_unwired(wt)
+
+    cmd = _CPP258_VERBATIM_1833
+    # Admission UNCHANGED — the REFUSAL path still vetoes (same string as HEAD,
+    # truncated operand and all), nothing is tier1-approved, policy denies.
+    assert (
+        permissions_module._destination_veto_reason(cmd, wt, for_lethality=False)
+        is not None
+    )
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+    # End-to-end: refused, but the run survives.
+    result = asyncio.run(_bundled_handler(cwd=wt)("Bash", {"command": cmd}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
+def test_cpp258_refusal_path_unchanged_by_the_carve(tmp_path: Path) -> None:
+    """Both-directions: the REFUSAL path (``for_lethality=False``) is byte-
+    identical to HEAD — the ``for_lethality``-gated re-extraction never runs
+    there, so each case keeps its HEAD verdict exactly.
+
+      * The UNQUOTED-truncated `$(…)`/`` `…` `` forms and every escape NEGATIVE
+        still return a destination veto (the truncated/whole operand escapes).
+      * The already-sanctioned whole-operand forms (quoted, `$UID`, `${UID}`,
+        mika#2562 axis B) still return ``None`` on BOTH paths — they were never
+        the death, and the deny for them comes from policy default-deny, not from
+        this veto. Returning ``None`` here is pre-existing, not a widening.
+    """
+    veto = lambda c: permissions_module._destination_veto_reason(  # noqa: E731
+        c.split("&&")[0].strip(), wt, for_lethality=False
+    )
+    wt = _cpp258_wt(tmp_path)
+    # Truncated-by-shlex positives + all terminal negatives → veto on refusal path.
+    truncating = [
+        _CPP258_VERBATIM_1833,
+        "mkdir -p /tmp/compound-engineering-$(id -u)/ce-code-review/x",
+        "mkdir -p /tmp/compound-engineering-`id -u`/x",
+        "mkdir -p /tmp/compound-engineering-$(id -u)",
+    ]
+    for cmd in truncating + _CPP258_TERMINAL:
+        assert veto(cmd) is not None, cmd
+    # Whole-operand sanctioned forms (mika#2562) → None on the refusal path too.
+    for cmd in (
+        'mkdir -p "/tmp/compound-engineering-$(id -u)/ce-code-review/x"',
+        "mkdir -p /tmp/compound-engineering-$UID/x",
+        "mkdir -p /tmp/compound-engineering-${UID}/x",
+    ):
+        assert veto(cmd) is None, cmd
+
+
+def test_cpp258_subst_aware_word_split_keeps_substitution_whole() -> None:
+    """Unit (unconditional — runs even when the e2e carve is gated): the linear
+    tokenizer treats `$(…)` and `` `…` `` as opaque lexical units, strips quotes
+    like shlex, and reports an unbalanced substitution as ``None`` (unevaluable)."""
+    split = permissions_module._subst_aware_word_split
+    assert split("mkdir -p /tmp/c-$(id -u)/x") == [
+        "mkdir",
+        "-p",
+        "/tmp/c-$(id -u)/x",
+    ]
+    assert split("mkdir -p /tmp/c-`id -u`/x") == [
+        "mkdir",
+        "-p",
+        "/tmp/c-`id -u`/x",
+    ]
+    # quotes stripped exactly like the already-surviving shlex quoted form
+    assert split('mkdir -p "/tmp/c-$(id -u)/x"') == [
+        "mkdir",
+        "-p",
+        "/tmp/c-$(id -u)/x",
+    ]
+    # a non-uid substitution is kept whole too (the downstream veto rejects it)
+    assert split("mkdir -p /tmp/$(curl evil)/x") == [
+        "mkdir",
+        "-p",
+        "/tmp/$(curl evil)/x",
+    ]
+    # nested substitution: paren depth tracked, stays one token
+    assert split("mkdir -p /tmp/a-$(echo $(id -u))/x") == [
+        "mkdir",
+        "-p",
+        "/tmp/a-$(echo $(id -u))/x",
+    ]
+    # unbalanced → None (unevaluable → survivable at the caller)
+    assert split("mkdir -p /tmp/a-$(id -u/x") is None
+    assert split("mkdir -p /tmp/a-`id -u/x") is None
+    assert split('mkdir -p "/tmp/unterminated') is None
+
+
+def test_cpp258_tokenizer_is_linear_on_nested_substitution() -> None:
+    """ReDoS bound (cpp#250 lesson): the tokenizer is LINEAR, so a 2000-char
+    operand with deeply nested `$(` resolves far under 50 ms. A quadratic or
+    backtracking implementation would blow the budget here."""
+    import time
+
+    operand = "/tmp/compound-engineering-" + "$(" * 700 + "id -u" + ")" * 700 + "/x"
+    seg = "mkdir -p " + operand
+    assert len(seg) >= 2000
+    start = time.perf_counter()
+    permissions_module._subst_aware_word_split(seg)
+    assert (time.perf_counter() - start) * 1000 < 50.0
+
+
+def test_cpp258_denial_is_terminal_bounded_time_on_2000_char_operand(
+    tmp_path: Path,
+) -> None:
+    """End-to-end time bound: the full `_denial_is_terminal` on a 2000-char
+    nested-`$(` mkdir operand stays under 50 ms (the ticket's budget)."""
+    import time
+
+    wt = _cpp258_wt(tmp_path)
+    operand = "/tmp/compound-engineering-" + "$(id -u)" * 240 + "/x"
+    cmd = "mkdir -p " + operand[:1990]
+    start = time.perf_counter()
+    permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+    assert (time.perf_counter() - start) * 1000 < 50.0
