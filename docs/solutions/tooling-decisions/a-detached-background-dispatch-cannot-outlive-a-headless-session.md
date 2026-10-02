@@ -1,6 +1,6 @@
 ---
-title: "A detached background dispatch cannot outlive a headless session — the reached PreToolUse hook strips run_in_background so every dispatch is blocking"
-date: 2026-10-01
+title: "A detached background dispatch cannot outlive a headless session — the reached PreToolUse hook forces run_in_background=False (does NOT strip it) so every dispatch runs foreground"
+date: 2026-10-02
 problem_type: tooling_decision
 track: knowledge
 module: permissions
@@ -43,7 +43,21 @@ forbids this in plain words ("Detaching local review into a polled background jo
 is forbidden"), yet the prohibition did not hold: a **prompt-level** prohibition
 does not bind the harness. The correction belongs at the **substrate**.
 
-## The fix — strip `run_in_background` on the already-reached hook
+## Why the first cut (cpp#269, strip) was inoperant
+
+cpp#269 shipped the right *placement* but the wrong *rewrite*: it **removed** the
+`run_in_background` key (`_maybe_strip_run_in_background` popped it). In the
+embedded CLI, **"Agents run in the background BY DEFAULT"** and the foreground
+gate is `run_in_background !== false`. Removing the key requests the default,
+which is **still background** — so the lethality survived unchanged. A second
+pilot (`bb9163e1`, mika#2627, 140 turns, $59.72) died the **same** death AFTER
+#269 deployed: its stderr shows three `agent_dispatch_run_in_background_stripped`
+events (the hook fired), yet each `Agent` call returned in **11–26 ms** and the
+session ended on "waiting on them". Dispatches with no key were background too.
+**`strip ≠ foreground`**: the only value the CLI reads as foreground is the key
+present and literally `False`.
+
+## The fix — FORCE `run_in_background=False` on the already-reached hook
 
 claude-pilot already registers a `PreToolUse` hook on `Agent|Task`
 (`create_subagent_model_inherit_hook`, cpp#257/263) that rewrites the forwarded
@@ -54,25 +68,28 @@ dispatch from the main pilot actually traverses (the dispatch is authorized
 `harness-runtime-tools-bypass-can-use-tool.md`). That reachability is already
 established for this hook; cpp#267 reuses it.
 
-The same hook now **also** removes `run_in_background` when it is present and
-truthy (`_maybe_strip_run_in_background`). In headless every dispatch becomes
-blocking: it completes within the turn, so there is no detached task for session
-close to orphan. The two rewrites compose into **one** `updatedInput`, and each
-emits its **own** `review_degraded` audit event (`agent_dispatch_model_inherit`
-and `agent_dispatch_run_in_background_stripped`); both can co-occur on a single
-dispatch and both are then auditable.
+The same hook now **sets `run_in_background = False` explicitly**
+(`_force_foreground_dispatch`) whenever the dispatch's value is anything other
+than literal `False` — **truthy OR absent**, because an absent key is the CLI's
+background default. If the value is already literally `False`, the hook no-ops.
+The key is always left **present and `False`**, never removed. In headless every
+dispatch then runs foreground: it completes within the turn, so there is no
+detached task for session close to orphan. The two rewrites compose into **one**
+`updatedInput`, and each emits its **own** `review_degraded` audit event
+(`agent_dispatch_model_inherit` and `agent_dispatch_forced_foreground`); both can
+co-occur on a single dispatch and both are then auditable.
 
 Crucially, a single assistant message carrying several `Agent` calls **still runs
-them in parallel**: the strip removes only the detached/polled *background* mode,
-not within-message concurrency. So the review stays parallel-within-a-message;
-only the "dispatch-then-yield" death is closed. The cost of piste (a) is that
-review becomes sequential *across* messages — the trade Prime ratified
-(2026-10-01) as the minimal, safe-direction change.
+them in parallel**: the rewrite removes only the detached/polled *background*
+mode, not within-message concurrency. So the review stays
+parallel-within-a-message; only the "dispatch-then-yield" death is closed. The
+cost of piste (a) is that review becomes sequential *across* messages — the trade
+Prime ratified (2026-10-01) as the minimal, safe-direction change.
 
 Why not make `_merge_stream` keep the session open until background tasks finish
 (piste b)? It is more faithful to interactive mode, but strictly riskier: the
 wait must be bounded and "what counts as still-in-flight" defined. Forcing the
-dispatch blocking is the smaller, provably-terminating change.
+dispatch foreground is the smaller, provably-terminating change.
 
 ## This is a harness-behavior correction, not an admission change
 
@@ -82,34 +99,45 @@ byte-identical; `tier1.py` is unmodified; `is_tier1_auto_approve`,
 `is_tier3_dangerous`, `TIER3_PATTERNS`, egress, and `_denial_is_terminal` are
 untouched. So the MPC gate suffices; no admission signature is required. The
 harness-behavior point: **a detached background dispatch cannot outlive a headless
-session, so the reached hook forces it blocking.**
+session, so the reached hook forces `run_in_background=False` — it does NOT strip
+the key, because removing it requests the CLI's background default.**
 
 ## Proving it: rewrite ⊥ effect-verification
 
 Prime required the *rewrite* and the *invariant* to be two separate assertions,
 never the same one:
 
-- **Rewrite-test** (`test_cpp267_run_in_background_is_stripped_when_truthy`,
-  `..._absent_or_falsy_passes_through_unchanged`): the rewrite logic
-  (`_maybe_strip_run_in_background`) drops a truthy `run_in_background` and leaves
-  absent/`False`/falsy untouched, without mutating the input.
-- **Invariant-test**
+- **Rewrite-test** (`test_cpp267_run_in_background_is_forced_false_when_truthy`,
+  `test_cpp267_absent_run_in_background_is_forced_false`,
+  `test_cpp267_already_false_is_noop`): the rewrite logic
+  (`_force_foreground_dispatch`) sets `run_in_background` to literal `False`
+  (present, not removed) for a truthy value AND for an absent key, no-ops on an
+  already-`False` dispatch, and does not mutate the input.
+- **AC3 RED/GREEN invariant-test**
+  (`test_cpp267_invariant_red_on_strip_green_on_force_false`): Prime's invariant
+  *no background task survives session end in headless*, encoded by a model of the
+  CLI gate (`run_in_background !== false`). It is **RED on cpp#269's strip** — the
+  stripped dispatch has an absent key, which the CLI reads as the background
+  default, so the invariant is violated — and **GREEN after fix267b** forces the
+  key present and `False`.
+- **Invariant-test (SDK path)**
   (`test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_request`):
-  the invariant that governs the lethality — *in headless, no detached background
-  task outlives the session* — asserted at the level that governs it: **after the
-  reached hook, no `Agent` dispatch the pilot forwards carries
-  `run_in_background: true`**. Reachability is proven through the SDK's own hook
-  path — `Query._handle_control_request` with a `hook_callback`
-  `SDKControlRequest`, exactly as the cpp#263 reachability test — **not** a direct
-  call to the hook function (a green direct call attests the function, not the
-  path the CLI drives; that is the flaw that failed the cpp#257 first gate).
+  the invariant asserted on **CLI semantics** — after the reached hook, the
+  forwarded `updatedInput` carries `run_in_background` **present and `=== False`**
+  (the one value the CLI gate accepts as foreground; the behavioral contract is
+  that the Agent result returns only at subagent END). Reachability is proven
+  through the SDK's own hook path — `Query._handle_control_request` with a
+  `hook_callback` `SDKControlRequest`, exactly as the cpp#263 reachability test —
+  **not** a direct call to the hook function (a green direct call attests the
+  function, not the path the CLI drives; that is the flaw that failed the cpp#257
+  first gate).
 - **Combined-test**
   (`test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch`): the
-  exact `624656b1` shape (`model: sonnet` + `run_in_background: true` on a 1M
-  session), driven through the SDK path — the single forwarded `updatedInput` has
-  **both** the `model` override dropped and `run_in_background` stripped, **both**
-  audit events fire, and no `permissionDecision` is added (cpp#263 model-inherit
-  stays intact).
+  exact `624656b1` / `bb9163e1` shape (`model: sonnet` + `run_in_background: true`
+  on a 1M session), driven through the SDK path — the single forwarded
+  `updatedInput` has **both** the `model` override dropped and `run_in_background`
+  forced present-and-`False`, **both** audit events fire, and no
+  `permissionDecision` is added (cpp#263 model-inherit stays intact).
 
 ## Why This Matters
 
@@ -150,11 +178,11 @@ if model_rewrite is not None:
     audit.emit("review_degraded", {"reason": "agent_dispatch_model_inherit", ...})
 
 bg_source = rewritten if rewritten is not None else tool_input
-bg_rewrite = _maybe_strip_run_in_background(bg_source)             # cpp#267
-if bg_rewrite is not None:
-    rewritten = bg_rewrite
+bg_rewrite = _force_foreground_dispatch(bg_source)                # cpp#267/fix267b
+if bg_rewrite is not None:   # fired when truthy OR absent; no-op only if already False
+    rewritten = bg_rewrite   # rewritten["run_in_background"] is False (present)
     audit.emit("review_degraded",
-               {"reason": "agent_dispatch_run_in_background_stripped", ...})
+               {"reason": "agent_dispatch_forced_foreground", ...})
 
 return {} if rewritten is None else {
     "hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": rewritten}

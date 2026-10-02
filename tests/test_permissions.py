@@ -4386,7 +4386,10 @@ def test_cpp257_pre_tool_use_hook_leaves_larger_or_equal_override_untouched(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The reached hook does nothing (empty output, no admission touch, no audit)
-    for a same-or-larger override — proving it is not a blanket Agent rewriter."""
+    for a same-or-larger override — proving the MODEL rewrite is not a blanket
+    Agent rewriter. The dispatch is already-foreground (``run_in_background:
+    False``) so the cpp#267 force-foreground rewrite also no-ops, isolating the
+    model axis: a truly untouched dispatch returns empty output."""
     import json as _json
 
     from claude_agent_sdk._internal.query import Query
@@ -4414,8 +4417,13 @@ def test_cpp257_pre_tool_use_hook_leaves_larger_or_equal_override_untouched(
             "input": {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Agent",
-                # Same window as the session → not strictly smaller → untouched.
-                "tool_input": {"subagent_type": "general-purpose", "model": "claude-opus-5[1m]"},
+                # Same window as the session → not strictly smaller → model
+                # untouched; already-foreground → cpp#267 also no-ops.
+                "tool_input": {
+                    "subagent_type": "general-purpose",
+                    "model": "claude-opus-5[1m]",
+                    "run_in_background": False,
+                },
                 "tool_use_id": "toolu_cpp257b",
                 "session_id": "s",
                 "transcript_path": "/tmp/t.jsonl",
@@ -4434,41 +4442,63 @@ def test_cpp257_pre_tool_use_hook_leaves_larger_or_equal_override_untouched(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# cpp#267 — the PreToolUse Agent hook ALSO strips run_in_background.
+# cpp#267 (fix267b) — the PreToolUse Agent hook FORCES run_in_background=False.
 #
 # A detached background dispatch cannot outlive a headless session: a pilot that
 # dispatches reviewers with `run_in_background: true` then yields its turn ends
 # the session (SDK ResultMessage), and the background agents die with it — review
 # lost, no PR, PIPELINE_INCOMPLETE (founding incident 624656b1). The same reached
-# PreToolUse hook as cpp#257/263 now forces every dispatch blocking.
+# PreToolUse hook as cpp#257/263 now forces every dispatch foreground.
 #
-# Prime requires rewrite ⊥ effect-verification: the REWRITE-test (the hook strips
-# run_in_background) and the INVARIANT-test (no detached background task outlives
-# the session) are SEPARATE, not the same assertion. The invariant is proven at
-# the level that governs it — after the hook, no Agent dispatch the pilot forwards
-# carries `run_in_background: true` — and reachability is proven through the SDK's
-# OWN hook path (`Query._handle_control_request` with a `hook_callback` control
-# request), NOT a direct call to the hook function.
+# WHY FORCE, NOT STRIP (cpp#269 was inoperant). The embedded CLI runs Agents in
+# the background BY DEFAULT and gates foreground on `run_in_background !== false`.
+# cpp#269 REMOVED the key — but an absent key requests the default = STILL
+# BACKGROUND, so the lethality survived (2nd pilot bb9163e1 / mika#2627 died the
+# same death after #269: strip fired, Agent returned in 11-26 ms, session ended
+# "waiting on them"). The fix forces the key PRESENT and literally `False`.
+#
+# Prime requires rewrite ⊥ effect-verification: the REWRITE-test (the hook forces
+# run_in_background=False) and the INVARIANT-test (no detached background task
+# outlives the session) are SEPARATE, not the same assertion. The invariant is
+# proven at the level that governs it — after the hook, every Agent dispatch the
+# pilot forwards carries `run_in_background === false` — and reachability is
+# proven through the SDK's OWN hook path (`Query._handle_control_request` with a
+# `hook_callback` control request), NOT a direct call to the hook function.
 # ════════════════════════════════════════════════════════════════════════════
 
-from claude_pilot.permissions import _maybe_strip_run_in_background  # noqa: E402
-
-# ── REWRITE-test: the hook's rewrite logic strips a truthy run_in_background ──
+from claude_pilot.permissions import _force_foreground_dispatch  # noqa: E402
 
 
-def test_cpp267_run_in_background_is_stripped_when_truthy() -> None:
-    """REWRITE-test (cpp#267): a present-and-truthy ``run_in_background`` is
-    removed; every other dispatch field is preserved and the input is not
-    mutated."""
+def _dispatch_is_background(tool_input: dict) -> bool:
+    """Model the embedded CLI's foreground gate: a dispatch runs in the
+    BACKGROUND (so a detached task outlives a headless session end) unless
+    ``run_in_background`` is literally ``False``. The CLI test is
+    ``run_in_background !== false``, so an ABSENT key (the default) and any truthy
+    value are both background; only literal ``False`` is foreground. This is the
+    exact semantics cpp#269's strip (which left the key ABSENT) got wrong.
+    """
+    return tool_input.get("run_in_background") is not False
+
+
+# ── REWRITE-test: the hook forces run_in_background=False (present, literal) ──
+
+
+def test_cpp267_run_in_background_is_forced_false_when_truthy() -> None:
+    """REWRITE-test (cpp#267/fix267b): a present-and-truthy ``run_in_background``
+    is forced to literal ``False`` (PRESENT, not removed); every other dispatch
+    field is preserved and the input is not mutated."""
     tool_input = {
         "description": "Code review",
         "subagent_type": "general-purpose",
         "run_in_background": True,
         "prompt": "review this diff",
     }
-    rewritten = _maybe_strip_run_in_background(tool_input)
-    assert rewritten is not None, "a truthy run_in_background must be stripped"
-    assert "run_in_background" not in rewritten, "the background flag must be dropped"
+    rewritten = _force_foreground_dispatch(tool_input)
+    assert rewritten is not None, "a truthy run_in_background must be forced False"
+    # fix267b: the key is PRESENT and literally False — NOT stripped. Removing it
+    # (cpp#269) requested the CLI background default and was inoperant.
+    assert "run_in_background" in rewritten, "the key must stay PRESENT (not stripped)"
+    assert rewritten["run_in_background"] is False
     assert rewritten["description"] == "Code review"
     assert rewritten["subagent_type"] == "general-purpose"
     assert rewritten["prompt"] == "review this diff"
@@ -4476,14 +4506,73 @@ def test_cpp267_run_in_background_is_stripped_when_truthy() -> None:
     assert tool_input["run_in_background"] is True
 
 
-def test_cpp267_run_in_background_absent_or_falsy_passes_through_unchanged() -> None:
-    """The strip is tight: absent, ``False``, or any falsy value → no rewrite
-    (the dispatch is already blocking)."""
-    assert _maybe_strip_run_in_background({"description": "x"}) is None
-    assert _maybe_strip_run_in_background({"run_in_background": False}) is None
-    assert _maybe_strip_run_in_background({"run_in_background": None}) is None
-    assert _maybe_strip_run_in_background({"run_in_background": 0}) is None
-    assert _maybe_strip_run_in_background({"run_in_background": ""}) is None
+def test_cpp267_absent_run_in_background_is_forced_false() -> None:
+    """fix267b (vs cpp#269): an ABSENT ``run_in_background`` is background in the
+    CLI (the default), so it MUST be rewritten to literal ``False`` — not left
+    alone. This is exactly the case cpp#269's strip got wrong."""
+    tool_input = {"description": "x", "subagent_type": "general-purpose"}
+    rewritten = _force_foreground_dispatch(tool_input)
+    assert rewritten is not None, "an absent key is the background default → force False"
+    assert rewritten["run_in_background"] is False
+    # also any non-False falsy value (None/0/"") is background → forced False
+    assert _force_foreground_dispatch({"run_in_background": None})["run_in_background"] is False
+    assert _force_foreground_dispatch({"run_in_background": 0})["run_in_background"] is False
+    assert _force_foreground_dispatch({"run_in_background": ""})["run_in_background"] is False
+
+
+def test_cpp267_already_false_is_noop() -> None:
+    """Only a dispatch already literally ``False`` (already foreground) is left
+    untouched — no rewrite, no audit churn."""
+    assert _force_foreground_dispatch({"run_in_background": False}) is None
+
+
+# ── AC3 (Prime's invariant, VU ROUGE): RED on #269's strip, GREEN on force-False ─
+
+
+def test_cpp267_invariant_red_on_strip_green_on_force_false() -> None:
+    """AC3 — Prime's invariant ``no background task survives session end in
+    headless`` must FAIL on cpp#269's code and PASS after fix267b.
+
+    The invariant is encoded by :func:`_dispatch_is_background`, which models the
+    embedded CLI's ``run_in_background !== false`` foreground gate: anything other
+    than literal ``False`` (absent OR truthy) runs in the background and so
+    outlives a headless session.
+
+    RED-before, simulated: cpp#269 STRIPPED the key (``pop``). We reproduce that
+    exact pre-fix behavior on the founding-incident dispatch and show the
+    invariant is VIOLATED — the stripped dispatch has an ABSENT key, which the CLI
+    reads as the background default, so a detached task still outlives the
+    session. GREEN-after: fix267b forces the key PRESENT and ``False``, and the
+    invariant holds.
+    """
+    original = {
+        "description": "ce-code-review reviewer",
+        "subagent_type": "general-purpose",
+        "run_in_background": True,
+        "prompt": "review this diff",
+    }
+
+    # RED — simulate cpp#269's STRIP (remove the key). The pre-fix hook did
+    # exactly `rewritten.pop("run_in_background", None)`.
+    pre_fix_stripped = dict(original)
+    pre_fix_stripped.pop("run_in_background", None)
+    assert "run_in_background" not in pre_fix_stripped
+    # The invariant FAILS on the strip: absent key == CLI background default, so
+    # the detached task outlives the headless session. (This assertion is RED if
+    # you (wrongly) expect the strip to have fixed the lethality.)
+    assert _dispatch_is_background(pre_fix_stripped) is True, (
+        "cpp#269 inoperant: stripping the key leaves it ABSENT == the CLI "
+        "background default == the detached task still outlives the session"
+    )
+
+    # GREEN — fix267b FORCES the key present and literally False.
+    post_fix = _force_foreground_dispatch(original)
+    assert post_fix is not None
+    assert post_fix["run_in_background"] is False
+    assert _dispatch_is_background(post_fix) is False, (
+        "fix267b: run_in_background === false is the one value the CLI gate "
+        "accepts as foreground, so the dispatch no longer outlives the session"
+    )
 
 
 # ── INVARIANT-test: no background dispatch survives session end (SDK path) ────
@@ -4494,11 +4583,20 @@ def test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_reque
 ) -> None:
     """INVARIANT PROOF (cpp#267) — SEPARATE from the rewrite-test above.
 
-    The invariant that actually governs the lethality is: *in headless, no
-    detached background task outlives the session*. Asserted at the level that
-    governs it — after the reached PreToolUse hook, NO ``Agent`` dispatch the
-    pilot forwards carries ``run_in_background: true`` — so there is no detached
-    task left in flight for session close to orphan.
+    AC2 — the assertion is on CLI SEMANTICS, not key presence: the rewritten
+    ``updatedInput`` carries ``run_in_background`` PRESENT and ``=== False`` —
+    exactly the one value the embedded CLI's ``run_in_background !== false`` gate
+    accepts as foreground. The behavioral contract is that, with this input, the
+    Agent tool result returns only at the subagent's END (blocking); the
+    input-level proof of that contract is ``run_in_background is False``. (cpp#269
+    stripped the key, leaving it ABSENT == the CLI background default == still
+    orphaned; fix267b forces it present and False.)
+
+    The invariant that governs the lethality is: *in headless, no detached
+    background task outlives the session*. Asserted at the level that governs it —
+    after the reached PreToolUse hook, every ``Agent`` dispatch the pilot forwards
+    runs foreground — so there is no detached task left in flight for session
+    close to orphan.
 
     Reachability is proven through the SDK's OWN hook-dispatch entrypoint
     (``Query._handle_control_request`` with a ``hook_callback``
@@ -4564,14 +4662,22 @@ def test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_reque
     assert hook_specific["hookEventName"] == "PreToolUse"
 
     updated = hook_specific["updatedInput"]
-    # THE INVARIANT: the forwarded dispatch is blocking — no detached task is left
-    # in flight for session close to orphan.
-    assert updated.get("run_in_background") in (None, False), (
-        "no Agent dispatch forwarded by the pilot may carry a truthy "
-        "run_in_background — a detached background task must not outlive a "
-        "headless session"
+    # AC2 — CLI SEMANTICS, not key presence: run_in_background is PRESENT and
+    # literally False (the one value the CLI's `!== false` gate reads as
+    # foreground). cpp#269 stripped the key — absent == background default ==
+    # inoperant — so a present-and-False assertion is exactly what distinguishes
+    # the fix from the regression.
+    assert "run_in_background" in updated, (
+        "fix267b: the key must be PRESENT (cpp#269 stripped it, leaving the CLI "
+        "background default in force)"
     )
-    assert "run_in_background" not in updated
+    assert updated["run_in_background"] is False, (
+        "the forwarded dispatch runs foreground (run_in_background === false) — "
+        "a detached background task must not outlive a headless session; the "
+        "behavioral contract is the Agent result returns only at subagent END"
+    )
+    # The modeled CLI gate agrees the dispatch is foreground.
+    assert _dispatch_is_background(updated) is False
     # The dispatch still runs; only the detached/polled mode was removed.
     assert updated["subagent_type"] == "general-purpose"
     assert updated["description"] == "ce-code-review reviewer"
@@ -4581,10 +4687,10 @@ def test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_reque
     assert "permissionDecision" not in hook_specific
     assert "decision" not in frame["response"]["response"]
 
-    # The strip is mechanically auditable (cpp#267 AC2 / Prime control (i)).
+    # The rewrite is mechanically auditable (cpp#267 AC2 / Prime control (i)).
     stderr = capsys.readouterr().err
     assert permissions_module.audit.AUDIT_TAG in stderr
-    assert "agent_dispatch_run_in_background_stripped" in stderr
+    assert "agent_dispatch_forced_foreground" in stderr
     assert "pre_tool_use_hook" in stderr
 
 
@@ -4594,12 +4700,13 @@ def test_cpp267_invariant_no_background_dispatch_forwarded_via_sdk_control_reque
 def test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Both cpp#263 (model inherit) and cpp#267 (background strip) apply to ONE
-    dispatch — the exact 624656b1 shape (forced sonnet + run_in_background on a
-    1M session). Driven through the SDK hook path; asserts the single forwarded
-    ``updatedInput`` has BOTH the model override dropped AND run_in_background
-    stripped, that BOTH audit events fired, and that no ``permissionDecision`` is
-    added (cpp#263 model-inherit stays intact)."""
+    """Both cpp#263 (model inherit) and cpp#267/fix267b (force foreground) apply
+    to ONE dispatch — the 624656b1 / bb9163e1 shape (forced sonnet +
+    run_in_background on a 1M session). Driven through the SDK hook path; asserts
+    the single forwarded ``updatedInput`` has BOTH the model override dropped AND
+    run_in_background forced present-and-False, that BOTH audit events fired, and
+    that no ``permissionDecision`` is added (cpp#263 model-inherit stays
+    intact)."""
     import json as _json
 
     from claude_agent_sdk._internal.query import Query
@@ -4651,7 +4758,11 @@ def test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch(
     updated = hook_specific["updatedInput"]
     # BOTH rewrites landed in the one forwarded input.
     assert "model" not in updated, "cpp#263: the smaller-window override must be dropped"
-    assert "run_in_background" not in updated, "cpp#267: the background flag must be stripped"
+    assert updated["run_in_background"] is False, (
+        "cpp#267/fix267b: run_in_background forced PRESENT and literally False "
+        "(not stripped — an absent key is the CLI background default)"
+    )
+    assert _dispatch_is_background(updated) is False
     assert updated["subagent_type"] == "general-purpose"
     assert updated["description"] == "Code reuse review"
     assert updated["prompt"] == "review this diff"
@@ -4663,4 +4774,4 @@ def test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch(
     # BOTH audit events fired — each rewrite is independently auditable.
     stderr = capsys.readouterr().err
     assert "agent_dispatch_model_inherit" in stderr, "cpp#263 model-inherit audit intact"
-    assert "agent_dispatch_run_in_background_stripped" in stderr, "cpp#267 strip audited"
+    assert "agent_dispatch_forced_foreground" in stderr, "cpp#267 force-foreground audited"
