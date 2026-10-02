@@ -185,8 +185,26 @@ _EVAL_COMMAND_POSITION_RE: re.Pattern[str] = re.compile(
 )
 
 
+# cpp#278: the handful of TIER3 entries the model-facing hint names as TERMINAL
+# forms (`DENIED_BASH_PATTERNS_HINT`) are hoisted to named constants here so the
+# `_TERMINAL_FORM_REGISTRY` (below the lethality tuples) can reference the EXACT
+# pattern objects the classifier uses — the hint stays derived from this source
+# list, not a hand-copied mirror, and a drift-guard test can prove each named
+# form really sits in the lethality verb set. Hoisting changes nothing at
+# runtime: `TIER3_PATTERNS` holds the same compiled objects in the same order,
+# so admission (`is_tier3_dangerous`) is byte-identical.
+_RM_RF_PATTERN = re.compile(r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b")   # rm -rf, rm -fr, rm -rfi
+_SED_I_SHORT_PATTERN = re.compile(r"\bsed\s+(-\w*i|-i\w*)\b")  # sed -i
+_BASH_C_PATTERN = re.compile(r"\bbash\s+-c\b")
+_SH_C_PATTERN = re.compile(r"\bsh\s+-c\b")
+# The generic bare `>`/`>>` catch-all: the ONE TIER3 entry that names a FILE
+# TARGET (not a proven-danger verb), so it is excluded from the lethality verb
+# set and its lethality is decided instead by the cwd-aware destination veto —
+# terminal only when the redirect target is proven to escape the worktree.
+_GENERIC_REDIRECT_PATTERN = re.compile(r"(?<!<)>{1,2}(?!\(|&[\d-])")  # > or >> (not process sub, not fd-manipulation)
+
 TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b"),           # rm -rf, rm -fr, rm -rfi
+    _RM_RF_PATTERN,                                         # rm -rf, rm -fr, rm -rfi
     re.compile(r"git\s+push\s+.*--force\b"),                # git push --force
     re.compile(r"git\s+push\s+.*-\w*f\b"),                  # git push -f
     re.compile(r"git\s+push\s+\S+\s+(main|master)\b"),      # git push origin main/master
@@ -195,10 +213,10 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bDROP\s+TABLE\b", re.IGNORECASE),
     re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE),
     re.compile(r"\bcargo\s+publish\b"),
-    re.compile(r"\bsed\s+(-\w*i|-i\w*)\b"),                 # sed -i
+    _SED_I_SHORT_PATTERN,                                   # sed -i
     re.compile(r"\bgh\s+label\s+(delete|edit)\b"),
-    re.compile(r"\bbash\s+-c\b"),
-    re.compile(r"\bsh\s+-c\b"),
+    _BASH_C_PATTERN,
+    _SH_C_PATTERN,
     # cpp#235: admission adopts the same command-position `eval` definition as
     # lethality (shared object above). `cargo test --test eval <name>` /
     # `node --eval` / `--test=eval` are no longer flagged (the word is a test
@@ -228,7 +246,7 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     # See mika#946 (resolution of mika#938 F5 sentinel divergence).
     re.compile(r"<\("),                                     # <(...)
     re.compile(r">\("),                                     # >(...)
-    re.compile(r"(?<!<)>{1,2}(?!\(|&[\d-])"),               # > or >> (not process sub, not fd-manipulation)
+    _GENERIC_REDIRECT_PATTERN,                              # > or >> (not process sub, not fd-manipulation)
 )
 
 
@@ -360,6 +378,104 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
             *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
             *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
         )
+    )
+
+
+# ── cpp#278: terminal-form registry — the single derivation the hint and its ──
+# drift-guard test both consume (mika#2634).
+#
+# Three pilots were killed in 24 h (93bac846, c722b251, debf318f) by an ad-hoc
+# "shell probe": each wanted to OBSERVE a shell/git behaviour (a captured stderr,
+# a git state, a redirect) and ran a script instead of writing a test. The
+# model-facing hint (`DENIED_BASH_PATTERNS_HINT`, below) already named the refused
+# patterns, but did NOT say which ones also END THE SESSION (no retry, no
+# recovery) rather than merely returning an adaptable `tool_result` error — nor
+# what to reach for instead. Per-ticket instructions after each death do not
+# scale; the fix says it once, in the one place every pilot reads.
+#
+# This registry is that single source of truth. Each entry pairs the one-line
+# "refused AND the session ends" bullet the hint renders with the EXACT tier1
+# pattern object the classifier matches on, so the prose cannot drift from
+# enforcement. `_render_terminal_forms_block` BUILDS the hint's terminal-forms
+# section from it; `tests/test_tier1.py::test_terminal_forms_hint_derived_from_
+# tier1` asserts, for every entry, that its pattern really is in the lethality
+# set (a verb in `_matches_proven_dangerous_lethality_verb`'s union, or the one
+# generic-redirect entry the destination veto governs) AND that its bullet is
+# present in the rendered hint — so a terminal form added here (or a pattern that
+# silently leaves the lethality set) forces a hint/registry update or the suite
+# goes red.
+#
+# `is_verb_lethal=True` → proven-danger regardless of target (the verb itself is
+# fatal: `bash -c`, `sh -c`, `eval`, `sed -i`, `rm -rf`). `False` → the generic
+# `>`/`>>` redirect, fatal ONLY when its target is proven out-of-worktree by the
+# cwd-aware destination veto (hence it is excluded from the lethality verb set).
+_TERMINAL_FORM_REGISTRY: tuple[tuple[str, re.Pattern[str], bool], ...] = (
+    (
+        "- `bash -c` / `sh -c` (running a script through a shell) — refused AND "
+        "the session ENDS.",
+        _BASH_C_PATTERN,
+        True,
+    ),
+    (
+        "  `sh -c` shares this fate; `xargs sh -c …` / `find … -exec sh -c …` do too.",
+        _SH_C_PATTERN,
+        True,
+    ),
+    (
+        "- `eval` (evaluating a constructed string at command position) — refused "
+        "AND the session ENDS.",
+        _EVAL_COMMAND_POSITION_RE,
+        True,
+    ),
+    (
+        "- `sed -i` whose in-place target is outside this worktree — refused AND "
+        "the session ENDS.",
+        _SED_I_SHORT_PATTERN,
+        True,
+    ),
+    (
+        "- a shell redirect (`>`, `>>`) whose target is outside this worktree — "
+        "refused AND the session ENDS.",
+        _GENERIC_REDIRECT_PATTERN,
+        False,
+    ),
+    (
+        "- `rm -rf` on an unresolved or uncontained target — refused AND the "
+        "session ENDS.",
+        _RM_RF_PATTERN,
+        True,
+    ),
+)
+
+
+def _render_terminal_forms_block() -> str:
+    """The TERMINAL-forms section of ``DENIED_BASH_PATTERNS_HINT``, rendered from
+    ``_TERMINAL_FORM_REGISTRY`` so the hint text is DERIVED from the same tier1
+    pattern objects the classifier enforces (cpp#278). Bullets are emitted in
+    registry order; see the registry's block comment for the drift guard."""
+    bullets = "\n".join(entry[0] for entry in _TERMINAL_FORM_REGISTRY)
+    return (
+        "## These forms do not just get refused — they END the session\n"
+        "\n"
+        "Most denials come back as a `tool_result` error you can adapt to and "
+        "retry.\n"
+        "The forms below do NOT: the refusal ALSO ends the session immediately, "
+        "with\n"
+        "no retry and no recovery. Never reach for one:\n"
+        "\n"
+        f"{bullets}\n"
+        "\n"
+        "To OBSERVE a shell or git behaviour (a captured stderr, a git state, a\n"
+        "redirect outcome), do NOT script it — a one-shot probe that trips a form\n"
+        "above kills the run. Instead, WRITE A TEST in the repo's own harness (the\n"
+        "durable, re-runnable way to pin a behaviour), OR run ONE simple command "
+        "per\n"
+        "call with LITERAL relative paths under `.pilot-scratch/` — no variable, no\n"
+        "`;`/`&&`, and no sub-shell.\n"
+        "\n"
+        "Never `pip install` on the host (it clobbers the shared launcher); to "
+        "test,\n"
+        "use `uv run` in a clone or a throwaway venv."
     )
 
 
@@ -2403,7 +2519,13 @@ def is_tier3_dangerous_for_lethality(command: str) -> bool:
 # prompt-only reduces the RATE of the stochastic ScheduleWakeup trap (n=1 of 139
 # sessions, mika#1652), it does not close the class; the disallowed_tools guard in
 # agent.py is best-effort defense-in-depth on top.
-DENIED_BASH_PATTERNS_HINT: str = """\
+# cpp#278: the hint LEADS with the terminal-forms block (rendered from
+# `_TERMINAL_FORM_REGISTRY`, so it stays derived from tier1's own lists), because
+# a terminal form kills the session outright — the costliest failure a pilot can
+# hit — and the substitute ("write a test, not a shell probe") belongs where
+# every pilot reads it. The denied-but-recoverable patterns and the headless
+# no-op tools follow.
+_DENIED_BASH_PATTERNS_HINT_BODY: str = """\
 ## Bash commands the policy DENIES — use the native tool instead
 
 The permission policy DENIES the Bash patterns below. A denied call costs you a
@@ -2458,6 +2580,14 @@ strand your session:
   (e.g. Explore) and want to "wait" for its result, you do NOT need to: the
   subagent runs synchronously and its result is already available to you in the
   next turn. Just continue your work in-turn — read the result and proceed."""
+
+
+# The model-facing payload appended to the system prompt by agent.py. Composed
+# (cpp#278) as: the TERMINAL-forms block (derived from `_TERMINAL_FORM_REGISTRY`)
+# + the denied-but-recoverable / headless-no-op body.
+DENIED_BASH_PATTERNS_HINT: str = (
+    _render_terminal_forms_block() + "\n\n" + _DENIED_BASH_PATTERNS_HINT_BODY
+)
 
 
 # ── Safe Bash command checking ───────────────────────────────────────────────

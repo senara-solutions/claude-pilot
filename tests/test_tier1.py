@@ -19,6 +19,9 @@ import pytest
 from claude_pilot import permissions as permissions_module
 from claude_pilot.tier1 import (
     _EVAL_COMMAND_POSITION_RE,
+    _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+    _SED_INPLACE_LONG_FORM_FOR_LETHALITY,
+    _TERMINAL_FORM_REGISTRY,
     _TIER3_VERB_PATTERNS_FOR_LETHALITY,
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
@@ -41,9 +44,11 @@ from claude_pilot.tier1 import (
     _last_real_assignment_value,
     _mask_quoted_operator_chars_for_admission,
     _mask_quoted_redirect_chars,
+    _matches_proven_dangerous_lethality_verb,
     _mktemp_scratch_variable_names,
     _quote_spans,
     _redirect_targets,
+    _render_terminal_forms_block,
     _rm_segment_operands,
     _sed_i_suffix_is_benign_backup,
     _sed_i_target_operands,
@@ -2586,6 +2591,93 @@ def test_1409_hint_claims_match_enforcement() -> None:
     ]
     for cmd in approved:
         assert is_safe_bash_command(cmd) is True, f"expected approved but DENIED: {cmd}"
+
+
+# ── cpp#278: terminal-forms hint is DERIVED from tier1's lethality lists ──────
+
+
+def _lethality_verb_set() -> set:
+    """The exact set of pattern objects `_matches_proven_dangerous_lethality_verb`
+    consults — the verbs that are session-fatal regardless of target."""
+    return {
+        *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
+        *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+        *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
+    }
+
+
+def test_terminal_forms_hint_derived_from_tier1() -> None:
+    """cpp#278 AC3 drift guard. Every terminal form the hint names is DERIVED
+    from `_TERMINAL_FORM_REGISTRY`, which references the EXACT tier1 pattern
+    objects the classifier enforces. For each registry entry this asserts:
+
+      * its bullet is actually present in the rendered hint (so dropping a form
+        from the hint, or renaming its bullet, goes red), and
+      * its pattern really is in the lethality set it claims — a verb in
+        `_matches_proven_dangerous_lethality_verb`'s union (`is_verb_lethal`
+        True), or the ONE generic-redirect entry the destination veto governs,
+        which is deliberately EXCLUDED from the verb set (False).
+
+    So a terminal verb added to tier1's lethality list but not surfaced here, or
+    a hint form whose pattern silently leaves the lethality set, forces a
+    registry/hint update or the suite fails. The hint lives next to the lists
+    (tier1.py) to prevent drift; this makes the promise falsifiable."""
+    hint = DENIED_BASH_PATTERNS_HINT
+    verb_set = _lethality_verb_set()
+    assert _TERMINAL_FORM_REGISTRY, "registry must not be empty"
+    for bullet, pattern, is_verb_lethal in _TERMINAL_FORM_REGISTRY:
+        assert bullet in hint, f"terminal form not named in hint: {bullet!r}"
+        assert bullet in _render_terminal_forms_block()
+        if is_verb_lethal:
+            assert pattern in verb_set, (
+                f"registry claims verb-lethal but pattern not in lethality set: "
+                f"{pattern.pattern!r}"
+            )
+        else:
+            # The generic redirect: lethal via the cwd-aware destination veto,
+            # NOT the verb set — it is the one TIER3 entry excluded from it.
+            assert pattern is TIER3_PATTERNS[-1]
+            assert pattern not in verb_set
+
+
+def test_terminal_forms_registry_names_the_ac1_forms() -> None:
+    """cpp#278 AC1: the registry names exactly the five terminal forms the ticket
+    enumerates — `bash -c`/`sh -c`, `eval`, `sed -i`, an out-of-worktree redirect,
+    `rm -rf`. Pins the curated set so a silent removal is caught."""
+    tokens = {bullet for bullet, _p, _v in _TERMINAL_FORM_REGISTRY}
+    blob = "\n".join(tokens)
+    for needed in ("`bash -c`", "`sh -c`", "`eval`", "`sed -i`", "redirect", "`rm -rf`"):
+        assert needed in blob, f"AC1 terminal form missing from registry: {needed}"
+
+
+def test_terminal_forms_verb_patterns_are_actually_lethal() -> None:
+    """cpp#278: belt-and-braces on the drift guard — each verb-lethal registry
+    pattern, fed a representative command, is proven terminal by the real
+    lethality predicate `_matches_proven_dangerous_lethality_verb` (so the
+    pattern membership check above cannot pass against a dead pattern)."""
+    samples = {
+        "bash -c": "bash -c 'id'",
+        "sh -c": "sh -c 'id'",
+        "eval": "eval \"$(cmd)\"",
+        "sed -i": "sed -i 's/a/b/' /etc/passwd",
+        "rm -rf": "rm -rf /etc",
+    }
+    for bullet, _pattern, is_verb_lethal in _TERMINAL_FORM_REGISTRY:
+        if not is_verb_lethal:
+            continue
+        key = next(k for k in samples if f"`{k}`" in bullet)
+        assert _matches_proven_dangerous_lethality_verb(samples[key]) is True, bullet
+
+
+def test_terminal_forms_hint_gives_the_write_a_test_substitute() -> None:
+    """cpp#278 AC2: the hint gives the substitute for observing a shell/git
+    behaviour — write a test, or one simple command per call with literal
+    relative paths under `.pilot-scratch/`, no variable / `;`/`&&` / sub-shell."""
+    hint = DENIED_BASH_PATTERNS_HINT
+    assert "WRITE A TEST" in hint
+    assert ".pilot-scratch/" in hint
+    assert "no variable" in hint
+    assert "sub-shell" in hint
 
 
 # ── Quote-aware compound split ───────────────────────────────────────────────
