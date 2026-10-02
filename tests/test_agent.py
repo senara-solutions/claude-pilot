@@ -665,6 +665,61 @@ async def test_59_run_agent_disallows_schedulewakeup_tool(
     assert "ScheduleWakeup" in disallowed
 
 
+# ── cpp#267 (fix267b): CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is the primary switch ─
+
+
+@pytest.mark.asyncio
+async def test_cpp267_run_agent_sets_disable_background_tasks_env_in_cli_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRIMARY switch: run_agent hands the SDK an `env` that sets
+    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, so the bundled CLI subprocess removes
+    `run_in_background` from the Agent/Bash tool schema and the model cannot
+    detach a dispatch that a headless session close would orphan.
+
+    This asserts on the REAL mechanism — the `env` dict the pilot passes to
+    `ClaudeAgentOptions` — not a mock of the CLI. The SDK's subprocess transport
+    merges `options.env` into the launched CLI's effective environment (it builds
+    the child env as `{**os.environ, ..., **options.env, ...}`), so a key present
+    here is present in the CLI subprocess.
+    """
+    captured: dict[str, Any] = {}
+
+    def _capturing_options(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()  # FakeClient ignores options
+
+    monkeypatch.setattr(agent_module, "ClaudeAgentOptions", _capturing_options)
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    env = captured.get("env")
+    assert isinstance(env, dict), f"expected an env dict on the options, got {env!r}"
+    # The gate (`a.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`) is a raw truthy read, so
+    # the value must be non-empty; "1" is Claude Code's canonical truthy form.
+    assert env.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") == "1"
+    # A COPY of the module constant, not the shared object: a later env merge (by
+    # the SDK or a future caller) must not corrupt the constant across sessions.
+    assert env is not agent_module._CLI_FORCE_FOREGROUND_ENV
+
+
+def test_cpp267_force_foreground_env_constant_is_canonical_truthy() -> None:
+    """The module constant pins the exact var and a non-empty (canonical "1")
+    value — the embedded CLI gate is a raw truthy read of the string, and an
+    empty string would NOT disable background tasks."""
+    env = agent_module._CLI_FORCE_FOREGROUND_ENV
+    assert env == {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+    assert env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "value must be truthy"
+
+
 # ── cpp#55: _extract_session_id / _extract_model read SystemMessage.data ──────
 
 

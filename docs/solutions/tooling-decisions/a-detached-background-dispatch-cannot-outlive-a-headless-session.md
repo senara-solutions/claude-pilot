@@ -1,5 +1,5 @@
 ---
-title: "A detached background dispatch cannot outlive a headless session — the reached PreToolUse hook forces run_in_background=False (does NOT strip it) so every dispatch runs foreground"
+title: "A detached background dispatch cannot outlive a headless session — CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 in the CLI env removes run_in_background from the tool schema (primary switch); the reached PreToolUse hook forces run_in_background=False as belt-and-suspenders"
 date: 2026-10-02
 problem_type: tooling_decision
 track: knowledge
@@ -10,7 +10,9 @@ tags:
   - agent-dispatch
   - subagent
   - run_in_background
+  - CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
   - headless
+  - env-var
   - pre-tool-use-hook
   - ce-code-review
   - pipeline-incomplete
@@ -57,7 +59,62 @@ session ended on "waiting on them". Dispatches with no key were background too.
 **`strip ≠ foreground`**: the only value the CLI reads as foreground is the key
 present and literally `False`.
 
-## The fix — FORCE `run_in_background=False` on the already-reached hook
+## The real switch — `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` in the CLI env
+
+Forcing `run_in_background=False` in the dispatch's `updatedInput` is **still not
+guaranteed**: a resume spawn of mika#2630 saw its agents go async *despite* an
+explicit `run_in_background: false` — the harness can re-interpret an input
+rewrite. The **real** switch of the embedded CLI is an environment variable, read
+directly by the CLI's own background-tasks gate:
+
+```js
+function Bl(){ return d3().backgroundTasksDisabled
+                      || a.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS }
+// the Agent (and Bash) tool schema is built conditionally on it:
+n = Bl()||k8() ? e.omit({run_in_background:!0}) : e
+```
+
+With `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` set, `run_in_background` **disappears
+from the Agent and Bash tool schemas entirely**: the model cannot request it, and
+the CLI injects system-prompt text telling the model only synchronous subagents
+exist. This is the CLI's **own gate**, not an input rewrite it can reinterpret —
+so it is the **primary** switch, and the hook below is kept only as
+belt-and-suspenders. The symbols `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` and
+`backgroundTasksDisabled` are both present in the pinned bundled CLI binary
+(`claude_agent_sdk/_bundled/claude`).
+
+- **Value**: `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`. The gate is a raw truthy
+  read of the string (any non-empty value triggers it); `"1"` is Claude Code's
+  canonical truthy form for a `DISABLE_*` flag. An empty string would **not**
+  disable it.
+- **Mechanism**: passed via the SDK's own **`ClaudeAgentOptions.env`** option (in
+  `agent.py`, constant `_CLI_FORCE_FOREGROUND_ENV`), **not** `os.environ`. The
+  SDK's subprocess transport builds the CLI's effective env as
+  `{**os.environ_without_CLAUDECODE, "CLAUDE_CODE_ENTRYPOINT": ..., **options.env,
+  "CLAUDE_AGENT_SDK_VERSION": ...}` (`_internal/transport/subprocess_cli.py`), so
+  an `options.env` entry lands in the launched CLI subprocess's environment and
+  wins over any inherited value. Passed as a `dict(...)` copy so the shared
+  module constant is never mutated.
+- **Scope**: this touches **only** the CLI/agent subprocess the SDK launches. It
+  is unrelated to `transport.py`'s *relay* subprocess, whose `scrub_env` is a
+  different code path and is left untouched (and the var name matches no scrub
+  pattern anyway).
+
+### Side effect (assessed, accepted)
+
+The same variable also removes `run_in_background` from the **Bash** tool schema.
+A pilot can therefore no longer detach a long-running Bash command (e.g. a build)
+into the background: it now runs **foreground** and must finish within the turn,
+subject to the Bash tool's own timeout. This is **consistent with the fix's
+intent** — a headless pilot that detaches a Bash build and yields suffers the
+*same* death as the Agent case (the detached job is orphaned when the session
+closes on `ResultMessage`), so foreground Bash is the correct headless behaviour,
+not a regression. The one implication to flag: a genuinely long build that
+previously relied on background Bash must now fit the foreground turn/timeout
+budget. Whether any real pilot depends essentially on background Bash (Monitor,
+etc.) is an MPC transcript-replay check at the gate.
+
+## The belt — FORCE `run_in_background=False` on the already-reached hook
 
 claude-pilot already registers a `PreToolUse` hook on `Agent|Task`
 (`create_subagent_model_inherit_hook`, cpp#257/263) that rewrites the forwarded
@@ -93,20 +150,32 @@ dispatch foreground is the smaller, provably-terminating change.
 
 ## This is a harness-behavior correction, not an admission change
 
-The hook adds **no `permissionDecision`** — for either rewrite. It changes the
-dispatch's *input*, never whether the dispatch is *admitted*. Bash admission is
+Neither layer touches admission. The env var sets a CLI runtime flag; the hook
+adds **no `permissionDecision`** for either rewrite — it changes the dispatch's
+*input*, never whether the dispatch is *admitted*. Bash admission is
 byte-identical; `tier1.py` is unmodified; `is_tier1_auto_approve`,
 `is_tier3_dangerous`, `TIER3_PATTERNS`, egress, and `_denial_is_terminal` are
 untouched. So the MPC gate suffices; no admission signature is required. The
 harness-behavior point: **a detached background dispatch cannot outlive a headless
-session, so the reached hook forces `run_in_background=False` — it does NOT strip
-the key, because removing it requests the CLI's background default.**
+session, so the CLI env var removes `run_in_background` from the tool schema
+(primary) and the reached hook forces `run_in_background=False` (belt) — neither
+strips the key to request the CLI's background default, which was cpp#269's
+inoperant mistake.**
 
 ## Proving it: rewrite ⊥ effect-verification
 
 Prime required the *rewrite* and the *invariant* to be two separate assertions,
 never the same one:
 
+- **Env-presence test (primary switch)**
+  (`test_cpp267_run_agent_sets_disable_background_tasks_env_in_cli_subprocess`,
+  `test_cpp267_force_foreground_env_constant_is_canonical_truthy`): asserts on the
+  **real mechanism** — the `env` dict the pilot hands to `ClaudeAgentOptions`
+  (captured through a spy `ClaudeAgentOptions`, not a CLI mock) carries
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, a non-empty (truthy) value, and is a
+  **copy** of the module constant (not the shared object). Because the SDK merges
+  `options.env` into the launched CLI's effective environment, a key present here
+  is present in the CLI subprocess.
 - **Rewrite-test** (`test_cpp267_run_in_background_is_forced_false_when_truthy`,
   `test_cpp267_absent_run_in_background_is_forced_false`,
   `test_cpp267_already_false_is_noop`): the rewrite logic
