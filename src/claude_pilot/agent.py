@@ -69,6 +69,56 @@ SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"}
 # instead of a crash.
 _SDK_MAX_BUFFER_SIZE_BYTES = 10 * 1024 * 1024
 
+# ── cpp#267 (fix267b): the PRIMARY switch forcing subagent dispatches foreground ─
+#
+# The `_force_foreground_dispatch` PreToolUse hook (permissions.py) rewrites a
+# dispatch's `run_in_background` to literal `False`. That is the BELT. It is not
+# guaranteed on its own: a resume spawn of mika#2630 saw its agents go async
+# despite an explicit `run_in_background: false` in the dispatch input (the
+# harness can re-interpret an input rewrite). The REAL switch of the embedded
+# CLI is this environment variable.
+#
+# In the bundled CLI (`claude_agent_sdk/_bundled/claude`), the background-tasks
+# gate reads the env var directly:
+#     function Bl(){ return d3().backgroundTasksDisabled
+#                           || a.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS }
+# and the Agent tool's own schema is built conditionally on it:
+#     n = Bl()||k8() ? e.omit({run_in_background:!0}) : e
+# so when the var is set, `run_in_background` DISAPPEARS from the Agent (and
+# Bash) tool schema entirely: the model cannot request it, and the CLI injects
+# system-prompt text telling the model only synchronous subagents exist. This is
+# the CLI's own gate, not an input rewrite the CLI can reinterpret — which is
+# why it is the primary switch and the hook is kept only as belt-and-suspenders.
+# Confirmed present in the pinned bundled CLI binary (grep: the symbol
+# `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` and `backgroundTasksDisabled` are both
+# in it).
+#
+# VALUE: the gate is a raw truthy read of the env string, so any non-empty value
+# triggers it; `"1"` is Claude Code's canonical truthy form for a DISABLE_* flag.
+#
+# MECHANISM: passed via `ClaudeAgentOptions.env`, NOT `os.environ`. The SDK's
+# subprocess transport builds the CLI's env as
+# `{**os.environ_without_CLAUDECODE, "CLAUDE_CODE_ENTRYPOINT": ..., **options.env, ...}`
+# (`_internal/transport/subprocess_cli.py`), so an entry in `options.env` lands
+# in the bundled CLI subprocess's effective environment and wins over any
+# inherited value. This touches ONLY the CLI/agent subprocess the SDK launches;
+# it is unrelated to `transport.py`'s relay subprocess (whose `scrub_env` is a
+# different code path and is deliberately left alone).
+#
+# SIDE EFFECT (documented, accepted): the same var also removes
+# `run_in_background` from the BASH tool schema. A pilot can therefore no longer
+# detach a long-running Bash command into the background — such a command now
+# runs foreground and must finish within the turn (and is subject to the Bash
+# tool's own timeout). This is CONSISTENT with the fix's intent: a headless
+# pilot that detaches a Bash build and yields suffers the SAME death as the Agent
+# case (the detached job is orphaned when the session closes on ResultMessage).
+# Foreground Bash is the correct headless behaviour. The one implication to note
+# is that a genuinely long build that previously relied on background Bash must
+# now fit the foreground turn/timeout budget. See the plan's Side-effects section.
+_CLI_FORCE_FOREGROUND_ENV: dict[str, str] = {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+}
+
 # ── cpp#168: the idle watchdog can be starved by claude-pilot's OWN I/O ─────
 #
 # The ticket's leading hypothesis was a synchronous blocking read inside the
@@ -482,6 +532,16 @@ async def _run_agent_inner(
         # raising it narrows the failure population rather than removing the
         # guardrail that fix exists for.
         max_buffer_size=_SDK_MAX_BUFFER_SIZE_BYTES,
+        # cpp#267 (fix267b): the PRIMARY switch forcing subagent (and Bash)
+        # dispatches foreground. Setting CLAUDE_CODE_DISABLE_BACKGROUND_TASKS in
+        # the CLI subprocess's env removes `run_in_background` from the Agent/Bash
+        # tool schema entirely, so a headless dispatch cannot detach and be
+        # orphaned by session close. Passed via the SDK's own `env` option (merged
+        # into the CLI subprocess env, winning over inherited values); the
+        # `_force_foreground_dispatch` hook below stays as belt-and-suspenders.
+        # dict() so the module constant is never mutated by the SDK. See
+        # `_CLI_FORCE_FOREGROUND_ENV` above for the gate quote and the side effect.
+        env=dict(_CLI_FORCE_FOREGROUND_ENV),
         **_sdk_guardrail_kwargs(config),
     )
 

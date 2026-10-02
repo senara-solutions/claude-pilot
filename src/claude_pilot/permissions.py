@@ -2064,11 +2064,11 @@ def _maybe_inherit_session_model(
     return rewritten
 
 
-def _maybe_strip_run_in_background(
+def _force_foreground_dispatch(
     tool_input: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """cpp#267: remove a truthy ``run_in_background`` from a subagent dispatch so
-    that in headless every dispatch becomes blocking.
+    """cpp#267 (fix267b): FORCE ``run_in_background = False`` EXPLICITLY on a
+    subagent dispatch so that in headless every dispatch runs in the foreground.
 
     In headless, a detached background dispatch cannot outlive the session. A
     pilot that dispatches its reviewers with ``run_in_background: true`` and then
@@ -2081,21 +2081,35 @@ def _maybe_strip_run_in_background(
     is lethal. The prompt-level prohibition in ``ce-code-review`` does not hold —
     the correction belongs at the substrate.
 
-    Stripping the flag forces the dispatch blocking, so it completes within the
-    turn and cannot be orphaned by session close. A single assistant message that
-    carries several ``Agent`` calls still runs them in PARALLEL (the strip only
-    removes the detached/polled background mode, not within-message concurrency),
-    so the review stays parallel-within-a-message; only the dispatch-then-yield
-    death is closed.
+    WHY FORCE, NOT STRIP (cpp#269 was inoperant). In the embedded CLI, "Agents
+    run in the background BY DEFAULT" and the foreground gate is
+    ``run_in_background !== false``. cpp#269 REMOVED the key — but removing the
+    key requests the default, which is STILL BACKGROUND, so the lethality
+    survived (a 2nd pilot, ``bb9163e1`` / mika#2627, died the same death AFTER
+    #269 deployed: its stderr shows the strip firing, yet each ``Agent`` returned
+    in 11-26 ms and the session ended "waiting on them"). The key must therefore
+    be PRESENT and literally ``False`` — the one value the CLI's ``!== false``
+    gate accepts as foreground. An ABSENT key is background too, so it must be
+    rewritten, not left alone.
 
-    Returns a NEW ``tool_input`` dict with ``run_in_background`` removed when it
-    is present and truthy; returns ``None`` (leave the dispatch untouched) when
-    the key is absent or falsy.
+    Forcing the flag to ``False`` makes the dispatch blocking, so it completes
+    within the turn and cannot be orphaned by session close. A single assistant
+    message that carries several ``Agent`` calls still runs them in PARALLEL (the
+    rewrite only removes the detached/polled background mode, not within-message
+    concurrency), so the review stays parallel-within-a-message; only the
+    dispatch-then-yield death is closed.
+
+    Returns a NEW ``tool_input`` dict with ``run_in_background`` set to literal
+    ``False`` whenever the dispatch's current value is anything OTHER than literal
+    ``False`` — truthy OR absent, because in the embedded CLI an absent key
+    requests the background default. Returns ``None`` (leave the dispatch
+    untouched) only when ``run_in_background`` is ALREADY literally ``False``
+    (already foreground → no-op).
     """
-    if not tool_input.get("run_in_background"):
-        return None  # absent or falsy → nothing to strip
+    if tool_input.get("run_in_background") is False:
+        return None  # already explicitly foreground → no rewrite
     rewritten = dict(tool_input)
-    rewritten.pop("run_in_background", None)
+    rewritten["run_in_background"] = False
     return rewritten
 
 
@@ -2139,12 +2153,15 @@ def create_subagent_model_inherit_hook(
     * cpp#257/263 — when the dispatch forces a strictly-smaller-context-window
       ``model`` than the session's, drop the ``model`` override so it inherits the
       session model (``review_degraded`` reason ``agent_dispatch_model_inherit``).
-    * cpp#267 — when the dispatch carries a truthy ``run_in_background``, strip it
-      so that in headless the dispatch is blocking and cannot be orphaned by
-      session close (``review_degraded`` reason
-      ``agent_dispatch_run_in_background_stripped``). A detached background
-      dispatch cannot outlive a headless session, so the reached hook forces it
-      blocking; within-message parallelism is untouched.
+    * cpp#267 (fix267b) — FORCE ``run_in_background = False`` explicitly whenever
+      the dispatch's value is anything other than literal ``False`` (truthy OR
+      absent) so that in headless the dispatch runs foreground and cannot be
+      orphaned by session close (``review_degraded`` reason
+      ``agent_dispatch_forced_foreground``). A detached background dispatch cannot
+      outlive a headless session; the reached hook forces it foreground, within-
+      message parallelism untouched. cpp#269 STRIPPED the key and was inoperant —
+      removing the key requests the CLI's background default (the gate is
+      ``run_in_background !== false``), so the key must be present and ``False``.
 
     Returned callable matches the SDK ``HookCallback`` signature
     ``(input, tool_use_id, context) -> HookJSONOutput``. On a warranted rewrite
@@ -2197,17 +2214,21 @@ def create_subagent_model_inherit_hook(
                 },
             )
 
-        # (2) cpp#267 — strip a truthy ``run_in_background`` so a detached
-        # background dispatch cannot outlive a headless session. Compose on top of
-        # a model rewrite if one already happened, so both land in one input.
+        # (2) cpp#267 (fix267b) — FORCE ``run_in_background = False`` explicitly so
+        # a detached background dispatch cannot outlive a headless session.
+        # Removing the key (cpp#269) requested the CLI background default and was
+        # inoperant; the key must be present and literally ``False``. Fires when
+        # the value is truthy OR absent; no-op only when already ``False``.
+        # Compose on top of a model rewrite if one already happened, so both land
+        # in one input.
         bg_source = rewritten if rewritten is not None else tool_input
-        bg_rewrite = _maybe_strip_run_in_background(bg_source)
+        bg_rewrite = _force_foreground_dispatch(bg_source)
         if bg_rewrite is not None:
             rewritten = bg_rewrite
             audit.emit(
                 "review_degraded",
                 {
-                    "reason": "agent_dispatch_run_in_background_stripped",
+                    "reason": "agent_dispatch_forced_foreground",
                     "placement": "pre_tool_use_hook",
                     "tool_name": tool_name,
                     "task_id": task_id,
