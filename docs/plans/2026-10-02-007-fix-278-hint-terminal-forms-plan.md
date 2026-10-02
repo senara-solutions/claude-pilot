@@ -55,6 +55,14 @@ par appel** avec des chemins relatifs LITTÉRAUX sous `.pilot-scratch/` — **sa
 sans `;`/`&&`, sans sous-shell**. (Les carves cpp#272/#279 admettent désormais les
 littéraux `.pilot-scratch/<subpath>`, donc le substitut est réellement disponible.)
 
+Ligne de garde ajoutée (condition du gate MPC sur cpp#278, dernière ligne du bloc
+substitut) : « Never `pip install` on the host (it clobbers the shared launcher); to
+test, use `uv run` in a clone or a throwaway venv. » — un `pip install` hôte réécrit le
+lanceur `[console_scripts]` partagé (`~/.local/bin/claude-pilot`) et casse le launcher de
+prod. Texte de hint pur : advisory, PAS une entrée de `_TERMINAL_FORM_REGISTRY` (ce n'est
+pas un classifieur de forme terminale), donc sans effet sur admission/létalité ni sur le
+test garde-dérive centré-registre.
+
 ### AC3 — dérivé de `tier1.py`, garde-dérive
 
 `_TERMINAL_FORM_REGISTRY` (co-localisé avec les tuples de létalité, `tier1.py`) :
@@ -109,7 +117,9 @@ cpp#268/#272/#279, elle ne les remplace pas.
 - **Éteint** : le hint, en tête, nomme les 5 formes terminales (une ligne « refusé ET fin
   de session » chacune) et donne le substitut (« écris un test ; ou une commande simple
   par appel, chemins littéraux sous `.pilot-scratch/` »). Dit une fois, au seul endroit
-  que tous les pilotes lisent.
+  que tous les pilotes lisent. Une ligne de garde finale ajoute : jamais de `pip install`
+  hôte (il clobbe le lanceur partagé) — tester via `uv run` dans un clone ou un venv jetable
+  (condition du gate MPC ; texte advisory, admission/létalité inchangées).
 - **Vérif de sortie** : registre + builder + composition (`tier1.py`), test garde-dérive
   + 3 compagnons (`tests/test_tier1.py`) ; pytest 1730 vert (0 skip) ; ruff/mypy clean ;
   verify-pipeline GREEN ; digest admission+létalité IDENTIQUE avant/après (107 lignes,

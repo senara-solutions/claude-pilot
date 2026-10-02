@@ -471,7 +471,11 @@ def _render_terminal_forms_block() -> str:
         "durable, re-runnable way to pin a behaviour), OR run ONE simple command "
         "per\n"
         "call with LITERAL relative paths under `.pilot-scratch/` — no variable, no\n"
-        "`;`/`&&`, and no sub-shell."
+        "`;`/`&&`, and no sub-shell.\n"
+        "\n"
+        "Never `pip install` on the host (it clobbers the shared launcher); to "
+        "test,\n"
+        "use `uv run` in a clone or a throwaway venv."
     )
 
 

@@ -59,6 +59,13 @@ structural lethality carves (cpp#268/#272/#279), which are the real defense.
    command per call with LITERAL relative paths under `.pilot-scratch/` — no
    variable, no `;`/`&&`, no sub-shell. The cpp#272/#279 carves now admit
    `.pilot-scratch/<subpath>` literals, so that substitute is actually available.
+   A final guard line (MPC gate condition on cpp#278) closes the substitute block:
+   "Never `pip install` on the host (it clobbers the shared launcher); to test, use
+   `uv run` in a clone or a throwaway venv." A host `pip install` rewrites the shared
+   `[console_scripts]` launcher (`~/.local/bin/claude-pilot`) and breaks the
+   production entry point. It is pure hint text — advisory, NOT a
+   `_TERMINAL_FORM_REGISTRY` entry (it classifies no terminal form), so it leaves
+   admission/lethality and the registry-centric drift guard untouched.
 
 3. **Derive the hint from tier1's own lists — no drift.** A small registry,
    `_TERMINAL_FORM_REGISTRY`, co-located with the lethality tuples, pairs each
