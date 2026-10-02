@@ -115,8 +115,28 @@ _SDK_MAX_BUFFER_SIZE_BYTES = 10 * 1024 * 1024
 # Foreground Bash is the correct headless behaviour. The one implication to note
 # is that a genuinely long build that previously relied on background Bash must
 # now fit the foreground turn/timeout budget. See the plan's Side-effects section.
+#
+# BASH TIMEOUT CAP (cpp#267 follow-up, mika#2630): a direct consequence of the
+# side effect above. With background detach removed, a long build (e.g.
+# `cargo test --workspace`) that a pilot used to launch in the background now
+# runs FOREGROUND and is bounded by the Bash tool's timeout. In the pinned
+# bundled CLI the per-command timeout is clamped to a MAX cap:
+#     var OOo=120000, DOo=600000;   // default 2min, hard max 10min
+#     function Owe(e){ let n=e.BASH_DEFAULT_TIMEOUT_MS; ...; return OOo }
+#     function H5e(e){ let n=e.BASH_MAX_TIMEOUT_MS;
+#                      if(n){...; return Math.max(r,Owe(e))} return DOo }
+# so `BASH_MAX_TIMEOUT_MS` is the MAX cap (default read is `BASH_DEFAULT_TIMEOUT_MS`,
+# a separate symbol) and without it a foreground long build is capped at the
+# built-in 10-min (`DOo`) ceiling. We raise ONLY the max cap to 30 min so a long
+# explicit-timeout or default build can run to completion foreground; we leave the
+# default (`BASH_DEFAULT_TIMEOUT_MS`) untouched so short commands keep the 2-min
+# default. Both symbols confirmed present in the pinned bundled CLI binary
+# (grep: `BASH_MAX_TIMEOUT_MS` and `BASH_DEFAULT_TIMEOUT_MS`). Same env-delivery
+# mechanism as the DISABLE flag above (`ClaudeAgentOptions.env`).
 _CLI_FORCE_FOREGROUND_ENV: dict[str, str] = {
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    # 1_800_000 ms = 30 min. Raised max cap for foreground long builds (see above).
+    "BASH_MAX_TIMEOUT_MS": "1800000",
 }
 
 # ── cpp#168: the idle watchdog can be starved by claude-pilot's OWN I/O ─────

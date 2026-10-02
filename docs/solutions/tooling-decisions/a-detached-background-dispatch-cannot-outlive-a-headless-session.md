@@ -114,6 +114,22 @@ previously relied on background Bash must now fit the foreground turn/timeout
 budget. Whether any real pilot depends essentially on background Bash (Monitor,
 etc.) is an MPC transcript-replay check at the gate.
 
+**Follow-up — raised Bash timeout cap (cpp#267 follow-up, mika#2630).** The
+transcript-replay check found this foreground shift is real: 11/60 sessions had
+launched a long build (`cargo test --workspace` and the like) in the background,
+which now runs foreground. In the pinned bundled CLI the per-command timeout is
+clamped to a **max cap** (`BASH_MAX_TIMEOUT_MS`; the *default* read is the
+separate `BASH_DEFAULT_TIMEOUT_MS`), defaulting to the built-in 10-min ceiling —
+too short for a full workspace build. We therefore add `BASH_MAX_TIMEOUT_MS =
+1_800_000` (30 min) to the **same** `ClaudeAgentOptions.env`
+(`_CLI_FORCE_FOREGROUND_ENV`), raising only the max cap so a long
+explicit-timeout or default build can run foreground to completion; the default
+(`BASH_DEFAULT_TIMEOUT_MS`) is left untouched, so short commands keep the 2-min
+default. The var name was verified at source by grepping the bundled CLI binary —
+both `BASH_MAX_TIMEOUT_MS` (max, `Math.max(r, default)`) and
+`BASH_DEFAULT_TIMEOUT_MS` (default, falls back to 120 000 ms) are present, and
+the max-cap symbol is the one we raise.
+
 ## The belt — FORCE `run_in_background=False` on the already-reached hook
 
 claude-pilot already registers a `PreToolUse` hook on `Agent|Task`
