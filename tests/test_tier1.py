@@ -4257,19 +4257,25 @@ class TestCpp253SedInplaceSuffix:
             ("-ibak", "bak"),  # GNU: no dot required
             ("-ni.bak", ".bak"),  # cluster + suffix, split on the FIRST `i`
             ("-i.bak-2", ".bak-2"),
+            # cpp#274: GNU LONG in-place form. Bare long form carries no backup;
+            # the suffix is supplied ONLY after `=`.
+            ("--in-place", ""),
+            ("--in-place=.bak", ".bak"),
+            ("--in-place=.orig", ".orig"),
+            ("--in-place=", ""),  # explicit empty suffix after `=`
         ):
             assert _sed_inplace_suffix(tok) == suffix, tok
 
     def test_suffix_recognizer_rejects_non_inplace_and_wildcard(self) -> None:
         # `None` (not an in-place flag / fail-closed) for: no `i`, a `*` wildcard
-        # suffix (GNU projects the backup to an arbitrary path), a non-letter
-        # leading cluster, a `--`-long option, and the bare dash.
+        # suffix (GNU projects the backup to an arbitrary path, short OR long
+        # form), and the bare dash.
         for tok in (
             "-n",  # no `i`
             "-e",  # no `i`
             "-i.b*",  # `*` wildcard suffix → fail closed
             "-i/tmp/*",  # `*` wildcard suffix → fail closed
-            "--in-place",  # `--` long option (leading cluster not letters)
+            "--in-place=.b*",  # cpp#274: `*` wildcard in the long-form suffix
             "-",  # bare dash
             "src/x.rs",  # a file operand, not a flag
         ):
@@ -4381,6 +4387,73 @@ class TestCpp271SedSuffixDevnullIntersection:
         assert is_tier3_dangerous_for_lethality("sed -i.bak 's/a/b/' /dev/null") is True
         # The bare-`-i` /dev/null carve inside the classifier is unchanged.
         assert is_tier3_dangerous_for_lethality("sed -i 's/a/b/' /dev/null") is False
+
+
+class TestCpp274SedLongInPlaceForm:
+    """cpp#274 (SSC residue on the cpp#271 gate, MPC OK-conditional): the GNU
+    LONG in-place form — `sed --in-place` / `--in-place=SUFFIX` — joins the short
+    `-i`/`-i<SUFFIX>` form in BOTH directions. The long form was flagged by
+    NEITHER admission NOR lethality, so `sed --in-place … /etc/passwd` was a
+    policy default-deny (sed is not allow-listed) but NON-terminal, while the
+    short `sed -i.bak … /etc/passwd` was terminal — an inconsistency. The fix is
+    LETHALITY-ONLY: admission stays byte-identical (the long form is still absent
+    from `TIER3_PATTERNS`).
+    """
+
+    def test_long_form_is_tier3_dangerous_for_lethality(self) -> None:
+        # The lethality classifier now flags the long form (its long-form twin
+        # verb pattern) — mirroring the short entry, so an UNconfined target is
+        # terminal. ADMISSION is untouched (`is_tier3_dangerous` still False —
+        # proven in test_permissions.py's byte-identity test).
+        for cmd in (
+            "sed --in-place 's/a/b/' /etc/passwd",
+            "sed --in-place=.bak 's/a/b/' /etc/passwd",
+            "sed --in-place 's/a/b/' crates/x.rs",
+            "sed --in-place=.bak 's|a|XX|' /dev/null",
+        ):
+            assert is_tier3_dangerous_for_lethality(cmd) is True, cmd
+        # Admission classifier stays byte-identical: the long form is NOT in
+        # TIER3_PATTERNS.
+        assert is_tier3_dangerous("sed --in-place 's/a/b/' /etc/passwd") is False
+        assert is_tier3_dangerous("sed --in-place=.bak 's/a/b/' /etc/passwd") is False
+
+    def test_long_form_worktree_target_is_carved(
+        self, scratch_worktree: Path
+    ) -> None:
+        wt = str(scratch_worktree)
+        # POSITIVE: long form on a worktree target is survivable, exactly like
+        # the short `-i.bak` worktree carve (cpp#255).
+        assert (
+            sed_i_confined_to_worktree("sed --in-place 's/a/b/' src/x.rs", wt) is True
+        )
+        assert (
+            sed_i_confined_to_worktree("sed --in-place=.bak 's/a/b/' src/x.rs", wt)
+            is True
+        )
+
+    def test_long_form_sole_devnull_is_carved(self) -> None:
+        # POSITIVE: sole /dev/null target with a benign suffix is survivable for
+        # the long form too — the cpp#271 intersection extended (no cwd needed).
+        for cmd in (
+            "sed --in-place 's|a|XX|' /dev/null",
+            "sed --in-place=.bak 's|a|XX|' /dev/null",
+            "sed --in-place=.orig 's/a/b/' /dev/null",
+        ):
+            assert sed_i_confined_to_worktree(cmd, "/nonexistent") is True, cmd
+
+    def test_long_form_unconfined_stays_terminal(self) -> None:
+        # NEGATIVE: out-of-worktree target, `..` traversal, path-bearing suffix
+        # on sole /dev/null, and a chained danger all stay terminal (no cwd that
+        # could resolve them in).
+        for cmd in (
+            "sed --in-place 's/a/b/' /etc/passwd",
+            "sed --in-place=.bak 's/a/b/' /etc/passwd",
+            "sed --in-place 's/a/b/' ../../x",
+            "sed --in-place=/tmp/../etc/ 's|a|XX|' /dev/null",  # path-bearing suffix
+            "sed --in-place=.bak 's|a|XX|' /dev/null && rm -rf /etc",  # chained
+            "sed --in-place 's/a/b/' /dev/null /etc/passwd",  # mixed → not sole
+        ):
+            assert sed_i_confined_to_worktree(cmd, "/nonexistent") is False, cmd
 
 
 # ── ce-* /tmp scratch: uid token + same-command var tracing (mika#2562) ────────

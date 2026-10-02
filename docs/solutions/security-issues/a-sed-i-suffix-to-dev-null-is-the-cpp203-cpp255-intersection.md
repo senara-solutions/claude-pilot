@@ -6,7 +6,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: medium
-tags: [permissions, policy, bash, sed, sed-i, dev-null, inert-sink, backup-suffix, lethality, survivable-deny, worktree-containment, shlex, redirect-token, fail-closed, negative-control, claude-pilot-203, claude-pilot-253, claude-pilot-255, claude-pilot-271, mika-2624]
+tags: [permissions, policy, bash, sed, sed-i, sed-in-place-long-form, dev-null, inert-sink, backup-suffix, lethality, survivable-deny, admission-vs-lethality, worktree-containment, shlex, redirect-token, fail-closed, negative-control, claude-pilot-203, claude-pilot-253, claude-pilot-255, claude-pilot-271, claude-pilot-274, mika-2624]
 applies_when: "two lethality carves each cover one axis of the same operation (an inert target, and a flag's suffix forms) but neither covers the other axis's value, leaving the intersection terminal"
 ---
 
@@ -105,17 +105,44 @@ reusing `_sed_i_target_operands` and the sole-operand constraint verbatim. Addin
 a value to an existing axis is safer than forking a parallel classifier that can
 drift.
 
-## The one thing out of scope
+## The long `--in-place` form joins the short (cpp#274)
 
 The ticket lists `sed --in-place=/tmp/../etc/ … /dev/null` as a negative that
-must stay terminal. On HEAD it is ALREADY survivable — not via any `/dev/null`
-carve, but because the long `--in-place` form is not matched by `TIER3_PATTERNS`
-at all, so the whole command is never tier3-dangerous and `_denial_is_terminal`
-short-circuits. `_sed_inplace_suffix` does not recognize `--in-place` either, so
-this carve never touches it; its behaviour is unchanged by this fix. Making the
-long form terminal would require ADDING `--in-place` to the tier3 denylist — an
-ADMISSION change, outside cpp#271's lethality-only scope and its byte-identical
-invariant. Flagged to MPC as a separate question.
+must stay terminal, and SSC flagged a broader residue: `sed --in-place …
+/etc/passwd` and `sed --in-place=.bak … /etc/passwd` were REFUSED but NON
+terminal, while the short `sed -i.bak … /etc/passwd` was terminal. MPC ratified
+closing it here (cpp#271 gate, OK-conditional).
+
+The initial read ("making the long form terminal requires an admission change")
+was wrong, and the reconciliation is the load-bearing lesson. The deny on `sed
+--in-place … /etc/passwd` does NOT come from `TIER3_PATTERNS` — proven at source,
+`is_tier3_dangerous("sed --in-place … /etc/passwd")` is **False**. It comes from
+the policy allowlist's default-deny (sed is not allow-listed). Terminality,
+meanwhile, is decided by `is_tier3_dangerous_for_lethality`, NOT by
+`TIER3_PATTERNS` directly — and that lethality classifier has its own verb set
+(`_matches_proven_dangerous_lethality_verb`) that can be extended WITHOUT
+touching admission. So the long form joins the short in LETHALITY ONLY:
+
+1. **`_sed_inplace_suffix`** gains a cpp#274 branch recognizing `--in-place`
+   (empty suffix) and `--in-place=SUFFIX` (GNU supplies the long-form suffix only
+   after `=`). This threads through `_sed_i_target_operands` →
+   `sed_i_confined_to_worktree`, so the long form receives BOTH carves (sole
+   `/dev/null` survivable, worktree target survivable) exactly like `-i`/`-i<SUFFIX>`.
+2. **`_SED_INPLACE_LONG_FORM_FOR_LETHALITY`** (`\bsed\s+--in-place\b`) is the
+   long-form twin of the short `\bsed\s+(-\w*i|-i\w*)\b` entry, added to
+   `_matches_proven_dangerous_lethality_verb` — never to `TIER3_PATTERNS`. It
+   makes an UNconfined long-form target (`/etc/passwd`, a `..` traversal) terminal.
+
+Admission is byte-identical, proven: `is_tier3_dangerous` stays False for the
+long form (it is never added to the denylist), `is_tier1_auto_approve` and the
+policy are untouched, and the deny decision (which already stood via the
+allowlist) does not move — a before/after diff over 875 commands is empty. Only
+`_denial_is_terminal` flips, for exactly the four unconfined long-form shapes.
+
+The general lesson: terminality and admission are separate classifiers. A denial
+that stands via the policy allowlist can be made terminal by extending the
+LETHALITY verb set alone — it does not require touching `TIER3_PATTERNS`, and
+assuming it does conflates the refusal question with the lethality question.
 
 ## Negative controls (must stay terminal)
 
@@ -130,3 +157,15 @@ invariant. Flagged to MPC as a separate question.
 - `sed -i.bak 'y/a/b/' /dev/null` — non-substitution script, fail-closed.
 - `sed -i.bak 's/a/b/w /etc/x' /dev/null` — `w` write flag in the script, fail-closed.
 - `sed -i.bak 's|a|XX|' /dev/null && rm -rf /etc` — chained destructive verb.
+
+### cpp#274 long-form negatives (now terminal — VU ROUGE)
+
+- `sed --in-place 's/a/b/' /etc/passwd` — long form, out-of-worktree target.
+- `sed --in-place=.bak 's/a/b/' /etc/passwd` — long form with suffix, out of worktree.
+- `sed --in-place 's/a/b/' ../../x` — long form, `..` traversal.
+- `sed --in-place=/tmp/../etc/ 's|a|XX|' /dev/null` — long-form suffix carries `/`+`..` (write vector).
+
+### cpp#274 long-form positives (survivable, like the short form)
+
+- `sed --in-place 's/a/b/' crates/x.rs` — long form, worktree target (cpp#255 extended).
+- `sed --in-place=.bak 's|a|XX|' /dev/null` — long form, sole `/dev/null`, benign suffix (cpp#271 extended).

@@ -1076,6 +1076,73 @@ def test_cpp271_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+def test_cpp274_sed_long_in_place_form_joins_the_short(tmp_path: Path) -> None:
+    """cpp#274 (SSC residue on the cpp#271 gate, MPC OK-conditional): the GNU
+    LONG in-place form `sed --in-place` / `--in-place=SUFFIX` now behaves exactly
+    like the short `-i`/`-i<SUFFIX>` form in both directions.
+
+    VU-ROUGE (non-terminal on HEAD → terminal now): an out-of-worktree or
+    `..`-traversal target, and a path-bearing suffix on sole /dev/null.
+    POSITIVE (survivable, consistency with cpp#255/#271 extended to the long
+    form): a worktree target, and sole /dev/null with a benign suffix.
+    """
+    f = permissions_module._denial_is_terminal
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    (worktree / "crates").mkdir()
+    wt = str(worktree)
+
+    # VU-ROUGE — now TERMINAL (were non-terminal on HEAD).
+    for cmd in (
+        "sed --in-place 's/a/b/' /etc/passwd",
+        "sed --in-place=.bak 's/a/b/' /etc/passwd",
+        "sed --in-place 's/a/b/' ../../x",
+        "sed --in-place=/tmp/../etc/ 's|a|XX|' /dev/null",  # path-bearing suffix
+    ):
+        assert f("Bash", {"command": cmd}, wt) is True, cmd
+
+    # POSITIVE — survivable, like the short form's worktree + sole-/dev/null carves.
+    for cmd in (
+        "sed --in-place 's/a/b/' crates/x.rs",
+        "sed --in-place=.bak 's/a/b/' crates/x.rs",
+        "sed --in-place 's|a|XX|' /dev/null",
+        "sed --in-place=.bak 's|a|XX|' /dev/null",
+    ):
+        assert f("Bash", {"command": cmd}, wt) is False, cmd
+
+
+def test_cpp274_long_form_admission_is_byte_identical(tmp_path: Path) -> None:
+    """cpp#274 sovereign boundary: making the long form terminal is LETHALITY-ONLY.
+    `sed --in-place … /etc/passwd` was ALREADY a policy default-deny on HEAD (sed
+    is not allow-listed); `is_tier3_dangerous` is False for the long form and
+    STAYS False (the long form is never added to `TIER3_PATTERNS`), never
+    tier1-auto-approved, and the policy still default-denies it. Only
+    `_denial_is_terminal` flips terminal; end-to-end the handler returns a
+    non-terminal ``PermissionResultDeny``, never an allow.
+    """
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve, is_tier3_dangerous
+
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    policy = load_policy(_BUNDLED_POLICY)
+    for cmd in (
+        "sed --in-place 's/a/b/' /etc/passwd",
+        "sed --in-place=.bak 's/a/b/' /etc/passwd",
+    ):
+        # admission untouched: tier3 classifier still False, not auto-approved,
+        # policy still denies (the deny comes from the allowlist, not tier3).
+        assert is_tier3_dangerous(cmd) is False, cmd
+        assert is_tier1_auto_approve("Bash", {"command": cmd}, str(worktree)) is False
+        assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny", cmd
+        result = asyncio.run(
+            _bundled_handler(cwd=str(worktree))("Bash", {"command": cmd}, _mock_ctx())
+        )
+        assert isinstance(result, PermissionResultDeny)
+        # terminal now (it flipped) — but still a deny, never an allow.
+        assert result.interrupt is True
+
+
 def test_cpp213_admission_is_byte_identical_only_lethality_flips(
     tmp_path: Path,
 ) -> None:
