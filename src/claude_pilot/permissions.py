@@ -8,6 +8,7 @@ response to SDK PermissionResult.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import (
@@ -2414,8 +2415,14 @@ def create_permission_handler(
                     # marker). Calling `_denial_is_terminal` separately per
                     # consumer would let them drift on a future edit.
                     chain_terminal = _denial_is_terminal(tool_name, tool_input, cwd)
+                    # cpp#262: name the chain-unsafe segment + carry the command
+                    # hash on the log line. Read-only diagnostic — the decision
+                    # above (`chain_terminal`, the veto) is already taken.
+                    _disp, _diag = _bash_deny_log_fields(
+                        policy, tool_name, tool_input, cwd, detail
+                    )
                     log_policy_deny(
-                        tool_name, detail, pd.rule_id, terminal=chain_terminal
+                        tool_name, _disp, pd.rule_id, terminal=chain_terminal, **_diag
                     )
                     if guardrails is not None:
                         guardrails.note_policy_deny(
@@ -2459,7 +2466,13 @@ def create_permission_handler(
                         # breach is a kill we asked for and must never earn
                         # another turn, not even via an earlier harmless
                         # refusal that armed the survivable marker.
-                        log_policy_deny(tool_name, detail, pd.rule_id, terminal=True)
+                        # cpp#262: name the destination-vetoed segment + hash.
+                        _disp, _diag = _bash_deny_log_fields(
+                            policy, tool_name, tool_input, cwd, detail
+                        )
+                        log_policy_deny(
+                            tool_name, _disp, pd.rule_id, terminal=True, **_diag
+                        )
                         if guardrails is not None:
                             guardrails.note_policy_deny(
                                 f"{tool_name}: {detail}", terminal=True
@@ -2525,7 +2538,13 @@ def create_permission_handler(
                         _veto_reason = _destination_veto_reason(_cmd, cwd)
                         if _veto_reason is not None:
                             deny_message = _veto_reason
-                log_policy_deny(tool_name, detail, pd.rule_id, terminal=deny_terminal)
+                # cpp#262: name the refused segment + hash on the deny line.
+                _disp, _diag = _bash_deny_log_fields(
+                    policy, tool_name, tool_input, cwd, detail
+                )
+                log_policy_deny(
+                    tool_name, _disp, pd.rule_id, terminal=deny_terminal, **_diag
+                )
                 # cpp#151 B0/B1: mark the session when — and only when — the
                 # refusal is survivable. This is the site the ticket's eight
                 # dead sessions came through: a read-only composed command
@@ -2571,7 +2590,11 @@ def create_permission_handler(
             # `mika notify` per call — so making it non-terminal would turn a
             # retry loop into an operator-notification flood on the very channel
             # that compensates for non-lethal denials elsewhere.
-            log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
+            # cpp#262: Bash escalate gets the same one-line segment/hash fields.
+            _disp, _diag = _bash_deny_log_fields(
+                policy, tool_name, tool_input, cwd, detail
+            )
+            log_policy_deny_with_notify(tool_name, _disp, pd.rule_id, **_diag)
             # cpp#151 B0: terminal by design (unchanged by cpp#128 — an escalate
             # exists to put a human in the loop). Recorded on the wire, and arms
             # `terminal_policy_deny` so no resume is offered for the rest of the
@@ -2931,3 +2954,139 @@ def _summarize_input(tool_name: str, tool_input: dict[str, Any]) -> str:
         suffix = f" {_scrub_secrets(str(args)[:100])}" if args else ""
         return f"{skill}{suffix}"
     return _scrub_secrets(json.dumps(tool_input, default=str)[:150])
+
+
+# ── cpp#262: `[policy:deny]` observability (OBSERVABILITY ONLY, NO decision) ───
+#
+# For a multi-line script the old `[policy:deny]` line showed only the START of
+# the command and never named WHICH compound segment was refused. Raw newlines
+# in `detail` meant a `grep '[policy:deny]'` returned only line 1, and the
+# `rule_id` + `(terminal)/(non-terminal)` suffix landed on a LATER physical line
+# or were lost to the 200-char truncation. 57ad9d76's "15 `cd <WT> && …`
+# refusals" were multi-line scripts whose faulty line was elsewhere (`make`,
+# `cargo run`, `env`, `sed -i`); the misleading log nearly signed an admission
+# extension (cpp#256). The helpers below name the first offending segment and
+# its cause, and carry a hash of the full command, so the line is self-contained
+# and recoverable. EVERYTHING here is a read: it is consumed ONLY by the log
+# string and never feeds back into any gate, so admission and lethality stay
+# byte-identical (AC5). The decision of WHICH segment broke the chain is taken
+# by `_bash_allow_is_chain_safe` / the per-segment tier3 / `_destination_veto_
+# reason` exactly as before; this re-walk only REPORTS it.
+
+
+class _RefusedSegment(NamedTuple):
+    """The first refused compound segment of a Bash command + why (cpp#262).
+
+    ``offender_count`` is how many segments are offenders (``>= 1``); the log
+    names the first and, when it is ``> 1``, how many in total. Purely
+    diagnostic. (Not named ``count`` — that would shadow ``tuple.count``.)
+    """
+
+    segment: str
+    cause: str
+    offender_count: int
+
+
+def _segment_refusal_cause(policy: Policy, segment: str, cwd: str) -> str | None:
+    """Why this single compound segment would be refused, or ``None`` when it is
+    not itself an offender (cpp#262 diagnostic — read-only).
+
+    Priority mirrors the decision path's own order: the containment boundary
+    first (`_destination_veto_reason`), then tier3 danger, then the policy
+    verdict. A segment that is tier1-safe, or an independently clean (non-tier3)
+    policy-allow, is NOT an offender — exactly the two "continue" cases of
+    `_bash_allow_is_chain_safe`'s per-segment loop — and returns ``None``.
+    """
+    if not segment:
+        return None
+    dest = _destination_veto_reason(segment, cwd)
+    if dest is not None:
+        return f"dest-veto: {dest}"
+    if is_tier3_dangerous(segment):
+        return "tier3"
+    # Mirror `_bash_allow_is_chain_safe`'s per-segment "safe" tests verbatim
+    # (tier1-safe, or a clean non-tier3 policy allow) so a segment this helper
+    # calls an offender is exactly one that path would have refused.
+    if is_safe_bash_command(segment):
+        return None
+    pd = evaluate(policy, "Bash", {"command": segment})
+    if pd.decision == "allow" and not is_tier3_dangerous(segment):
+        return None
+    if pd.decision == "allow":
+        # allow but tier3 — already caught above; defensive.
+        return "tier3"
+    return "default-deny" if pd.rule_id is None else "chain-unsafe"
+
+
+def _diagnose_refused_bash(
+    policy: Policy, command: str, cwd: str
+) -> _RefusedSegment | None:
+    """Re-walk the compound segments of a refused Bash command and name the
+    FIRST offender + its cause (cpp#262 AC2). Read-only: consulted ONLY by the
+    log line, so it cannot change admission or lethality (AC5)."""
+    if not isinstance(command, str) or not command:
+        return None
+    offenders: list[tuple[str, str]] = []
+    for seg in _split_compound_command(command):
+        cause = _segment_refusal_cause(policy, seg, cwd)
+        if cause is not None:
+            offenders.append((seg, cause))
+    if not offenders:
+        return None
+    first_seg, first_cause = offenders[0]
+    return _RefusedSegment(
+        segment=first_seg, cause=first_cause, offender_count=len(offenders)
+    )
+
+
+def _command_hash(command: str) -> str:
+    """Short sha256 prefix of the FULL (untruncated) command (cpp#262 AC4), so a
+    truncated `[policy:deny]` line can be re-joined to the transcript
+    (`~/.mika/data/pilot-transcripts/<id>.jsonl`) without timestamp heuristics.
+    """
+    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+def _bash_deny_display_detail(
+    base_detail: str, command: str, diag: _RefusedSegment | None
+) -> str:
+    """The command excerpt shown on the deny line. Normally the same 200-char
+    window as every other log (`base_detail`); but when the faulty segment falls
+    OUTSIDE that window, show the segment preferentially (cpp#262 AC3) so
+    truncation never drops what was actually refused."""
+    if diag is None:
+        return base_detail
+    seg_scrubbed = _scrub_secrets(diag.segment)
+    if seg_scrubbed and seg_scrubbed not in base_detail:
+        return seg_scrubbed[:200]
+    return base_detail
+
+
+def _bash_deny_log_fields(
+    policy: Policy,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    cwd: str,
+    detail: str,
+) -> tuple[str, dict[str, Any]]:
+    """`(display_detail, kwargs)` for `log_policy_deny` / `_with_notify` on a
+    Bash refusal (cpp#262): a possibly segment-preferring excerpt plus the
+    diagnostic + command hash. For non-Bash, or on any diagnostic failure,
+    returns `(detail, {})` — the diagnostic can NEVER crash or alter the deny
+    path (observability must not touch the decision, AC5)."""
+    if tool_name != "Bash":
+        return detail, {}
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command:
+        return detail, {}
+    try:
+        diag = _diagnose_refused_bash(policy, command, cwd)
+        display = _bash_deny_display_detail(detail, command, diag)
+        fields: dict[str, Any] = {"cmd_hash": _command_hash(command)}
+        if diag is not None:
+            fields["segment"] = diag.segment
+            fields["cause"] = diag.cause
+            fields["segment_count"] = diag.offender_count
+        return display, fields
+    except Exception:  # pragma: no cover — diagnostic must never affect the deny
+        return detail, {}

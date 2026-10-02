@@ -10,6 +10,8 @@ for events that are equivalent to TIER 1.5 in
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -5147,3 +5149,212 @@ def test_cpp267_model_inherit_and_background_strip_combine_on_one_dispatch(
     stderr = capsys.readouterr().err
     assert "agent_dispatch_model_inherit" in stderr, "cpp#263 model-inherit audit intact"
     assert "agent_dispatch_forced_foreground" in stderr, "cpp#267 force-foreground audited"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#262 — `[policy:deny]` observability (OBSERVABILITY ONLY, no decision)
+#
+# The multi-line defect: the old deny line showed only the START of a script and
+# never named which segment was refused; raw newlines meant `grep '[policy:deny]'`
+# returned only line 1, and the rule_id + lethality suffix landed on a later,
+# untagged physical line. A misleading log nearly signed cpp#256. These tests
+# pin the fix: ONE physical line, the named segment + cause, a recoverable hash
+# — and prove the gate matrix is byte-identical (only the log STRING changes).
+# ────────────────────────────────────────────────────────────────────────────
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(line: str) -> str:
+    return _ANSI_RE.sub("", line)
+
+
+def _chain_deny_policy(tmp_path: Path) -> Path:
+    """`cd` is allow-listed; everything else default-denies — so a `cd …; make …`
+    compound reaches the chain-veto / default-deny deny path."""
+    p = tmp_path / "chain.yaml"
+    p.write_text(
+        "rules:\n"
+        "  - id: bash-cd\n"
+        "    tool: Bash\n"
+        '    pattern: "^cd "\n'
+        "    decision: allow\n"
+        "    reason: cd\n"
+        "default:\n"
+        "  decision: deny\n"
+        "  reason: no matching policy rule — denied by default\n"
+    )
+    return p
+
+
+def test_262_multiline_deny_is_one_physical_line_naming_the_segment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1+AC2+AC4: a multi-line script whose faulty segment is line 3 renders as
+    ONE physical line that NAMES the refused segment + cause and carries a hash
+    of the full command."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        guardrails=None,
+        policy_path=_chain_deny_policy(tmp_path),
+    )
+    command = f"cd {worktree}\necho building\nmake build\ncargo run"
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    line = _plain(lines[0])
+    # AC1 — ONE physical line: no raw newline survived into `detail`.
+    assert "\n" not in line
+    assert "⏎" in line, line
+    # AC2 — the faulty segment (line 3) is named, with a cause and a count.
+    assert 'segment="make build"' in line, line
+    assert "cause=default-deny" in line, line
+    assert "(1 of 2)" in line, line  # make build + cargo run both offend
+    # AC4 — a recoverable hash of the FULL command.
+    want = hashlib.sha256(command.encode()).hexdigest()[:12]
+    assert f"sha256:{want}" in line, line
+    # The prefix + lethality suffix (cpp#151) are preserved for dispatch-lib.
+    assert "[policy:deny] Bash: " in line, line
+    assert line.rstrip().endswith("(non-terminal)") or line.rstrip().endswith(
+        "(terminal)"
+    )
+
+
+def test_262_truncation_shows_the_faulty_segment_preferentially(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC3: when the faulty segment falls OUTSIDE the 200-char window, it is shown
+    preferentially over the (allow-listed) script start that would otherwise fill
+    the window."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        guardrails=None,
+        policy_path=_chain_deny_policy(tmp_path),
+    )
+    # A long allow-listed `cd` prefix (> 200 chars) then the faulty `make` line.
+    long_prefix = "cd " + ("a/" * 140)  # ~283 chars, allow-listed shape
+    command = f"{long_prefix}\nmake build"
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    line = _plain(lines[0])
+    assert 'segment="make build"' in line, line
+    # The faulty segment is visible in the excerpt even though it sits past the
+    # 200-char start-of-script window.
+    assert "make build" in line.split("segment=")[0], line
+
+
+def test_262_dest_veto_names_the_segment_and_cause(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC2: a destination veto names the write-capable segment and a dest-veto
+    cause — not just the script start."""
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd=str(worktree),
+        guardrails=None,
+        policy_path=_BUNDLED_POLICY,
+    )
+    command = 'echo "go"\nmkdir -p /definitely/outside/x'
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+    lines = _deny_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    line = _plain(lines[0])
+    assert "\n" not in line
+    assert 'segment="mkdir -p /definitely/outside/x"' in line, line
+    assert "cause=dest-veto:" in line, line
+    assert line.rstrip().endswith("(terminal)"), line
+
+
+def test_262_diagnostic_does_not_change_the_gate_matrix(tmp_path: Path) -> None:
+    """AC5: the gate matrix is byte-identical. The diagnostic re-walk is a pure
+    read — running it leaves every gate predicate's verdict unchanged, and the
+    predicates themselves return their known values over a broad sample."""
+    from claude_pilot.tier1 import (
+        is_tier1_auto_approve,
+        is_tier3_dangerous,
+        is_tier3_dangerous_for_lethality,
+    )
+
+    policy = permissions_module.load_policy(_BUNDLED_POLICY)
+    cwd = str(tmp_path)
+
+    sample = [
+        "ls -la",
+        "git status",
+        "cd /x && make build",
+        'echo "go"; mkdir -p /definitely/outside/x',
+        "rm -rf /",
+        "sed -i 's/a/b/' /etc/passwd",
+        "cat f\nmake build\ncargo run",
+        "env | grep -c MIKA",
+        "mkdir -p /tmp/scratch",
+        "grep -rn 'x' . | head",
+        "for d in */; do echo $d; done",
+        "git show HEAD:docs/x.md > docs/x.md",
+    ]
+
+    # Snapshot the four gate predicates before any diagnostic call.
+    before = {
+        c: (
+            is_tier1_auto_approve("Bash", {"command": c}, cwd),
+            is_tier3_dangerous(c),
+            is_tier3_dangerous_for_lethality(c),
+            permissions_module._denial_is_terminal("Bash", {"command": c}, cwd),
+        )
+        for c in sample
+    }
+
+    # Exercise the cpp#262 diagnostic on every sample (its only new work).
+    for c in sample:
+        permissions_module._diagnose_refused_bash(policy, c, cwd)
+        permissions_module._command_hash(c)
+
+    # Snapshot again — the diagnostic is read-only, so nothing moved.
+    after = {
+        c: (
+            is_tier1_auto_approve("Bash", {"command": c}, cwd),
+            is_tier3_dangerous(c),
+            is_tier3_dangerous_for_lethality(c),
+            permissions_module._denial_is_terminal("Bash", {"command": c}, cwd),
+        )
+        for c in sample
+    }
+    assert before == after
+
+    # And a few anchor values, so a future edit that quietly changed a gate
+    # (not just the log string) would fail here too.
+    assert before["ls -la"][0] is True  # tier1 auto-approve
+    assert before["rm -rf /"][1] is True  # tier3-dangerous
+    assert before["rm -rf /"][3] is True  # terminal
+    assert before["env | grep -c MIKA"][1] is False  # not dangerous
+
+
+def test_262_hash_is_of_the_full_untruncated_command(tmp_path: Path) -> None:
+    """AC4: the hash is over the FULL command, so a truncated line still rejoins
+    the transcript regardless of the 200-char display window."""
+    long_cmd = "cd x\n" + "echo " + ("z" * 500) + "\nmake build"
+    got = permissions_module._command_hash(long_cmd)
+    assert got == hashlib.sha256(long_cmd.encode()).hexdigest()[:12]
+    assert len(got) == 12
