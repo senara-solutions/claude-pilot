@@ -321,6 +321,28 @@ _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205: tuple[re.Pattern[str], ...] = (
 )
 
 
+# cpp#274 (LETHALITY-ONLY): GNU sed's LONG in-place form — `sed --in-place` and
+# `sed --in-place=SUFFIX`. `TIER3_PATTERNS`' sed entry (`\bsed\s+(-\w*i|-i\w*)\b`)
+# only matches the SHORT `-i`/`-i<SUFFIX>` form, so the long form was flagged by
+# NEITHER admission NOR lethality — a `sed --in-place … /etc/passwd` was denied
+# (sed is not allow-listed → policy default-deny) but NON-terminal, while the
+# short `sed -i … /etc/passwd` was terminal. SSC flagged the inconsistency,
+# MPC ratified closing it HERE (cpp#271 gate, OK-conditional). This pattern is
+# the long-form TWIN of the short entry, and like `_PROVEN_DANGEROUS_VERB_
+# PATTERNS_CPP205` it is LETHALITY-ONLY: NOT added to `TIER3_PATTERNS`, NEVER
+# consulted by `is_tier3_dangerous`/`is_tier1_auto_approve`/any YAML rule, so
+# ADMISSION STAYS BYTE-IDENTICAL (the command was already a default-deny; its
+# deny decision does not move). Mirrors the short entry adjacency (`--in-place`
+# immediately after `sed`); the trailing `\b` admits both the bare long form and
+# the `=SUFFIX` form (word→`=` is a boundary). The two carves
+# (`sed_i_confined_to_worktree`: sole-`/dev/null` survivable, worktree target
+# survivable) reach the long form via `_sed_inplace_suffix`'s cpp#274 branch, so
+# the long form joins the short in BOTH directions.
+_SED_INPLACE_LONG_FORM_FOR_LETHALITY: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsed\s+--in-place\b"),
+)
+
+
 def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
     """Whether *stripped_command* — already put through
     `is_tier3_dangerous_for_lethality`'s quote-mask / `/dev/null` / contained-
@@ -328,13 +350,15 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
     of its target (cpp#205 case a): the union of every `TIER3_PATTERNS` entry
     EXCEPT its own trailing generic-redirect catch-all
     (`_TIER3_VERB_PATTERNS_FOR_LETHALITY`), plus the new verbs enumerated in
-    `_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205`. Never consulted by the REFUSAL
-    path (`is_tier3_dangerous`); LETHALITY only."""
+    `_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205`, plus the long-form sed in-place
+    twin `_SED_INPLACE_LONG_FORM_FOR_LETHALITY` (cpp#274). Never consulted by the
+    REFUSAL path (`is_tier3_dangerous`); LETHALITY only."""
     return any(
         p.search(stripped_command)
         for p in (
             *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
             *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+            *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
         )
     )
 
@@ -4424,7 +4448,7 @@ def _sed_i_script_all_safe_subs(script: str) -> bool:
             return False
 
 def _sed_inplace_suffix(tok: str) -> str | None:
-    """If *tok* is a GNU sed in-place flag — bare ``-i``, a clustered ``-ni``, or
+    r"""If *tok* is a GNU sed in-place flag — bare ``-i``, a clustered ``-ni``, or
     a SUFFIX form ``-i.bak`` / ``-i.orig`` / ``-ibak`` (cpp#253, mika#2601) —
     return its backup SUFFIX (``""`` for bare ``-i``); otherwise ``None``.
 
@@ -4435,16 +4459,39 @@ def _sed_inplace_suffix(tok: str) -> str | None:
     inside the worktree; the returned suffix lets the caller confine that backup
     too (cpp#229 invariant, extended to the backup). The leading cluster (before
     the ``i``) must be ASCII letters — other no-arg short flags (`-n`, `-r`, …) —
-    matching the pre-cpp#253 `-[A-Za-z]*i[A-Za-z]*` charset; ``--in-place`` (a
-    ``--``-prefixed long option) is not recognized here and is not caught by
-    ``TIER3_PATTERNS`` anyway (already survivable). A ``*`` in the suffix is a GNU
-    wildcard (each ``*`` is replaced by the filename, which can PROJECT the backup
-    to an arbitrary path), so it disqualifies the token → fail closed (stays
-    terminal). This is a LINEAR scan — no backtracking regex — so recognition stays
-    bounded-time on pathological input (cpp#250 ReDoS lesson).
+    matching the pre-cpp#253 `-[A-Za-z]*i[A-Za-z]*` charset.
+
+    cpp#274: the GNU LONG in-place form — ``--in-place`` (no backup) and
+    ``--in-place=SUFFIX`` (backup suffix after ``=``; ``--in-place.bak`` is NOT
+    valid GNU syntax, the long option takes its suffix only after ``=``) — is now
+    recognized here too, so the worktree- and sole-`/dev/null`-confinement carves
+    (`_sed_i_target_operands` → `sed_i_confined_to_worktree`) reach the long form
+    exactly as they reach ``-i`` / ``-i<SUFFIX>``. This is LETHALITY-only: the
+    long form is STILL absent from ``TIER3_PATTERNS`` (admission byte-identical —
+    the command was already a policy default-deny, sed not being allow-listed);
+    its terminality comes from the lethality-only verb pattern
+    `_SED_INPLACE_LONG_FORM_FOR_LETHALITY` added to
+    `_matches_proven_dangerous_lethality_verb`, the long-form twin of the short
+    ``\bsed\s+(-\w*i|-i\w*)\b`` `TIER3_PATTERNS` entry.
+
+    A ``*`` in the suffix is a GNU wildcard (each ``*`` is replaced by the
+    filename, which can PROJECT the backup to an arbitrary path), so it
+    disqualifies the token → fail closed (stays terminal). This is a LINEAR scan
+    — no backtracking regex — so recognition stays bounded-time on pathological
+    input (cpp#250 ReDoS lesson).
     """
     if len(tok) < 2 or tok[0] != "-":
         return None
+    # cpp#274: GNU long in-place form. `--in-place` carries no backup; the suffix
+    # is supplied ONLY after `=` (`--in-place=SUFFIX`). Checked before the short
+    # cluster scan below, which rejects `--in-place` (leading `-` is not alpha).
+    if tok == "--in-place":
+        return ""
+    if tok.startswith("--in-place="):
+        suffix = tok[len("--in-place=") :]
+        if "*" in suffix:
+            return None
+        return suffix
     idx = tok.find("i", 1)
     if idx == -1:
         return None
@@ -4596,6 +4643,30 @@ def _sed_i_edit_and_backup_confined(target: str, suffix: str, cwd: str) -> bool:
     return True
 
 
+def _sed_i_suffix_is_benign_backup(suffix: str) -> bool:
+    """Whether a GNU ``-i<SUFFIX>`` backup suffix is a benign no-slash/no-``..``
+    suffix that cannot project the backup onto an attacker-chosen path (cpp#271).
+
+    GNU sed with a non-``*`` suffix writes the backup by APPENDING the suffix to
+    the edited filename, so a suffix carrying a path separator (`../../etc/x`,
+    `/tmp/x`) or a `..` component is a WRITE VECTOR and must disqualify the
+    ``/dev/null`` carve below (fail-closed). The ``*`` wildcard is already
+    excluded upstream by `_sed_inplace_suffix`. The empty suffix (bare ``-i``,
+    no backup) is benign.
+    """
+    return "/" not in suffix and ".." not in suffix
+
+
+# A shlex token that is actually a shell REDIRECT operator, not a sed file
+# operand — `2>/dev/null`, `>out`, `>/etc/x`, `1>>log`, `2>&1`. `shlex.split`
+# does not model redirects, so it mis-tokenizes these as positionals; the
+# cpp#271 sole-`/dev/null` check filters them out before counting real file
+# operands. Any genuine out-of-worktree redirect target is independently
+# re-armed by `_denial_is_terminal`'s redirect/destination veto, which runs on
+# the FULL command after this carve.
+_SED_REDIRECT_TOKEN_RE = re.compile(r"^\d*[<>]")
+
+
 def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     """Whether *command*'s tier3-for-lethality danger is due SOLELY to
     ``sed -i`` substitution segment(s) whose EVERY file target resolves
@@ -4613,6 +4684,37 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     (`sed -i '…' a.rs /etc/passwd`), or a second unconfined danger all leave a
     proven-danger remainder that still fires. Returns ``False`` (stays terminal)
     when no segment was confined or the remainder is still proven-dangerous.
+
+    cpp#271 — the cpp#203 x cpp#255 intersection. `/dev/null` is a kernel-owned
+    inert sink: `sed -i` on it writes nothing durable, the sanction cpp#203
+    (`_SED_I_DEVNULL_RE`) already grants the BARE `-i` form inside
+    `is_tier3_dangerous_for_lethality`. cpp#203 covered only bare `-i`; this
+    suffix parser (cpp#253/#255) covered the suffix forms only for WORKTREE
+    targets — so `sed -i.bak … /dev/null` (pilot 94770602, mika#2624) fell
+    between the two and stayed terminal. Here the cpp#255 suffix parser carries
+    the cpp#203 `/dev/null` axis: when a segment's SOLE file target is
+    `/dev/null`, it is inert regardless of the `-i` suffix form, PROVIDED the
+    suffix is a benign no-slash/no-`..` backup suffix (GNU would write the
+    backup as `/dev/null` + suffix, so a path-bearing suffix is a write vector
+    and stays terminal, fail-closed). SOLE-target mirrors cpp#203's own
+    constraint (`/dev/null` must be the only file operand), so a mixed list
+    (`sed -i … /dev/null real.rs`) is byte-identical to pre-cpp#271: `/dev/null`
+    is NOT treated inert there, so the per-target confinement below rejects it
+    (absolute) and the segment stays terminal. cpp#203 (bare `-i` /dev/null) and
+    cpp#255 (suffix + worktree target) behaviour are both unchanged — this only
+    ADDS the sole-`/dev/null` x suffix intersection.
+
+    cpp#274: the GNU LONG in-place form — `sed --in-place` / `--in-place=SUFFIX`
+    — now joins the short `-i`/`-i<SUFFIX>` form in BOTH directions.
+    `_sed_inplace_suffix` recognizes it (so this carve grants the long form the
+    sole-`/dev/null` and worktree-target survivability exactly as the short
+    form), while the lethality-only verb pattern
+    `_SED_INPLACE_LONG_FORM_FOR_LETHALITY` makes an UNconfined long-form target
+    (`/etc/passwd`, a `..` traversal) terminal — closing the pre-existing
+    inconsistency where `sed --in-place … /etc/passwd` was denied but
+    non-terminal while `sed -i.bak … /etc/passwd` was terminal. ADMISSION stays
+    byte-identical (the long form is still absent from `TIER3_PATTERNS`; the
+    command was already a policy default-deny either way).
     """
     survivors: list[str] = []
     carved = False
@@ -4620,6 +4722,20 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
         result = _sed_i_target_operands(seg)
         if result is not None:
             targets, suffix = result
+            # cpp#271: a segment whose SOLE sed-i target is the inert /dev/null
+            # sink is survivable for any benign backup suffix — the cpp#203 axis
+            # carried across the suffix forms. No cwd resolution: /dev/null is a
+            # kernel device, never resolved on disk. shlex mis-tokenizes a shell
+            # redirect (`2>/dev/null`, `>out`) as a positional, so those tokens
+            # are filtered before the sole-target test; a real out-of-worktree
+            # redirect target is re-armed by `_denial_is_terminal`'s redirect
+            # veto on the FULL command after this carve (fail-safe).
+            real_targets = [t for t in targets if not _SED_REDIRECT_TOKEN_RE.match(t)]
+            if real_targets == ["/dev/null"] and _sed_i_suffix_is_benign_backup(
+                suffix
+            ):
+                carved = True
+                continue
             if all(
                 _sed_i_edit_and_backup_confined(t, suffix, cwd) for t in targets
             ):
