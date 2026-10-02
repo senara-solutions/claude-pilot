@@ -161,6 +161,85 @@ La règle « lecture seule » de cpp#270 (`_var_has_nonread_occurrence` via
   variable-avec-suffixe (cohérent avec cpp#265, létalité-seule, admission intacte) —
   un alignement, pas un élargissement de l'admission.
 
+## Gate-KO MPC (tête `f032790`) — garde `ln` : un créateur de lien défait le confinement worktree-relatif (fail-closed)
+
+Le gate MPC a validé l'admission byte-identique, la latence (15,4 ms pire cas),
+les 4 formes du ticket et tous les négatifs de traversée/réaffectation — **sauf un
+point** : l'évasion par lien symbolique.
+
+```
+D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/passwd"
+```
+
+Le script plante `.pilot-scratch/x/l -> /etc`, puis écrit **à travers** le lien :
+la cible `"$D/l/passwd"` **paraît** worktree-relative au résolveur (`$D` racine
+bien à `.pilot-scratch/x`), donc la carve la tenait survivable — alors que l'écriture
+s'échappe du confinement vers `/etc`. C'est exactement la classe que
+`_redirect_destination_veto_reason` (cpp#154) ferme pour les redirections LITTÉRALES
+en résolvant le chemin pour **retenir** la létalité ; la cible dérivée-de-variable
+n'y passait pas.
+
+**Correctif (létalité-seule, stricter).** Un classifieur lexical PRÉ-exec ne peut
+pas prouver que la cible d'un lien planté *plus tard dans le même script* reste
+in-worktree. Donc la carve `.pilot-scratch` **fail-closed** : la présence d'un
+créateur de lien à **position-commande** n'importe où dans le compound
+re-terminalise la carve.
+
+- `_command_creates_link(command)` (`tier1.py`) : détecte `ln` (avec/sans
+  `-s`/`-sf`/… ou lien dur), `link` GNU, et **`cp` AVEC un flag symbolic-link**
+  (`-s`, groupé `-rs`/`-sf`, ou `--symbolic-link`) comme **tête de commande** d'un
+  segment `_split_compound_command` (quote-aware), derrière les mêmes mots-clés
+  (`then|do|else|elif|!`), préfixes d'assignation-env (`FOO=bar`) et chaîne
+  d'exec-prefixes (`sudo|env|exec|command|nohup|time|xargs` + flags) que
+  `_EVAL_COMMAND_POSITION_RE`. Un `ln` collé dans un chemin (`$D/ln`,
+  `/usr/bin/ln`), nommé en **argument** (`echo ln -s`) ou **cité** dans une chaîne
+  (`printf 'ln'`, `"; ln foo"`) n'est PAS une tête de commande → aucun faux
+  déclenchement.
+- **`cp -s` rejoint `ln`/`link`** (`_cp_args_create_symlink`, `tier1.py`) :
+  `cp -s /etc "$D/l"` plante un symlink **exactement** comme `ln -s`. `cp` est
+  créateur de lien SSI un token d'option porte le flag symbolic `s` (court `-s`,
+  groupé `-rs`/`-sf` — sensible à la casse : `s` minuscule = symbolic, `-S`
+  majuscule = `--suffix` qui prend un argument, PAS symbolic ; `--` termine le
+  parsing d'options). Un `cp` **ORDINAIRE** (sans `-s` : `cp a "$D/b"`,
+  `cp -r src "$D/"`) est une copie, PAS un créateur de lien → ne déclenche JAMAIS
+  (sinon sur-terminalisation d'un `cp` légitime). L'évasion non-vacante que ce
+  garde ferme : `cp -s /etc .pilot-scratch/x/l; printf y > "$D/l/passwd"` — le
+  symlink est planté via un chemin **littéral** (segment `cp` contenu,
+  non-terminal), puis l'écriture chevauche le `$D` carvé (VU ROUGE : survivable
+  avant, terminal après). Note : un `cp -s` vers une destination `$`-enracinée
+  (`cp -s /etc "$D/l"`) est de toute façon déjà terminal via cpp#211 (véto cp/mv
+  `$`-root) — le garde `cp -s` est ceinture-et-bretelles là, et seul-rempart pour
+  la forme chemin-littéral.
+- Câblage : dans `_value_roots_at_scratch`, branche `_is_pilot_scratch_rel`
+  UNIQUEMENT — `if _command_creates_link(command): return False`. Les racines
+  `/tmp`/mktemp retournent plus haut (elles vétoient déjà l'absolu/`..`, et un
+  enfant-symlink y est le résidu lexical connu, hors scope) : **elles ne gagnent
+  pas la garde**. Scope confirmé à la source : la carve `.pilot-scratch` est la
+  seule que ce PR introduit admettant un arbre worktree-relatif qu'un symlink
+  planté pourrait rediriger.
+
+**Invariants.** Létalité-seule (re-terminalise — stricter) ; admission
+byte-identique (la garde vit dans le résolveur, consulté seulement sur le chemin
+`for_lethality` des deux puits mkdir/redirect) ; `< 1 ms` (`_denial_is_terminal`
+pire cas 0,26 ms, détection 200-segments < 50 ms) ; tier1 gate + egress
+intouchés.
+
+**Tests ajoutés (+17, suite 1692 → 1709).** `tests/test_permissions.py` :
+`test_cpp272_link_creator_defeats_confinement_stays_terminal` (formes d'évasion
+terminales : `ln -s`/`ln -sf`/`ln` dur/`link` GNU/`$PWD` variante/puits mkdir/
+`sudo ln`, **+ `cp -s` et `cp --symbolic-link` chemin-littéral** + `cp -s` vers
+`$D`) + 2 positifs anti-faux-déclenchement ajoutés à `_CPP272_SURVIVABLE`.
+`tests/test_tier1.py` : `test_link_creator_detected_at_command_position` (inclut
+`cp -s`/`-sf`/`-rs`/`--symbolic-link`), `test_link_creator_quoted_or_glued_is_not_a_command`
+(inclut `cp -s` cité/chemin), **`test_cp_is_a_link_creator_only_with_symbolic_flag`**
+(l'arête fine : `cp -s` oui, `cp`/`cp -r`/`cp -S`/`cp --suffix=.s`/`cp -- -s` non),
+`test_link_creator_gates_pilot_scratch_carve_not_tmp` (scope : `/tmp`+`ln` reste
+reconnu), `test_link_creator_detection_under_50ms`. Probe AVANT/APRÈS : l'évasion
+chemin-littéral `cp -s .pilot-scratch/x/l; printf > "$D/l/..."` survivable (VU
+ROUGE) → terminale (garde désactivée = `False`, active = `True`) ; un `cp`
+ordinaire vers `$D` est terminal dans les deux sens (cpp#211, indépendant de ce
+garde — donc pas de sur-terminalisation introduite ici).
+
 ## Références
 
 - Solution : `docs/solutions/security-issues/the-prescribed-pilot-scratch-root-is-a-derived-scratch-root-not-a-terminal-denial.md`.

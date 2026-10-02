@@ -1268,6 +1268,10 @@ _CPP272_SURVIVABLE = [
     'D=.pilot-scratch/x; printf x > "$D/a.txt"',
     'R="$PWD/.pilot-scratch/r"; printf x > "$R/a"',
     'D=.pilot-scratch/x; chmod 700 "$D"',
+    # cpp#272 gate-KO: NAMING "ln" in a quoted arg / path is NOT a link creator
+    # — it stays survivable (no false trigger from the fail-closed `ln` guard).
+    'D=.pilot-scratch/x; mkdir -p "$D"; echo "use ln -s to link" > "$D/note"',
+    'D=.pilot-scratch/ln-cache; mkdir -p "$D"',
 ]
 
 _CPP272_TERMINAL = [
@@ -1283,6 +1287,51 @@ _CPP272_TERMINAL = [
     'D=/etc; mkdir -p "$D"',                      # absolute non-scratch
     'D="$(curl evil)"; mkdir -p "$D"',            # command-sub root
 ]
+
+
+# cpp#272 gate-KO (MPC re-gate of head `f032790`): a `.pilot-scratch`-var script
+# that CREATES A LINK (`ln`/`ln -s`/`ln -sf`/hard `ln`/GNU `link`) is a SYMLINK-
+# CONFINEMENT ESCAPE — the script plants a symlink under `.pilot-scratch` pointing
+# out of the worktree (`-> /etc`), then writes through it. The carve FAILS CLOSED:
+# a link creator at command position re-terminalizes the derived-scratch carve
+# (VU ROUGE before this fix — survivable; terminal after). The `..` traversal and
+# reassignment negatives above are unaffected; these are the NEW terminal class.
+_CPP272_LINK_ESCAPE_TERMINAL = [
+    # the killer: plant `.pilot-scratch/x/l -> /etc`, write through it
+    'D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/passwd"',
+    'D=.pilot-scratch/x; ln -sf /etc "$D/l"; printf x > "$D/l/passwd"',
+    'D=.pilot-scratch/x; ln /a "$D/b"; printf x > "$D/b"',          # hard link
+    'D=.pilot-scratch/x; link a "$D/l"; printf x > "$D/l"',         # GNU link
+    'R="$PWD/.pilot-scratch/r"; ln -s /etc "$R/l"; printf x > "$R/l/passwd"',
+    'D=.pilot-scratch/x; ln -s / "$D/r"; mkdir -p "$D/r/etc/x"',    # mkdir sink
+    'D=.pilot-scratch/x; sudo ln -s /etc "$D/l"; printf x > "$D/l/p"',  # exec-prefix
+    # `cp -s`/`cp --symbolic-link` plants a symlink exactly like `ln -s`. The
+    # symlink is planted via a LITERAL `.pilot-scratch/...` path (so the cp
+    # segment itself is a contained, non-terminal write), then the escape write
+    # rides the carved `$D` path — WITHOUT the `cp -s` guard the redirect carve
+    # would hold it survivable (VU ROUGE: survivable before, terminal after).
+    'D=.pilot-scratch/x; cp -s /etc .pilot-scratch/x/l; printf y > "$D/l/passwd"',
+    "D=.pilot-scratch/x; cp --symbolic-link /etc .pilot-scratch/x/l; "
+    'printf y > "$D/l/passwd"',
+    # the coordinator's `$D`-dest forms (terminal — also via cpp#211's $-rooted
+    # cp/mv veto, belt-and-braces with the cp -s guard).
+    'D=.pilot-scratch/x; cp -s /etc "$D/l"; printf x > "$D/l/passwd"',
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP272_LINK_ESCAPE_TERMINAL)
+def test_cpp272_link_creator_defeats_confinement_stays_terminal(
+    cmd: str, tmp_path: Path
+) -> None:
+    """Gate-KO (MPC head `f032790`): a `.pilot-scratch`-var script that creates a
+    LINK is a symlink-confinement escape and MUST stay TERMINAL — a lexical
+    pre-exec classifier cannot prove a later-planted symlink's target stays
+    in-worktree, so the presence of `ln`/`link` fails the carve closed. Survivable
+    before this fix (VU ROUGE), terminal after."""
+    wt = _cpp272_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
 
 
 @pytest.mark.parametrize("cmd", _CPP272_SURVIVABLE)

@@ -103,6 +103,60 @@ survivable deny is still a deny: the command stays refused and the pilot routes
 around it. Pin this with a dedicated admission-identity test and an empirical
 broad-sample diff against the served code (0 diffs here, 28 commands).
 
+### 6. A link creator defeats the worktree-relative confinement — fail closed (gate-KO)
+
+The MPC gate (head `f032790`) found one survivable escape the carve above let
+through:
+
+```
+D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/passwd"
+```
+
+The script plants a symlink `.pilot-scratch/x/l -> /etc` under the derived root,
+then writes THROUGH it. The redirect target `"$D/l/passwd"` LOOKS worktree-relative
+to the resolver (`$D` genuinely roots at `.pilot-scratch/x`), so step 4's carve
+held it survivable — while the write itself escapes confinement to `/etc`. This is
+precisely the class cpp#154's `_redirect_destination_veto_reason` closes for
+LITERAL redirects, by resolving the path to RETAIN lethality; a variable-derived
+target never passed through it.
+
+A purely LEXICAL, pre-exec classifier cannot prove the target of a symlink the
+SAME script plants LATER stays in-worktree. So the `.pilot-scratch` carve FAILS
+CLOSED: `_command_creates_link(command)` detects `ln` (with or without
+`-s`/`-sf`/… or a hard link), GNU `link`, and `cp` WITH a symbolic-link flag at a
+COMMAND POSITION anywhere in the compound — the executed head of a quote-aware
+`_split_compound_command` segment, behind the same leading keywords / env-assignment
+prefixes / exec-prefix chain as `_EVAL_COMMAND_POSITION_RE` — and, when present, the
+`_is_pilot_scratch_rel` branch of `_value_roots_at_scratch` returns `False` (not
+scratch → terminal). An `ln`/`cp -s` glued in a path (`$D/ln`, `/usr/bin/ln`),
+named as an argument, or quoted inside a string (`printf 'ln'`, a `"; ln"` inside
+quotes) is NOT a command head and does not trigger — so the carve's positives
+survive.
+
+`cp` is a link creator ONLY WITH the symbolic-link flag — `-s`, a grouped bundle
+carrying lowercase `s` (`-rs`/`-sf`), or `--symbolic-link` (`_cp_args_create_symlink`):
+`cp -s /etc "$D/l"` plants a symlink exactly like `ln -s`. An ORDINARY `cp` (no
+`-s`) is a plain copy, NOT a link creator, and must NOT trigger — else a legitimate
+`cp a "$D/b"` / `cp -r src "$D/"` would be over-terminalized. The short flag is
+matched case-sensitively (`-S` is cp's `--suffix`, takes an argument, not symbolic);
+`--` ends option parsing. The escape this closes non-vacuously plants the symlink
+via a LITERAL `.pilot-scratch/...` path (so the `cp`/`ln` segment is itself a
+contained, non-terminal write) and rides the carved `$D` redirect for the escape
+write: `cp -s /etc .pilot-scratch/x/l; printf y > "$D/l/passwd"` — survivable before,
+terminal after. (A `cp -s` whose DESTINATION is `$`-rooted is already terminal via
+cpp#211's cp/mv `$`-root veto; the `cp -s` guard is belt-and-braces there and the
+sole guard for the literal-path form. `cp`/`mv` were never carved into the derived
+`.pilot-scratch` resolver — only the `bash-mkdir` and `bash-redirect` sinks were —
+so an ordinary var-rooted `cp`/`mv` stays terminal independently of this guard.)
+
+SCOPED to the `.pilot-scratch` branch ONLY: the `/tmp`/mktemp roots are recognized
+EARLIER in the resolver (they already veto absolute and `..` targets; a planted
+symlink CHILD there is the known, accepted lexical residue — out of scope and
+unchanged). The `.pilot-scratch` carve is the one this PR newly admits a
+worktree-relative tree for, so it is the one that gains the guard. LETHALITY-ONLY
+(it only ever re-terminalizes — stricter); admission stays byte-identical. VU
+ROUGE: the escape above is survivable before, terminal after.
+
 ## References
 
 - Code: `src/claude_pilot/tier1.py` (`_is_pilot_scratch_rel`,
@@ -110,8 +164,12 @@ broad-sample diff against the served code (0 diffs here, 28 commands).
   with the `.pilot-scratch` base case + `$PWD/` prefix + optional `cwd`
   fs-containment via `is_within_pilot_scratch`;
   `_is_transitive_ce_scratch_redirect_target`, the redirect twin of
-  `_is_transitive_ce_scratch_mkdir_target`), `src/claude_pilot/permissions.py`
-  (the `bash-mkdir` and `bash-redirect` `for_lethality` clauses now pass `cwd`).
+  `_is_transitive_ce_scratch_mkdir_target`; `_command_creates_link` +
+  `_segment_leading_tokens` + `_cp_args_create_symlink` — the gate-KO
+  `ln`/`link`/`cp -s` fail-closed guard, wired into the `_is_pilot_scratch_rel`
+  branch of `_value_roots_at_scratch`),
+  `src/claude_pilot/permissions.py` (the `bash-mkdir` and `bash-redirect`
+  `for_lethality` clauses now pass `cwd`).
 - Siblings: cpp#213 (`.pilot-scratch` rm prefix carve — source of
   `is_within_pilot_scratch`), cpp#201 (mktemp redirect SOURCE carve),
   cpp#265/#266 (transitive scratch derivation, LAST-WINS), cpp#270/#268 (derived

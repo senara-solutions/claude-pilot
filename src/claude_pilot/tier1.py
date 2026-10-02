@@ -966,6 +966,160 @@ def _is_pilot_scratch_rel(value: str) -> bool:
         return False
     return _PILOT_SCRATCH_REL_RE.match(value) is not None
 
+
+# cpp#272 gate-KO (MPC re-gate of head `f032790`): a command that CREATES A LINK
+# (`ln`, `ln -s`, `ln -sf`, … or GNU `link`, or `cp` with the symbolic-link flag
+# `-s`/`--symbolic-link`) DEFEATS the worktree-relative
+# `.pilot-scratch` confinement — a purely LEXICAL, pre-exec classifier cannot
+# know the target of a symlink the SAME script plants under `.pilot-scratch`
+# stays in-worktree. The killer:
+#
+#     D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/passwd"
+#
+# plants `.pilot-scratch/x/l -> /etc`, then writes THROUGH it to `/etc/passwd`:
+# the write LOOKS worktree-relative to the resolver but escapes confinement. So
+# the `.pilot-scratch` carve FAILS CLOSED — the mere presence of a link creator
+# at COMMAND POSITION anywhere in the compound re-terminalizes it (LETHALITY-ONLY,
+# the whole resolver is `for_lethality`-gated; the deny is byte-identical). This
+# is the derived-var twin of what `_redirect_destination_veto_reason` (cpp#154)
+# already does for LITERAL redirects by resolving the path to RETAIN lethality.
+#
+# SCOPED to the `.pilot-scratch` branch of `_value_roots_at_scratch` ONLY: the
+# `/tmp`/mktemp roots return earlier (they already veto absolute/`..` targets, so
+# a planted symlink CHILD there is the known, accepted lexical residue — out of
+# scope), and ONLY the `.pilot-scratch` carve this PR introduced newly admits a
+# worktree-relative tree a planted symlink could redirect.
+#
+# COMMAND-POSITION discipline mirrors the reads-only scanner / the shared
+# `_EVAL_COMMAND_POSITION_RE`: the creator is recognized only as the executed
+# command head of a (quote-aware) `_split_compound_command` segment — behind the
+# same leading keywords (`then|do|else|elif|!`), env-assignment prefixes, and
+# exec-prefix chain (`sudo|env|exec|command|nohup|time|xargs` + flags) that an
+# `eval` is recognized behind. An `ln` GLUED in a path (`$D/ln`, `/usr/bin/ln`),
+# named as an ARGUMENT (`echo ln -s`), or quoted inside a string (`printf 'ln'`)
+# is NOT a command head and does NOT trigger — so the carve's positives survive.
+#
+# `cp` is a link creator ONLY WITH the symbolic-link flag (`-s`, grouped `-rs`/
+# `-sf`, or `--symbolic-link`) — `cp -s /etc "$D/l"` plants a symlink exactly like
+# `ln -s`. An ORDINARY `cp` (no `-s`) is a plain copy, NOT a link creator, and must
+# NOT trigger (else a legitimate `cp a "$D/b"` / `cp -r src "$D/"` in a
+# `.pilot-scratch` script is wrongly terminalized). The short flag is matched
+# case-sensitively (lowercase `s` = symbolic; `-S` is cp's `--suffix`, which takes
+# an argument and is NOT symbolic); `--` ends option parsing.
+_LINK_CREATOR_COMMANDS: frozenset[str] = frozenset({"ln", "link"})
+_LINK_EXEC_PREFIXES: frozenset[str] = frozenset(
+    {"sudo", "env", "exec", "command", "nohup", "time", "xargs"}
+)
+_LINK_LEADING_KEYWORDS: frozenset[str] = frozenset(
+    {"then", "do", "else", "elif", "!"}
+)
+_LINK_ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_]\w*\+?=")
+
+
+def _segment_leading_tokens(segment: str) -> list[str]:
+    """The whitespace-separated tokens of ``segment``, splitting OUTSIDE single-
+    and double-quoted regions (via the shared ``_quote_spans``) so a quoted
+    space never breaks a token and a quoted separator is inert. Leading
+    ``(``/``{`` group-openers are shed so a subshelled/grouped command head is
+    still reachable. Used only to read a segment's COMMAND HEAD, so it does not
+    need to be a full shell parser."""
+    spans = {start: end for start, end, _closed in _quote_spans(segment)}
+    tokens: list[str] = []
+    n = len(segment)
+    i = 0
+    cur: list[str] = []
+    while i < n:
+        if i in spans:  # a quoted region: opaque, part of the current token
+            cur.append(segment[i : spans[i]])
+            i = spans[i]
+            continue
+        ch = segment[i]
+        if ch.isspace():
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        if ch in "({" and not cur and not tokens:
+            # a leading group-opener — shed it so `(ln -s …` / `{ ln -s …`
+            # exposes the real head; glued mid-token it stays part of the token.
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _cp_args_create_symlink(args: list[str]) -> bool:
+    """Whether a ``cp`` invocation's ARGUMENT tokens carry the symbolic-link flag
+    — `-s` (incl. grouped bundles `-rs`/`-sf`), or the long `--symbolic-link`.
+    `cp -s` plants a symlink exactly like `ln -s`. A plain `cp` (no `-s`) is a
+    copy, NOT a link creator, so it returns ``False`` (the legitimate positive
+    survives). Case-sensitive: lowercase `s` is symbolic, `-S` (cp's `--suffix`,
+    takes an argument) is not; a bare ``--`` ends option parsing (fail-open to
+    operands — no short `s` filename can falsely trigger past it)."""
+    for raw in args:
+        tok = raw.strip("\"'")
+        if tok == "--":  # end of options; the rest are operands
+            return False
+        if tok == "--symbolic-link" or tok.startswith("--symbolic-link="):
+            return True
+        if tok.startswith("--"):  # any other long option — never symbolic here
+            continue
+        # a short-option bundle (`-s`, `-rs`, `-sf`); the part before any `=` is
+        # the flag cluster. Lowercase `s` ⇒ symbolic-link.
+        if (
+            tok.startswith("-")
+            and len(tok) > 1
+            and "s" in tok[1:].split("=", 1)[0]
+        ):
+            return True
+    return False
+
+
+def _command_creates_link(command: str) -> bool:
+    """Whether ``command`` runs a link-creating command at a COMMAND POSITION
+    anywhere in the compound (cpp#272 gate-KO): ``ln``/``link`` unconditionally,
+    or ``cp`` WITH a symbolic-link flag (`-s`/`--symbolic-link`). FAIL-CLOSED and
+    LETHALITY-ONLY; see the block comment above for why a link creator defeats the
+    ``.pilot-scratch`` confinement and why it is scoped to that carve."""
+    for seg in _split_compound_command(command):
+        tokens = _segment_leading_tokens(seg)
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if not tok:
+                idx += 1
+                continue
+            if tok in _LINK_LEADING_KEYWORDS:  # command-opening keyword prefix
+                idx += 1
+                continue
+            if _LINK_ASSIGNMENT_RE.match(tok):  # env-assignment prefix `FOO=bar`
+                idx += 1
+                continue
+            if tok.startswith("-"):  # a flag of a preceding exec-prefix — skip
+                idx += 1
+                continue
+            if tok in _LINK_EXEC_PREFIXES:  # sudo/env/exec/… chain — head is next
+                idx += 1
+                continue
+            # First real command head of this segment. Strip surrounding quotes
+            # so a quoted head (`"ln"`) still counts. `ln`/`link` create a link
+            # unconditionally; `cp` only WITH a symbolic-link flag among its args.
+            # A creator NAMED later in the same segment is an ARGUMENT, not a head,
+            # so decide on the head and move to the next segment (`mkdir …; ln -s`
+            # still trips on its own segment).
+            head = tok.strip("\"'")
+            if head in _LINK_CREATOR_COMMANDS:
+                return True
+            if head == "cp" and _cp_args_create_symlink(tokens[idx + 1 :]):
+                return True
+            break
+    return False
+
+
 # cpp#265: a `VAR=value` assignment anchored at the START of a (lstripped)
 # segment — the only position where bash actually performs an assignment. The
 # flat `_ANY_ASSIGNMENT_RE` above also matches `VAR=…` text that merely appears
@@ -1495,6 +1649,12 @@ def _value_roots_at_scratch(
     if _is_uid_tolerant_tmp_scratch(value) or _is_tmpdir_default_scratch(value):
         return True
     if _is_pilot_scratch_rel(value):  # cpp#272: worktree `.pilot-scratch/<path>`
+        # cpp#272 gate-KO: a link creator in the compound defeats the
+        # worktree-relative confinement (a planted symlink could redirect the
+        # write out of the worktree) — fail closed to terminal. SCOPED here, the
+        # `.pilot-scratch` branch only; `/tmp`/mktemp roots returned above.
+        if _command_creates_link(command):
+            return False
         return cwd is None or is_within_pilot_scratch(value, cwd)
     # cpp#272: `$PWD/<tail>` / `${PWD}/<tail>` — `$PWD` is the pilot's worktree
     # cwd, a fixed root bash always sets, so (UNLESS the command reassigns PWD —
