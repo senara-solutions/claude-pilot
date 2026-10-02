@@ -8,6 +8,7 @@ response to SDK PermissionResult.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import (
@@ -39,6 +40,7 @@ from .tier1 import (
     _is_mktemp_scratch_redirect_target,
     _is_transitive_ce_scratch_mkdir_target,
     _is_transitive_ce_scratch_redirect_target,
+    _is_transitive_ce_scratch_sink_target,
     _is_uid_tolerant_tmp_scratch,
     _mask_lethality_heredoc_redirect_chars,
     _mask_lethality_redirect_chars,
@@ -1237,6 +1239,97 @@ def _extract_cp_mv_destination(seg: str) -> list[str] | None:
     return [non_flags[-1]]
 
 
+def _extract_cp_mv_sources(seg: str) -> list[str] | None:
+    """Source operand(s) of a `cp`/`mv` segment — every positional that is NOT
+    the write destination. For the `-t`/`--target-directory` form every
+    positional is a source (the target directory is the flag value); otherwise
+    the destination is the last positional and the rest are sources. Returns
+    ``None`` (fail-closed) when the operands cannot be parsed.
+
+    cpp#280: the `mv` source-containment gate (`_mv_has_escaping_source`) needs
+    these because a `mv` SOURCE is a WRITE (it is DELETED from its origin),
+    unlike a `cp` source (a read) — so a `mv` out of the worktree/scratch
+    envelope must stay lethal even when its destination is carved as scratch.
+    """
+    tokens = _shlex_operands(seg)
+    if tokens is None or len(tokens) < 3:  # need command + >= 1 source + dest
+        return None
+    rest = tokens[1:]
+    for i, tok in enumerate(rest):
+        if (
+            tok == "--target-directory" or _CP_MV_TARGET_FLAG_RE.fullmatch(tok)
+        ) and i + 1 < len(rest):
+            # `-t DIR`: DIR (rest[i+1]) is the target; every OTHER positional is
+            # a source.
+            srcs = [
+                t
+                for j, t in enumerate(rest)
+                if not t.startswith("-") and j != i + 1
+            ]
+            return srcs or None
+        if tok.startswith("--target-directory="):
+            srcs = [t for t in rest if not t.startswith("-")]
+            return srcs or None
+    non_flags = [t for t in rest if not t.startswith("-")]
+    if len(non_flags) < 2:  # need >= 1 source + destination
+        return None
+    return non_flags[:-1]
+
+
+def _mv_has_escaping_source(command: str, seg: str, cwd: str) -> bool:
+    """cpp#280 (gate-KO on cpp#279): whether a `mv` segment has a SOURCE operand
+    that escapes BOTH the worktree and every recognized scratch root — in which
+    case the derived-/mktemp-scratch DESTINATION carve must NOT fire and the deny
+    stays TERMINAL.
+
+    For `mv` the source is a WRITE — it is DELETED from its origin — so
+    `mv /etc/passwd "$D/"` MOVES a system file into scratch and must stay lethal.
+    `cp`'s source is only a READ (`cp /etc/passwd "$D/"` stays survivable, cpp#279
+    AC3), so this returns ``False`` for any non-`mv` segment and the `cp` carve is
+    byte-identical to cpp#279. The verb is read from the segment's leading word
+    (`_LEADING_CMD_RE`), the SAME classification `_segment_write_kind` uses.
+
+    A source is CONTAINED (non-escaping) when it roots at a recognized scratch —
+    the SAME `_is_transitive_ce_scratch_sink_target` (derived `$VAR` scratch) /
+    `_is_mktemp_scratch_redirect_target` (same-command `$(mktemp)` var) /
+    `_is_sanctioned_tmp_scratch` (literal `/tmp/…`) the DESTINATION axis itself
+    recognizes — OR it is a clean worktree-relative operand: not absolute, not
+    `$`/`~`-rooted, with no `..` component. A clean relative source always names
+    something inside the worktree (and `mv` relocates a symlink ENTRY rather than
+    following it), so its deletion is in-envelope — the SAME "contained by
+    accident" posture the cpp#209 `$VAR`-destination carve already relies on.
+
+    The classification is purely LEXICAL, deliberately NOT `is_within_project`:
+    that fails closed to ``False`` for every path in a torn-down worktree (the
+    cpp#209 incident window), which would BOTH mask an out-of-tree source and
+    wrongly terminalize a legitimate relative one — so a literal `mv crates/x.rs
+    "$D/"` must stay survivable in both cwd worlds (the ratified cpp#209 mv
+    positive) while `mv /etc/passwd "$D/"` stays terminal in both. A `mv` whose
+    operands cannot be parsed fails closed to escaping (the deny stays terminal).
+    """
+    m = _LEADING_CMD_RE.match(seg)
+    if m is None or m.group(1) != "mv":
+        return False
+    sources = _extract_cp_mv_sources(seg)
+    if sources is None:
+        return True  # unparseable operands → fail closed (stays terminal)
+    for src in sources:
+        if (
+            _is_transitive_ce_scratch_sink_target(command, src, cwd)
+            or _is_mktemp_scratch_redirect_target(command, src)
+            or _is_sanctioned_tmp_scratch(src)
+        ):
+            continue
+        if (
+            src.startswith("~")
+            or src.startswith("$")
+            or Path(src).is_absolute()
+            or any(part == ".." for part in src.split("/"))
+        ):
+            return True
+    return False
+
+
 def _extract_mkdir_destinations(seg: str) -> list[str] | None:
     """Every directory operand of a `mkdir` segment (each is created).
 
@@ -1705,10 +1798,58 @@ def _destination_veto_reason(
             # lethality verdict for this one named idiom independent of
             # whether `cwd` happens to resolve at all, rather than leaving it
             # to that accident either way.
+            #
+            # cpp#280 (gate-KO): the carve is the DESTINATION axis, which is
+            # correct for `cp` (source is a READ) but NOT for `mv` — a `mv`
+            # DELETES its source, so `mv /etc/passwd "$T/"` (T from `mktemp`)
+            # MOVES a system file into scratch and must stay TERMINAL. For `mv`
+            # only, require every SOURCE to be contained too
+            # (`_mv_has_escaping_source`); `cp` is unaffected (the guard returns
+            # ``False`` for any non-`mv` segment).
             if (
                 for_lethality
                 and kind == "bash-cp-mv"
                 and _is_mktemp_scratch_redirect_target(command, dest)
+                and not _mv_has_escaping_source(command, seg, cwd)
+            ):
+                continue
+            # cpp#279: the DERIVED-SCRATCH twin of the mktemp cp carve just above —
+            # and the cp/mv completion of the cpp#272/#273 `.pilot-scratch`/mktemp/
+            # `/tmp` carve that, until now, covered only the redirect and (bare) the
+            # mkdir sink. A `cp`/`mv` DESTINATION operand rooted at a variable that
+            # (LAST-WINS, transitively, reads-only) roots at a recognized derived
+            # scratch — `.pilot-scratch/…`, `$PWD/.pilot-scratch/…`, `$(mktemp -d)`,
+            # `/tmp/…` — with a `..`-free sub-path tail is survivable, like the
+            # redirect: `cp x.sh "$FAL/"`, `cp x.sh "$D/a"` (the 4617da8f death).
+            # The DESTINATION is the containment axis: `_extract_cp_mv_destination`
+            # already resolved it to the `-t`/`--target-directory` value or the LAST
+            # positional operand, so a copy INTO scratch is carved while the SOURCE
+            # (a read, broadly allowed) is not the axis — `cp /etc/passwd "$D/"`
+            # copies an out-of-tree file INTO scratch and is survivable (AC3), while
+            # `cp x "$D/a" /etc/` (final dest `/etc/`, out of scratch) stays TERMINAL
+            # because THAT dest fails the resolver and falls to the containment
+            # veto below. Uses the SAME shared resolver as the mkdir/redirect sinks
+            # (`_is_transitive_ce_scratch_sink_target` → `_value_roots_at_scratch`),
+            # so a var reassigned OUT of scratch stays terminal and a link creator
+            # in the compound re-terminalizes the `.pilot-scratch` branch (cpp#273).
+            # `for_lethality`-gated — admission (the deny) is byte-identical; only
+            # `_denial_is_terminal` flips True→False. Checked BEFORE the cpp#211
+            # `$`/`~` veto, which would otherwise terminalize `"$D/…"` outright.
+            #
+            # cpp#280 (gate-KO): the DESTINATION-is-the-containment-axis rule holds
+            # for `cp` (source is a READ: `cp /etc/passwd "$D/"` survivable, AC3)
+            # but NOT for `mv` — `mv` DELETES its source, so the source is itself a
+            # WRITE. `mv /etc/passwd "$D/"` wrongly became survivable here; it moves
+            # a system file into scratch and must stay TERMINAL. For `mv` only, the
+            # carve additionally requires EVERY SOURCE to resolve in-worktree or
+            # under a scratch root (`_mv_has_escaping_source`, the SAME scratch
+            # resolver as the destination). `cp` is UNCHANGED (the guard is a no-op
+            # for any non-`mv` segment), so all the cpp#279 cp positives hold.
+            if (
+                for_lethality
+                and kind == "bash-cp-mv"
+                and _is_transitive_ce_scratch_sink_target(command, dest, cwd)
+                and not _mv_has_escaping_source(command, seg, cwd)
             ):
                 continue
             # cpp#211: a `cp`/`mv` destination that (after `_extract_cp_mv_
@@ -1775,10 +1916,22 @@ def _destination_veto_reason(
             # cpp#201/#209 mktemp lethality carve just above. The direct-reassign
             # admission gap (`X=/tmp/ok; X=$HOME/evil; mkdir "$X"`) is a
             # pre-existing non-last-wins axis-A defect, out of scope (cpp#224).
+            # cpp#279: the mkdir sink now follows a derived-scratch var WITH a
+            # `..`-free sub-path (`mkdir -p "$D/a"`) via the suffix-aware
+            # `_is_transitive_ce_scratch_mkdir_target` (completes the cpp#272 carve
+            # the issue flagged — the mkdir transitive sink was bare-`$VAR` only).
+            # It ALSO consults `_is_mktemp_scratch_redirect_target` here, the SAME
+            # mktemp-var carve the cp and redirect sinks already OR in — so a
+            # `$(mktemp -d)` root (which the lexical `_value_roots_at_scratch`
+            # resolver does not itself recognize) is survivable through mkdir too,
+            # not just cp/redirect. Same root, now consistent across every sink.
             if (
                 for_lethality
                 and kind == "bash-mkdir"
-                and _is_transitive_ce_scratch_mkdir_target(command, dest, cwd)
+                and (
+                    _is_transitive_ce_scratch_mkdir_target(command, dest, cwd)
+                    or _is_mktemp_scratch_redirect_target(command, dest)
+                )
             ):
                 continue
             if kind == "bash-mkdir" and (
@@ -2414,8 +2567,14 @@ def create_permission_handler(
                     # marker). Calling `_denial_is_terminal` separately per
                     # consumer would let them drift on a future edit.
                     chain_terminal = _denial_is_terminal(tool_name, tool_input, cwd)
+                    # cpp#262: name the chain-unsafe segment + carry the command
+                    # hash on the log line. Read-only diagnostic — the decision
+                    # above (`chain_terminal`, the veto) is already taken.
+                    _disp, _diag = _bash_deny_log_fields(
+                        policy, tool_name, tool_input, cwd, detail
+                    )
                     log_policy_deny(
-                        tool_name, detail, pd.rule_id, terminal=chain_terminal
+                        tool_name, _disp, pd.rule_id, terminal=chain_terminal, **_diag
                     )
                     if guardrails is not None:
                         guardrails.note_policy_deny(
@@ -2459,7 +2618,13 @@ def create_permission_handler(
                         # breach is a kill we asked for and must never earn
                         # another turn, not even via an earlier harmless
                         # refusal that armed the survivable marker.
-                        log_policy_deny(tool_name, detail, pd.rule_id, terminal=True)
+                        # cpp#262: name the destination-vetoed segment + hash.
+                        _disp, _diag = _bash_deny_log_fields(
+                            policy, tool_name, tool_input, cwd, detail
+                        )
+                        log_policy_deny(
+                            tool_name, _disp, pd.rule_id, terminal=True, **_diag
+                        )
                         if guardrails is not None:
                             guardrails.note_policy_deny(
                                 f"{tool_name}: {detail}", terminal=True
@@ -2525,7 +2690,13 @@ def create_permission_handler(
                         _veto_reason = _destination_veto_reason(_cmd, cwd)
                         if _veto_reason is not None:
                             deny_message = _veto_reason
-                log_policy_deny(tool_name, detail, pd.rule_id, terminal=deny_terminal)
+                # cpp#262: name the refused segment + hash on the deny line.
+                _disp, _diag = _bash_deny_log_fields(
+                    policy, tool_name, tool_input, cwd, detail
+                )
+                log_policy_deny(
+                    tool_name, _disp, pd.rule_id, terminal=deny_terminal, **_diag
+                )
                 # cpp#151 B0/B1: mark the session when — and only when — the
                 # refusal is survivable. This is the site the ticket's eight
                 # dead sessions came through: a read-only composed command
@@ -2571,7 +2742,11 @@ def create_permission_handler(
             # `mika notify` per call — so making it non-terminal would turn a
             # retry loop into an operator-notification flood on the very channel
             # that compensates for non-lethal denials elsewhere.
-            log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
+            # cpp#262: Bash escalate gets the same one-line segment/hash fields.
+            _disp, _diag = _bash_deny_log_fields(
+                policy, tool_name, tool_input, cwd, detail
+            )
+            log_policy_deny_with_notify(tool_name, _disp, pd.rule_id, **_diag)
             # cpp#151 B0: terminal by design (unchanged by cpp#128 — an escalate
             # exists to put a human in the loop). Recorded on the wire, and arms
             # `terminal_policy_deny` so no resume is offered for the rest of the
@@ -2931,3 +3106,139 @@ def _summarize_input(tool_name: str, tool_input: dict[str, Any]) -> str:
         suffix = f" {_scrub_secrets(str(args)[:100])}" if args else ""
         return f"{skill}{suffix}"
     return _scrub_secrets(json.dumps(tool_input, default=str)[:150])
+
+
+# ── cpp#262: `[policy:deny]` observability (OBSERVABILITY ONLY, NO decision) ───
+#
+# For a multi-line script the old `[policy:deny]` line showed only the START of
+# the command and never named WHICH compound segment was refused. Raw newlines
+# in `detail` meant a `grep '[policy:deny]'` returned only line 1, and the
+# `rule_id` + `(terminal)/(non-terminal)` suffix landed on a LATER physical line
+# or were lost to the 200-char truncation. 57ad9d76's "15 `cd <WT> && …`
+# refusals" were multi-line scripts whose faulty line was elsewhere (`make`,
+# `cargo run`, `env`, `sed -i`); the misleading log nearly signed an admission
+# extension (cpp#256). The helpers below name the first offending segment and
+# its cause, and carry a hash of the full command, so the line is self-contained
+# and recoverable. EVERYTHING here is a read: it is consumed ONLY by the log
+# string and never feeds back into any gate, so admission and lethality stay
+# byte-identical (AC5). The decision of WHICH segment broke the chain is taken
+# by `_bash_allow_is_chain_safe` / the per-segment tier3 / `_destination_veto_
+# reason` exactly as before; this re-walk only REPORTS it.
+
+
+class _RefusedSegment(NamedTuple):
+    """The first refused compound segment of a Bash command + why (cpp#262).
+
+    ``offender_count`` is how many segments are offenders (``>= 1``); the log
+    names the first and, when it is ``> 1``, how many in total. Purely
+    diagnostic. (Not named ``count`` — that would shadow ``tuple.count``.)
+    """
+
+    segment: str
+    cause: str
+    offender_count: int
+
+
+def _segment_refusal_cause(policy: Policy, segment: str, cwd: str) -> str | None:
+    """Why this single compound segment would be refused, or ``None`` when it is
+    not itself an offender (cpp#262 diagnostic — read-only).
+
+    Priority mirrors the decision path's own order: the containment boundary
+    first (`_destination_veto_reason`), then tier3 danger, then the policy
+    verdict. A segment that is tier1-safe, or an independently clean (non-tier3)
+    policy-allow, is NOT an offender — exactly the two "continue" cases of
+    `_bash_allow_is_chain_safe`'s per-segment loop — and returns ``None``.
+    """
+    if not segment:
+        return None
+    dest = _destination_veto_reason(segment, cwd)
+    if dest is not None:
+        return f"dest-veto: {dest}"
+    if is_tier3_dangerous(segment):
+        return "tier3"
+    # Mirror `_bash_allow_is_chain_safe`'s per-segment "safe" tests verbatim
+    # (tier1-safe, or a clean non-tier3 policy allow) so a segment this helper
+    # calls an offender is exactly one that path would have refused.
+    if is_safe_bash_command(segment):
+        return None
+    pd = evaluate(policy, "Bash", {"command": segment})
+    if pd.decision == "allow" and not is_tier3_dangerous(segment):
+        return None
+    if pd.decision == "allow":
+        # allow but tier3 — already caught above; defensive.
+        return "tier3"
+    return "default-deny" if pd.rule_id is None else "chain-unsafe"
+
+
+def _diagnose_refused_bash(
+    policy: Policy, command: str, cwd: str
+) -> _RefusedSegment | None:
+    """Re-walk the compound segments of a refused Bash command and name the
+    FIRST offender + its cause (cpp#262 AC2). Read-only: consulted ONLY by the
+    log line, so it cannot change admission or lethality (AC5)."""
+    if not isinstance(command, str) or not command:
+        return None
+    offenders: list[tuple[str, str]] = []
+    for seg in _split_compound_command(command):
+        cause = _segment_refusal_cause(policy, seg, cwd)
+        if cause is not None:
+            offenders.append((seg, cause))
+    if not offenders:
+        return None
+    first_seg, first_cause = offenders[0]
+    return _RefusedSegment(
+        segment=first_seg, cause=first_cause, offender_count=len(offenders)
+    )
+
+
+def _command_hash(command: str) -> str:
+    """Short sha256 prefix of the FULL (untruncated) command (cpp#262 AC4), so a
+    truncated `[policy:deny]` line can be re-joined to the transcript
+    (`~/.mika/data/pilot-transcripts/<id>.jsonl`) without timestamp heuristics.
+    """
+    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+def _bash_deny_display_detail(
+    base_detail: str, command: str, diag: _RefusedSegment | None
+) -> str:
+    """The command excerpt shown on the deny line. Normally the same 200-char
+    window as every other log (`base_detail`); but when the faulty segment falls
+    OUTSIDE that window, show the segment preferentially (cpp#262 AC3) so
+    truncation never drops what was actually refused."""
+    if diag is None:
+        return base_detail
+    seg_scrubbed = _scrub_secrets(diag.segment)
+    if seg_scrubbed and seg_scrubbed not in base_detail:
+        return seg_scrubbed[:200]
+    return base_detail
+
+
+def _bash_deny_log_fields(
+    policy: Policy,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    cwd: str,
+    detail: str,
+) -> tuple[str, dict[str, Any]]:
+    """`(display_detail, kwargs)` for `log_policy_deny` / `_with_notify` on a
+    Bash refusal (cpp#262): a possibly segment-preferring excerpt plus the
+    diagnostic + command hash. For non-Bash, or on any diagnostic failure,
+    returns `(detail, {})` — the diagnostic can NEVER crash or alter the deny
+    path (observability must not touch the decision, AC5)."""
+    if tool_name != "Bash":
+        return detail, {}
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command:
+        return detail, {}
+    try:
+        diag = _diagnose_refused_bash(policy, command, cwd)
+        display = _bash_deny_display_detail(detail, command, diag)
+        fields: dict[str, Any] = {"cmd_hash": _command_hash(command)}
+        if diag is not None:
+            fields["segment"] = diag.segment
+            fields["cause"] = diag.cause
+            fields["segment_count"] = diag.offender_count
+        return display, fields
+    except Exception:  # pragma: no cover — diagnostic must never affect the deny
+        return detail, {}

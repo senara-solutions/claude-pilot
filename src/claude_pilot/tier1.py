@@ -1819,24 +1819,71 @@ def _value_roots_at_scratch(
     return _value_roots_at_scratch(nxt, command, depth + 1, cwd)
 
 
+def _is_transitive_ce_scratch_sink_target(
+    command: str, dest: str, cwd: str | None = None
+) -> bool:
+    """LETHALITY-ONLY: whether the (shlex/quote-stripped) WRITE-sink destination
+    ``dest`` is a variable reference ``$VAR``/``${VAR}`` — optionally carrying a
+    relative ``/<sub-path>`` tail — whose LAST same-command assignment roots
+    (transitively, reads-only) at a recognized derived scratch: a `/tmp` root
+    (cpp#266), ``$(mktemp -d)`` (cpp#270), or the worktree ``.pilot-scratch/`` /
+    ``$PWD/.pilot-scratch/`` root (cpp#272). The tail must carry no ``..``.
+
+    cpp#279: this is the SHARED resolver every WRITE sink follows — ``mkdir -p``,
+    ``cp``/``mv`` (DESTINATION operand), and the ``>``-redirect. Before cpp#279
+    only the redirect followed a var WITH a sub-path (`"$D/a.txt"`); ``mkdir``
+    followed only a BARE ``$D`` and ``cp`` not at all, so the SAME derived root was
+    survivable through one sink and terminal through another (the 4617da8f death:
+    `mkdir -p "$FAL/skills/…"`). Folding the sinks onto this one predicate — the
+    SAME ``_MKTEMP_SCRATCH_TARGET_RE`` shape the redirect twin already used (so the
+    ``/<sub-path>`` tail is stripped off the operand before the var is resolved),
+    the SAME ``_value_roots_at_scratch`` resolver, and the SAME inverted reads-only
+    reassignment rule (``_last_real_assignment_value`` → ``_live_scratch_source``,
+    so a var reassigned OUT of scratch stays terminal) — closes the hole with NO
+    fork. Consulted ONLY from the ``for_lethality`` veto path; the deny stays.
+
+    ``cwd`` (cpp#272) is threaded to ``_value_roots_at_scratch`` so a
+    ``.pilot-scratch`` root is held to fs-aware containment; ``None`` keeps the
+    recognition lexical (direct unit calls), unchanged for `/tmp`/mktemp roots.
+    """
+    m = _MKTEMP_SCRATCH_TARGET_RE.match(dest)
+    if m is None:
+        return False
+    if ".." in m.group("tail"):
+        return False
+    value = _last_real_assignment_value(command, m.group("var"))
+    if value is None:
+        return False
+    return _value_roots_at_scratch(value, command, 0, cwd)
+
+
 def _is_transitive_ce_scratch_mkdir_target(
     command: str, dest: str, cwd: str | None = None
 ) -> bool:
-    """LETHALITY-ONLY: whether the (shlex-stripped) ``dest`` is a bare ``$VAR``
-    whose LAST same-command assignment roots (transitively) at a recognized
-    scratch. Consulted only from the ``for_lethality`` veto path; the deny stays.
+    """LETHALITY-ONLY: whether a ``mkdir`` destination ``dest`` roots (transitively)
+    at a recognized derived scratch. Consulted only from the ``for_lethality`` veto
+    path; the deny stays.
+
+    cpp#279: a ``mkdir`` destination now follows a var WITH a ``/<sub-path>`` tail
+    (`mkdir -p "$D/a"`, `"$D/a/b"`, `"${D}/x"`) via the shared
+    ``_is_transitive_ce_scratch_sink_target`` — like the redirect twin — closing
+    the cpp#272-flagged hole where the mkdir sink stayed bare-``$VAR``. The bare
+    ``_CE_SCRATCH_VARREF_RE`` branch is RETAINED (not replaced) so the
+    subshell-split artifact ``$D)`` (a `(subshell; mkdir -p "$D")` split's trailing
+    ``)``) — which the shared ``_MKTEMP_SCRATCH_TARGET_RE`` charset does not admit —
+    stays recognized. The two are unioned: True if EITHER the bare ref OR the
+    sub-path shape roots at scratch.
 
     ``cwd`` (cpp#272) is threaded to ``_value_roots_at_scratch`` so a
     ``.pilot-scratch`` root is held to fs-aware containment; ``None`` keeps the
     recognition lexical (direct unit calls), unchanged for `/tmp`/mktemp roots.
     """
     m = _CE_SCRATCH_VARREF_RE.match(dest)
-    if m is None:
-        return False
-    value = _last_real_assignment_value(command, m.group("var"))
-    if value is None:
-        return False
-    return _value_roots_at_scratch(value, command, 0, cwd)
+    if m is not None:
+        value = _last_real_assignment_value(command, m.group("var"))
+        if value is not None and _value_roots_at_scratch(value, command, 0, cwd):
+            return True
+    return _is_transitive_ce_scratch_sink_target(command, dest, cwd)
 
 
 def _is_transitive_ce_scratch_redirect_target(
@@ -1848,24 +1895,12 @@ def _is_transitive_ce_scratch_redirect_target(
     or the worktree ``.pilot-scratch/`` / ``$PWD/.pilot-scratch/`` root (cpp#272) —
     followed by a safe, ``..``-free relative tail.
 
-    The redirect twin of ``_is_transitive_ce_scratch_mkdir_target``: it reuses the
-    SAME derived-scratch resolver (``_value_roots_at_scratch``) and the SAME
-    inverted reads-only reassignment rule (``_last_real_assignment_value`` →
-    ``_live_scratch_source``), so a var reassigned OUT of scratch stays terminal.
-    It uses ``_MKTEMP_SCRATCH_TARGET_RE`` (``$VAR``/``${VAR}`` + optional tail,
-    optional surrounding quote) so a redirect carrying a suffix
-    (``> "$D/a.txt"``) is handled, where the bare-``$VAR``-only mkdir predicate is
-    not. Consulted ONLY from the ``for_lethality`` veto path; the deny stays.
+    cpp#279: a thin delegate to the SHARED
+    ``_is_transitive_ce_scratch_sink_target`` (unchanged behaviour — the redirect
+    twin was always the suffix-aware shape; the shared predicate IS its former
+    body). Consulted ONLY from the ``for_lethality`` veto path; the deny stays.
     """
-    m = _MKTEMP_SCRATCH_TARGET_RE.match(dest)
-    if m is None:
-        return False
-    if ".." in m.group("tail"):
-        return False
-    value = _last_real_assignment_value(command, m.group("var"))
-    if value is None:
-        return False
-    return _value_roots_at_scratch(value, command, 0, cwd)
+    return _is_transitive_ce_scratch_sink_target(command, dest, cwd)
 
 
 def _is_contained_redirect_target(dest: str) -> bool:

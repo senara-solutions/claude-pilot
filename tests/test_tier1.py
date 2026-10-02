@@ -38,6 +38,7 @@ from claude_pilot.tier1 import (
     _is_safe_xargs_command,
     _is_transitive_ce_scratch_mkdir_target,
     _is_transitive_ce_scratch_redirect_target,
+    _is_transitive_ce_scratch_sink_target,
     _is_uid_tolerant_tmp_scratch,
     _last_assignment_value,
     _last_real_assignment_value,
@@ -4730,6 +4731,47 @@ class TestCeScratchSanctionUnit:
     def test_transitive_terminates_on_cycle(self) -> None:
         cmd = "A=$B/x; B=$A/y; mkdir -p \"$A\""
         assert _is_transitive_ce_scratch_mkdir_target(cmd, "$A") is False
+
+    # ── cpp#279: every write sink follows a derived-scratch var WITH a sub-path ──
+    def test_cpp279_mkdir_follows_var_with_subpath(self) -> None:
+        # The cpp#272 hole: the mkdir sink followed a derived-scratch var only
+        # BARE (`$D`); a `$D/<sub-path>` tail stayed unrecognized (the 4617da8f
+        # death). It now follows the sub-path like the redirect twin.
+        cmd = "D=.pilot-scratch/f"
+        for dest in ('"$D"', "$D", "$D/a", "$D/a/b", "${D}/a"):
+            d = dest.strip('"')
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, d) is True, d
+            assert _is_transitive_ce_scratch_sink_target(cmd, d) is True, d
+        # `..` in the sub-path is never carved; a reassignment OUT of scratch wins.
+        assert _is_transitive_ce_scratch_sink_target(cmd, "$D/../../etc") is False
+        assert _is_transitive_ce_scratch_sink_target(cmd, "$D/a/../../x") is False
+        out = "D=.pilot-scratch/f; D=/etc"
+        assert _is_transitive_ce_scratch_sink_target(out, "$D/a") is False
+
+    def test_cpp279_mkdir_bare_subshell_artifact_still_recognized(self) -> None:
+        # The bare `_CE_SCRATCH_VARREF_RE` branch is RETAINED so the `(subshell;
+        # mkdir -p "$D")` split's trailing `)` artifact still resolves — the
+        # suffix regex's charset does not admit `)`.
+        cmd = "D=.pilot-scratch/f"
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$D)") is True
+        assert _is_transitive_ce_scratch_sink_target(cmd, "$D)") is False  # suffix only
+
+    def test_cpp279_sink_predicate_handles_derived_roots(self) -> None:
+        # The shared sink resolver recognizes every derived-scratch root with a
+        # sub-path: `/tmp`, `$PWD/.pilot-scratch`, transitive `$SCRATCH_ROOT/…`.
+        for cmd, dest in (
+            ('D="/tmp/compound-engineering-$(id -u)"', "$D/a/b"),
+            ('D="$PWD/.pilot-scratch/x"', "$D/a"),
+            (
+                'SCRATCH_ROOT="/tmp/compound-engineering-$(id -u)";'
+                'RUN_DIR="$SCRATCH_ROOT/ce/$RUN_ID"',
+                "$RUN_DIR/sub",
+            ),
+        ):
+            assert _is_transitive_ce_scratch_sink_target(cmd, dest) is True, (cmd, dest)
+        # non-scratch roots with a sub-path stay unrecognized
+        assert _is_transitive_ce_scratch_sink_target("D=/etc", "$D/a") is False
+        assert _is_transitive_ce_scratch_sink_target('D="$HOME"', "$D/a") is False
 
     # ── cpp#265: a `VAR=…` token inside a quoted argument is NOT an assignment ──
     def test_transitive_echo_literal_does_not_poison_last_wins(self) -> None:
