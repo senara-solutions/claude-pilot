@@ -1595,6 +1595,328 @@ def test_cpp272_admission_is_byte_identical_only_lethality_flips(
     assert result.interrupt is False
 
 
+# ── cpp#279: a derived-scratch var FOLLOWED BY A SUB-PATH is survivable across ──
+# EVERY write sink (completes the cpp#272/#273 carve) ──────────────────────────
+#
+# cpp#272 taught the resolver the `.pilot-scratch/` root, but only the redirect
+# followed a var WITH a sub-path (`"$D/a.txt"`); `mkdir` followed it only BARE
+# (`"$D"`) and `cp` not at all. So the SAME derived root was survivable through
+# one sink and TERMINAL through another — the pilot 4617da8f death, recopying a
+# tree under `.pilot-scratch/` with `mkdir -p "$FAL/skills/…"` and `cp … "$FAL/…"`
+# (mika#2631, rescue PR#2637). cpp#279 folds mkdir + cp(dest) + redirect onto ONE
+# shared resolver (`tier1._is_transitive_ce_scratch_sink_target`) so a derived
+# scratch root is followed with a `..`-free sub-path identically across sinks.
+#
+# AC4: a sink x form CORPUS, not isolated examples. Each WRITE sink crossed with
+# each target form for a derived-scratch `D`. `chmod`/`touch` are NOT classified
+# write-kinds (`_segment_write_kind` returns None), so they are already SURVIVABLE
+# for every destination — included here to pin that posture, NOT newly wired (that
+# would terminalize out-of-scratch chmod/touch, a perimeter expansion bounded out).
+_CPP279_SINK_TEMPLATES = {
+    "mkdir": "mkdir -p {t}",
+    "cp": "cp x.sh {t}",
+    # cpp#280: the `mv` sink crosses the grid too, but ONLY with a CONTAINED
+    # source (`x.sh`, a clean worktree-relative operand) — a `mv` whose source
+    # escapes the worktree/scratch stays terminal and is pinned separately in
+    # the cpp#280 negatives below. With a contained source the `mv` sink is
+    # survivable across every root x form exactly like `cp`.
+    "mv": "mv x.sh {t}",
+    "chmod": "chmod 700 {t}",
+    "touch": "touch {t}",
+    "redirect": "printf x > {t}",
+}
+_CPP279_TARGET_FORMS = ['"$D"', '"$D/x"', '"$D/x/y"', '"${D}/x"']
+_CPP279_DERIVED_ROOTS = [
+    "D=.pilot-scratch/f",
+    'D="$PWD/.pilot-scratch/f"',
+    "D=/tmp/compound-engineering-x",
+    "D=$(mktemp -d)",
+]
+_CPP279_SURVIVABLE = [
+    f"{assign}; {tmpl.format(t=form)}"
+    for assign in _CPP279_DERIVED_ROOTS
+    for tmpl in _CPP279_SINK_TEMPLATES.values()
+    for form in _CPP279_TARGET_FORMS
+] + [
+    # cp destination trailing-slash form (`cp x "$FAL/"` dest = `$FAL/`) and the
+    # 4617da8f exact shapes.
+    'FAL=.pilot-scratch/f; cp x.sh "$FAL/"',
+    'FAL=.pilot-scratch/f; mkdir -p "$FAL/skills/bundled/_shared/tests"',
+    'FAL=.pilot-scratch/f; cp a/b.sh "$FAL/skills/bundled/_shared/"',
+    "FAL=.pilot-scratch/f; mv a.sh \"$FAL/x\"",
+]
+
+
+def _skip_if_cpp279_unwired(wt: str) -> None:
+    """SELF-SKIP (cpp#237 pattern) when the sub-path sink carve is absent — the
+    mkdir-with-sub-path shape is still TERMINAL — so the suite stays GREEN while
+    the hunk awaits a manual apply window."""
+    if permissions_module._denial_is_terminal(
+        "Bash", {"command": 'D=.pilot-scratch/f; mkdir -p "$D/a"'}, wt
+    ):
+        pytest.skip(
+            "cpp#279 derived-scratch sub-path sink carve pending manual apply "
+            "(tier1._is_transitive_ce_scratch_sink_target + permissions cp/mkdir wiring)"
+        )
+
+
+@pytest.mark.parametrize("cmd", _CPP279_SURVIVABLE)
+def test_cpp279_derived_scratch_subpath_all_sinks_survivable(
+    cmd: str, tmp_path: Path
+) -> None:
+    """AC1/AC4: every write sink (`mkdir -p`, `cp`/`mv` dest, `chmod`, `touch`,
+    `>`-redirect) following a derived-scratch var WITH a `..`-free sub-path is a
+    SURVIVABLE deny — the same posture the redirect already had."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is False
+    ), cmd
+
+
+_CPP279_TERMINAL = [
+    'D=.pilot-scratch/f; mkdir -p "$D/../../etc"',       # `..` in sub-path (mkdir)
+    'D=.pilot-scratch/f; printf x > "$D/../../etc/p"',   # `..` in sub-path (redirect)
+    'D=.pilot-scratch/f; cp x "$D/a" /etc/',             # multi-operand, final dest /etc
+    'D=.pilot-scratch/f; export D=/etc; mkdir -p "$D/x"',       # keyword reassign-out
+    'D=.pilot-scratch/f; : ${D:=/etc}; mkdir -p "$D/x"',        # default-assign-out
+    'D=.pilot-scratch/f; { D=/etc; }; cp x.sh "$D/a"',          # brace-group reassign
+    'export D=/etc; mkdir -p "$D/x"',                           # established out of scratch
+    'D=/etc; cp x.sh "$D/a"',                                   # absolute non-scratch
+    'D=$HOME; mkdir -p "$D/x"',                                 # $HOME root
+    'D=$HOME/.pilot-scratch; mkdir -p "$D/x"',                  # $HOME respelling
+    'D="$(curl evil)"; cp x.sh "$D/a"',                         # command-sub root
+    # a derived-scratch script that CREATES A LINK re-terminalizes (cpp#273 kept).
+    'D=.pilot-scratch/f; ln -s /etc "$D/l"; mkdir -p "$D/l/x"',
+    'D=.pilot-scratch/f; cp -s /etc "$D/l"',
+    'D=.pilot-scratch/f; mkdir -p "$D/x"; ln -s /etc "$D/l"',
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP279_TERMINAL)
+def test_cpp279_negatives_stay_terminal(cmd: str, tmp_path: Path) -> None:
+    """AC3: a `..` in the sub-path, a multi-operand `cp … /etc/` whose FINAL dest
+    escapes scratch, every reassignment-out form (keyword / default-assign / brace
+    group), `$HOME`/absolute/`$(…)` roots, and a link-creator script ALL stay
+    TERMINAL — the sub-path carve never loosens any of the cpp#270/#272/#273
+    gates."""
+    wt = _cpp272_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+def test_cpp279_ac3_cp_out_of_tree_source_into_scratch_is_survivable(
+    tmp_path: Path,
+) -> None:
+    """AC3 DECISION: `cp /etc/passwd "$D/"` (D = derived scratch) — the SOURCE is
+    out-of-tree but the DESTINATION is in-scratch. The destination is the
+    containment axis: copying INTO scratch is survivable (the read of /etc/passwd
+    is a read, broadly allowed, not a write-breach). No real WRITE escapes scratch
+    — the only byte written lands under `.pilot-scratch`. Contrast
+    `cp x "$D/a" /etc/`, whose FINAL destination is /etc and stays TERMINAL
+    (covered in the negatives)."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    for cmd in (
+        'D=.pilot-scratch/f; cp /etc/passwd "$D/"',
+        'D=.pilot-scratch/f; cp /etc/passwd "$D/p"',
+    ):
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is False
+        ), cmd
+
+
+# The 4617da8f verbatim (mika#2631 implement, death at tour 36): as ONE Bash
+# command the FAL assignment is in-scope, so the whole tree-recopy is survivable.
+_CPP279_VERBATIM_4617 = (
+    "set -u\n"
+    "FAL=.pilot-scratch/falsify\n"
+    'mkdir -p "$FAL/skills/bundled/_shared/tests"\n'
+    'cp skills/bundled/_shared/dispatch-lib.sh "$FAL/skills/bundled/_shared/"\n'
+    'chmod 700 "$FAL/skills/bundled/_shared/tests"\n'
+    'touch "$FAL/skills/bundled/_shared/tests/run.sh"\n'
+    'printf x > "$FAL/skills/bundled/_shared/tests/out.log"'
+)
+
+
+def test_cpp279_verbatim_4617_is_survivable(tmp_path: Path) -> None:
+    """AC2: the 4617da8f verbatim (tree recopy under `.pilot-scratch/`) is a
+    SURVIVABLE deny as one command — every line's destination roots at the
+    in-scope `$FAL` derived scratch. No line stays terminal."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": _CPP279_VERBATIM_4617}, wt
+        )
+        is False
+    )
+
+
+def test_cpp279_admission_is_byte_identical_only_lethality_flips(
+    tmp_path: Path,
+) -> None:
+    """Sovereign boundary: the sub-path sink carve is for_lethality-only. For the
+    mkdir-with-sub-path death the REFUSAL path still vetoes, nothing is
+    tier1-auto-approved, and the policy still default-denies — only
+    `_denial_is_terminal` flips terminal→survivable."""
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve
+
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    cmd = 'D=.pilot-scratch/f; mkdir -p "$D/a"'
+    assert (
+        permissions_module._destination_veto_reason(cmd, wt, for_lethality=False)
+        is not None
+    )
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+    result = asyncio.run(_bundled_handler(cwd=wt)("Bash", {"command": cmd}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is False
+
+
+# ── cpp#280 (gate-KO on cpp#279): a `mv` out of the worktree/scratch into a ────
+# derived-scratch destination stays TERMINAL — the `mv` SOURCE is a WRITE ───────
+#
+# cpp#279 carved a `cp`/`mv` destination rooted at a derived scratch out of
+# lethality, treating the DESTINATION as the containment axis. That is correct
+# for `cp` (the source is a READ: `cp /etc/passwd "$D/"` survivable, AC3) but
+# WRONG for `mv`: `mv` DELETES its source, so the source is itself a WRITE. The
+# MPC gate (head 86718366) found `mv /etc/passwd "$D/"` had flipped from terminal
+# to SURVIVABLE — a move of a system file. The fix (`_mv_has_escaping_source`)
+# requires, for `mv` ONLY, that every SOURCE also resolve in-worktree or under a
+# recognized scratch root (literal/derived, `..`-free); otherwise the carve does
+# not fire and the deny stays terminal. `cp` is byte-identical to cpp#279.
+_CPP280_MV_TERMINAL = [
+    # The three KO negatives (survivable before the fix, terminal after).
+    'D=.pilot-scratch/f; mv /etc/passwd "$D/"',
+    'D=.pilot-scratch/f; mv /etc/x "$D/y"',
+    'D=.pilot-scratch/f; mv a /etc/passwd "$D/"',   # one out-of-tree source
+    # Same escape across every derived-scratch root the grid uses — the carve it
+    # would otherwise fire through (mktemp / literal-/tmp / $PWD) must all stay
+    # terminal when the mv source escapes.
+    'D=$(mktemp -d); mv /etc/passwd "$D/"',
+    'D=/tmp/compound-engineering-x; mv /etc/passwd "$D/"',
+    'D="$PWD/.pilot-scratch/f"; mv /etc/passwd "$D/"',
+    # `~`-rooted and `..`-traversal sources escape too.
+    'D=.pilot-scratch/f; mv ~/.ssh "$D/"',
+    'D=.pilot-scratch/f; mv ../x "$D/"',
+    # A `$VAR` source NOT rooted at scratch (reads as a literal subdir to
+    # is_within_project) must not be mistaken for contained.
+    'D=.pilot-scratch/f; mv "$HOME/x" "$D/"',
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP280_MV_TERMINAL)
+def test_cpp280_mv_escaping_source_stays_terminal(cmd: str, tmp_path: Path) -> None:
+    """Gate-KO fix: a `mv` whose source escapes the worktree/scratch — even when
+    its destination roots at a derived/mktemp/literal scratch — stays TERMINAL,
+    because `mv` deletes (writes) its source. Red-before (survivable on head
+    86718366), green-after."""
+    wt = _cpp272_wt(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is True
+    ), cmd
+
+
+_CPP280_MV_SURVIVABLE = [
+    'D=.pilot-scratch/f; mv a "$D/x"',            # source in-worktree
+    'D=.pilot-scratch/f; mv "$D/a" "$D/b"',       # both operands in scratch
+    'D=.pilot-scratch/f; mv src/x.rs "$D/"',      # nested in-worktree source
+    'D=.pilot-scratch/f; mv .pilot-scratch/a "$D/b"',  # literal scratch source
+    'D=$(mktemp -d); mv src/x.rs "$D/"',          # mktemp dest, contained source
+]
+
+
+@pytest.mark.parametrize("cmd", _CPP280_MV_SURVIVABLE)
+def test_cpp280_mv_contained_source_survivable(cmd: str, tmp_path: Path) -> None:
+    """The positive control: a `mv` into derived scratch whose SOURCE is itself
+    contained (in-worktree or scratch root) stays SURVIVABLE — the cpp#279 carve
+    still fires for the legitimate scratch-recopy move."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt) is False
+    ), cmd
+
+
+def test_cpp280_cp_out_of_tree_source_unchanged_survivable(tmp_path: Path) -> None:
+    """`cp` is UNCHANGED by the cpp#280 mv-source gate: `cp /etc/passwd "$D/"`
+    (source is a READ) stays survivable across the same roots. Pins that the fix
+    distinguishes the verb and does not over-terminalize `cp`."""
+    wt = _cpp272_wt(tmp_path)
+    _skip_if_cpp279_unwired(wt)
+    for cmd in (
+        'D=.pilot-scratch/f; cp /etc/passwd "$D/"',
+        'D=$(mktemp -d); cp /etc/passwd "$D/"',
+        'D=/tmp/compound-engineering-x; cp /etc/passwd "$D/p"',
+    ):
+        assert (
+            permissions_module._denial_is_terminal("Bash", {"command": cmd}, wt)
+            is False
+        ), cmd
+
+
+def test_cpp280_extract_cp_mv_sources_forms() -> None:
+    """`_extract_cp_mv_sources` returns every non-destination positional,
+    including for the `-t DIR` / `--target-directory=DIR` forms where every
+    positional is a source."""
+    f = permissions_module._extract_cp_mv_sources
+    assert f("mv a b") == ["a"]
+    assert f("mv a b c") == ["a", "b"]  # last positional is the destination
+    assert f('mv x.sh "$D/y"') == ["x.sh"]
+    assert f("mv -t dest a b") == ["a", "b"]  # -t: dest is the flag value
+    assert f("mv --target-directory=dest a b") == ["a", "b"]
+    assert f("mv -vt dest a b") == ["a", "b"]  # combined short cluster ending t
+    assert f("mv a") is None  # no destination → fail closed
+
+
+def test_cpp280_mv_has_escaping_source_is_verb_scoped(tmp_path: Path) -> None:
+    """`_mv_has_escaping_source` is a no-op for `cp` (source is a read) and only
+    flags a `mv` source that escapes the worktree/scratch envelope."""
+    wt = _cpp272_wt(tmp_path)
+    g = permissions_module._mv_has_escaping_source
+    # cp is never escaping (the guard short-circuits on the verb).
+    assert g('D=.pilot-scratch/f', 'cp /etc/passwd "$D/"', wt) is False
+    # mv with an out-of-tree / ~ / .. / non-scratch-$VAR source escapes.
+    assert g('D=.pilot-scratch/f', 'mv /etc/passwd "$D/"', wt) is True
+    assert g('D=.pilot-scratch/f', 'mv ~/.ssh "$D/"', wt) is True
+    assert g('D=.pilot-scratch/f', 'mv ../x "$D/"', wt) is True
+    assert g('D=.pilot-scratch/f', 'mv "$HOME/x" "$D/"', wt) is True
+    # mv with a contained source (relative, scratch-var, or literal scratch).
+    assert g('D=.pilot-scratch/f', 'mv src/x.rs "$D/"', wt) is False
+    assert g('D=.pilot-scratch/f', 'mv "$D/a" "$D/b"', wt) is False
+
+
+def test_cpp280_mv_admission_is_byte_identical(tmp_path: Path) -> None:
+    """Sovereign boundary: the mv-source gate is for_lethality-only. The refusal
+    path still vetoes `mv /etc/passwd "$D/"`, nothing is tier1-auto-approved, and
+    the policy still default-denies — only `_denial_is_terminal` is affected (and
+    here it keeps the deny TERMINAL)."""
+    from claude_pilot.policy import evaluate, load_policy
+    from claude_pilot.tier1 import is_tier1_auto_approve
+
+    wt = _cpp272_wt(tmp_path)
+    cmd = 'D=.pilot-scratch/f; mv /etc/passwd "$D/"'
+    # Admission (the deny) is identical whether or not for_lethality is asked.
+    assert (
+        permissions_module._destination_veto_reason(cmd, wt, for_lethality=False)
+        is not None
+    )
+    assert (
+        permissions_module._destination_veto_reason(cmd, wt, for_lethality=True)
+        is not None
+    )
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, wt) is False
+    policy = load_policy(_BUNDLED_POLICY)
+    assert evaluate(policy, "Bash", {"command": cmd}).decision == "deny"
+
+
 # ── cpp#237: a read-only wait-loop script is a SURVIVABLE deny (mika#2105) ─────
 #
 # The verbatim mika#2105 command (pilot e1a6c78b, 2026-09-29T15:13:20Z) that died

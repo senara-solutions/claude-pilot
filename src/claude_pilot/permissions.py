@@ -40,6 +40,7 @@ from .tier1 import (
     _is_mktemp_scratch_redirect_target,
     _is_transitive_ce_scratch_mkdir_target,
     _is_transitive_ce_scratch_redirect_target,
+    _is_transitive_ce_scratch_sink_target,
     _is_uid_tolerant_tmp_scratch,
     _mask_lethality_heredoc_redirect_chars,
     _mask_lethality_redirect_chars,
@@ -1238,6 +1239,97 @@ def _extract_cp_mv_destination(seg: str) -> list[str] | None:
     return [non_flags[-1]]
 
 
+def _extract_cp_mv_sources(seg: str) -> list[str] | None:
+    """Source operand(s) of a `cp`/`mv` segment — every positional that is NOT
+    the write destination. For the `-t`/`--target-directory` form every
+    positional is a source (the target directory is the flag value); otherwise
+    the destination is the last positional and the rest are sources. Returns
+    ``None`` (fail-closed) when the operands cannot be parsed.
+
+    cpp#280: the `mv` source-containment gate (`_mv_has_escaping_source`) needs
+    these because a `mv` SOURCE is a WRITE (it is DELETED from its origin),
+    unlike a `cp` source (a read) — so a `mv` out of the worktree/scratch
+    envelope must stay lethal even when its destination is carved as scratch.
+    """
+    tokens = _shlex_operands(seg)
+    if tokens is None or len(tokens) < 3:  # need command + >= 1 source + dest
+        return None
+    rest = tokens[1:]
+    for i, tok in enumerate(rest):
+        if (
+            tok == "--target-directory" or _CP_MV_TARGET_FLAG_RE.fullmatch(tok)
+        ) and i + 1 < len(rest):
+            # `-t DIR`: DIR (rest[i+1]) is the target; every OTHER positional is
+            # a source.
+            srcs = [
+                t
+                for j, t in enumerate(rest)
+                if not t.startswith("-") and j != i + 1
+            ]
+            return srcs or None
+        if tok.startswith("--target-directory="):
+            srcs = [t for t in rest if not t.startswith("-")]
+            return srcs or None
+    non_flags = [t for t in rest if not t.startswith("-")]
+    if len(non_flags) < 2:  # need >= 1 source + destination
+        return None
+    return non_flags[:-1]
+
+
+def _mv_has_escaping_source(command: str, seg: str, cwd: str) -> bool:
+    """cpp#280 (gate-KO on cpp#279): whether a `mv` segment has a SOURCE operand
+    that escapes BOTH the worktree and every recognized scratch root — in which
+    case the derived-/mktemp-scratch DESTINATION carve must NOT fire and the deny
+    stays TERMINAL.
+
+    For `mv` the source is a WRITE — it is DELETED from its origin — so
+    `mv /etc/passwd "$D/"` MOVES a system file into scratch and must stay lethal.
+    `cp`'s source is only a READ (`cp /etc/passwd "$D/"` stays survivable, cpp#279
+    AC3), so this returns ``False`` for any non-`mv` segment and the `cp` carve is
+    byte-identical to cpp#279. The verb is read from the segment's leading word
+    (`_LEADING_CMD_RE`), the SAME classification `_segment_write_kind` uses.
+
+    A source is CONTAINED (non-escaping) when it roots at a recognized scratch —
+    the SAME `_is_transitive_ce_scratch_sink_target` (derived `$VAR` scratch) /
+    `_is_mktemp_scratch_redirect_target` (same-command `$(mktemp)` var) /
+    `_is_sanctioned_tmp_scratch` (literal `/tmp/…`) the DESTINATION axis itself
+    recognizes — OR it is a clean worktree-relative operand: not absolute, not
+    `$`/`~`-rooted, with no `..` component. A clean relative source always names
+    something inside the worktree (and `mv` relocates a symlink ENTRY rather than
+    following it), so its deletion is in-envelope — the SAME "contained by
+    accident" posture the cpp#209 `$VAR`-destination carve already relies on.
+
+    The classification is purely LEXICAL, deliberately NOT `is_within_project`:
+    that fails closed to ``False`` for every path in a torn-down worktree (the
+    cpp#209 incident window), which would BOTH mask an out-of-tree source and
+    wrongly terminalize a legitimate relative one — so a literal `mv crates/x.rs
+    "$D/"` must stay survivable in both cwd worlds (the ratified cpp#209 mv
+    positive) while `mv /etc/passwd "$D/"` stays terminal in both. A `mv` whose
+    operands cannot be parsed fails closed to escaping (the deny stays terminal).
+    """
+    m = _LEADING_CMD_RE.match(seg)
+    if m is None or m.group(1) != "mv":
+        return False
+    sources = _extract_cp_mv_sources(seg)
+    if sources is None:
+        return True  # unparseable operands → fail closed (stays terminal)
+    for src in sources:
+        if (
+            _is_transitive_ce_scratch_sink_target(command, src, cwd)
+            or _is_mktemp_scratch_redirect_target(command, src)
+            or _is_sanctioned_tmp_scratch(src)
+        ):
+            continue
+        if (
+            src.startswith("~")
+            or src.startswith("$")
+            or Path(src).is_absolute()
+            or any(part == ".." for part in src.split("/"))
+        ):
+            return True
+    return False
+
+
 def _extract_mkdir_destinations(seg: str) -> list[str] | None:
     """Every directory operand of a `mkdir` segment (each is created).
 
@@ -1706,10 +1798,58 @@ def _destination_veto_reason(
             # lethality verdict for this one named idiom independent of
             # whether `cwd` happens to resolve at all, rather than leaving it
             # to that accident either way.
+            #
+            # cpp#280 (gate-KO): the carve is the DESTINATION axis, which is
+            # correct for `cp` (source is a READ) but NOT for `mv` — a `mv`
+            # DELETES its source, so `mv /etc/passwd "$T/"` (T from `mktemp`)
+            # MOVES a system file into scratch and must stay TERMINAL. For `mv`
+            # only, require every SOURCE to be contained too
+            # (`_mv_has_escaping_source`); `cp` is unaffected (the guard returns
+            # ``False`` for any non-`mv` segment).
             if (
                 for_lethality
                 and kind == "bash-cp-mv"
                 and _is_mktemp_scratch_redirect_target(command, dest)
+                and not _mv_has_escaping_source(command, seg, cwd)
+            ):
+                continue
+            # cpp#279: the DERIVED-SCRATCH twin of the mktemp cp carve just above —
+            # and the cp/mv completion of the cpp#272/#273 `.pilot-scratch`/mktemp/
+            # `/tmp` carve that, until now, covered only the redirect and (bare) the
+            # mkdir sink. A `cp`/`mv` DESTINATION operand rooted at a variable that
+            # (LAST-WINS, transitively, reads-only) roots at a recognized derived
+            # scratch — `.pilot-scratch/…`, `$PWD/.pilot-scratch/…`, `$(mktemp -d)`,
+            # `/tmp/…` — with a `..`-free sub-path tail is survivable, like the
+            # redirect: `cp x.sh "$FAL/"`, `cp x.sh "$D/a"` (the 4617da8f death).
+            # The DESTINATION is the containment axis: `_extract_cp_mv_destination`
+            # already resolved it to the `-t`/`--target-directory` value or the LAST
+            # positional operand, so a copy INTO scratch is carved while the SOURCE
+            # (a read, broadly allowed) is not the axis — `cp /etc/passwd "$D/"`
+            # copies an out-of-tree file INTO scratch and is survivable (AC3), while
+            # `cp x "$D/a" /etc/` (final dest `/etc/`, out of scratch) stays TERMINAL
+            # because THAT dest fails the resolver and falls to the containment
+            # veto below. Uses the SAME shared resolver as the mkdir/redirect sinks
+            # (`_is_transitive_ce_scratch_sink_target` → `_value_roots_at_scratch`),
+            # so a var reassigned OUT of scratch stays terminal and a link creator
+            # in the compound re-terminalizes the `.pilot-scratch` branch (cpp#273).
+            # `for_lethality`-gated — admission (the deny) is byte-identical; only
+            # `_denial_is_terminal` flips True→False. Checked BEFORE the cpp#211
+            # `$`/`~` veto, which would otherwise terminalize `"$D/…"` outright.
+            #
+            # cpp#280 (gate-KO): the DESTINATION-is-the-containment-axis rule holds
+            # for `cp` (source is a READ: `cp /etc/passwd "$D/"` survivable, AC3)
+            # but NOT for `mv` — `mv` DELETES its source, so the source is itself a
+            # WRITE. `mv /etc/passwd "$D/"` wrongly became survivable here; it moves
+            # a system file into scratch and must stay TERMINAL. For `mv` only, the
+            # carve additionally requires EVERY SOURCE to resolve in-worktree or
+            # under a scratch root (`_mv_has_escaping_source`, the SAME scratch
+            # resolver as the destination). `cp` is UNCHANGED (the guard is a no-op
+            # for any non-`mv` segment), so all the cpp#279 cp positives hold.
+            if (
+                for_lethality
+                and kind == "bash-cp-mv"
+                and _is_transitive_ce_scratch_sink_target(command, dest, cwd)
+                and not _mv_has_escaping_source(command, seg, cwd)
             ):
                 continue
             # cpp#211: a `cp`/`mv` destination that (after `_extract_cp_mv_
@@ -1776,10 +1916,22 @@ def _destination_veto_reason(
             # cpp#201/#209 mktemp lethality carve just above. The direct-reassign
             # admission gap (`X=/tmp/ok; X=$HOME/evil; mkdir "$X"`) is a
             # pre-existing non-last-wins axis-A defect, out of scope (cpp#224).
+            # cpp#279: the mkdir sink now follows a derived-scratch var WITH a
+            # `..`-free sub-path (`mkdir -p "$D/a"`) via the suffix-aware
+            # `_is_transitive_ce_scratch_mkdir_target` (completes the cpp#272 carve
+            # the issue flagged — the mkdir transitive sink was bare-`$VAR` only).
+            # It ALSO consults `_is_mktemp_scratch_redirect_target` here, the SAME
+            # mktemp-var carve the cp and redirect sinks already OR in — so a
+            # `$(mktemp -d)` root (which the lexical `_value_roots_at_scratch`
+            # resolver does not itself recognize) is survivable through mkdir too,
+            # not just cp/redirect. Same root, now consistent across every sink.
             if (
                 for_lethality
                 and kind == "bash-mkdir"
-                and _is_transitive_ce_scratch_mkdir_target(command, dest, cwd)
+                and (
+                    _is_transitive_ce_scratch_mkdir_target(command, dest, cwd)
+                    or _is_mktemp_scratch_redirect_target(command, dest)
+                )
             ):
                 continue
             if kind == "bash-mkdir" and (
