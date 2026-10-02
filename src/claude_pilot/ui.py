@@ -158,8 +158,57 @@ def _lethality_suffix(terminal: bool) -> str:
     return TERMINAL_SUFFIX if terminal else NON_TERMINAL_SUFFIX
 
 
+#: cpp#262 — the glyph a raw newline in a deny ``detail`` renders as, so one
+#: refusal is ONE physical line (AC1). Before this, a multi-line script's
+#: `detail` carried raw newlines: `grep '[policy:deny]'` returned only line 1,
+#: while the `rule_id` + lethality suffix sat on a later, untagged physical line
+#: (or vanished to the 200-char truncation). Collapsing every hard break to a
+#: single visible glyph keeps the command, the named segment, the `rule_id` and
+#: the lethality on ONE grep-able line — the shape `dispatch-lib.sh` (mika#1097)
+#: and the Signal-S `^dispatch-lib: ` anchor already expect.
+NEWLINE_GLYPH = "⏎"
+
+
+def _one_physical_line(text: str) -> str:
+    """Collapse every hard line break to ``NEWLINE_GLYPH`` (cpp#262 AC1)."""
+    return (
+        text.replace("\r\n", NEWLINE_GLYPH)
+        .replace("\n", NEWLINE_GLYPH)
+        .replace("\r", NEWLINE_GLYPH)
+    )
+
+
+def _deny_diag_fields(
+    segment: str | None, cause: str | None, segment_count: int, cmd_hash: str | None
+) -> str:
+    """The cpp#262 fields appended after the command excerpt on a deny line:
+    ``segment="…" cause=… [1 of N] sha256:…``.
+
+    Each is emitted only when supplied, so a non-Bash denial (no segment, no
+    hash) renders exactly as before — the fields APPEND, never reshaping the
+    `[policy:deny] <tool>: ` prefix nor the trailing lethality suffix, so the
+    cross-repo `dispatch-lib.sh` reader (AC6) keeps matching the line."""
+    parts = ""
+    if segment is not None:
+        parts += f' segment="{_one_physical_line(segment)}"'
+        if cause is not None:
+            more = f" (1 of {segment_count})" if segment_count > 1 else ""
+            parts += f" cause={_one_physical_line(cause)}{more}"
+    if cmd_hash is not None:
+        parts += f" sha256:{cmd_hash}"
+    return parts
+
+
 def log_policy_deny(
-    tool_name: str, detail: str, rule_id: str | None, *, terminal: bool
+    tool_name: str,
+    detail: str,
+    rule_id: str | None,
+    *,
+    terminal: bool,
+    segment: str | None = None,
+    cause: str | None = None,
+    segment_count: int = 1,
+    cmd_hash: str | None = None,
 ) -> None:
     """Render a policy refusal, naming whether it also ends the run (cpp#151).
 
@@ -170,15 +219,36 @@ def log_policy_deny(
     tier3-dangerous Bash — correct behaviour) and "died despite
     ``interrupt=False``" (the actual residue). A default value here would let a
     future call site silently rejoin the two populations.
+
+    cpp#262 (OBSERVABILITY, no decision change): the line is now ONE physical
+    line (newlines in ``detail``/``segment`` escaped), and for a Bash refusal it
+    NAMES the refused segment (``segment=`` + ``cause=``) and carries a short
+    ``sha256:`` hash of the FULL command — so a multi-line script no longer
+    misattributes the denial to its first line, and the full command stays
+    recoverable from the transcript. These extra fields come from a READ-ONLY
+    diagnostic re-walk (``permissions._diagnose_refused_bash``); they never
+    touch the decision. The ``[policy:deny] <tool>: `` prefix and the trailing
+    lethality suffix are unchanged.
     """
     tag = f" [{rule_id}]" if rule_id else ""
     _log(
         f"{RED}[policy:deny]{RESET} {BOLD}{tool_name}{RESET}: "
-        f"{detail}{tag}{_lethality_suffix(terminal)}"
+        f"{_one_physical_line(detail)}"
+        f"{_deny_diag_fields(segment, cause, segment_count, cmd_hash)}"
+        f"{tag}{_lethality_suffix(terminal)}"
     )
 
 
-def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None) -> None:
+def log_policy_deny_with_notify(
+    tool_name: str,
+    detail: str,
+    rule_id: str | None,
+    *,
+    segment: str | None = None,
+    cause: str | None = None,
+    segment_count: int = 1,
+    cmd_hash: str | None = None,
+) -> None:
     """Log a policy decision of ``escalate`` (wire-format) = deny-with-notify.
 
     Renamed from ``log_policy_escalate`` in cpp#20/#21: the runtime semantics
@@ -192,9 +262,13 @@ def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None
     # so deliberately — an escalate exists to put a human in the loop). The
     # suffix is rendered anyway so every refusal line in the log states its
     # lethality, and so the AC5 grep for `(non-terminal)` cannot match here.
+    # cpp#262: same one-physical-line escaping + segment/hash fields as the
+    # plain deny, for the Bash-escalate case.
     _log(
         f"{YELLOW}[policy:deny_with_notify]{RESET} {BOLD}{tool_name}{RESET}: "
-        f"{detail}{tag}{TERMINAL_SUFFIX}"
+        f"{_one_physical_line(detail)}"
+        f"{_deny_diag_fields(segment, cause, segment_count, cmd_hash)}"
+        f"{tag}{TERMINAL_SUFFIX}"
     )
 
 
