@@ -121,13 +121,16 @@ which now runs foreground. In the pinned bundled CLI the per-command timeout is
 clamped to a **max cap** (`BASH_MAX_TIMEOUT_MS`; the *default* read is the
 separate `BASH_DEFAULT_TIMEOUT_MS`), defaulting to the built-in 10-min ceiling —
 too short for a full workspace build. We therefore add `BASH_MAX_TIMEOUT_MS =
-1_800_000` (30 min) to the **same** `ClaudeAgentOptions.env`
+1_680_000` (28 min) to the **same** `ClaudeAgentOptions.env`
 (`_CLI_FORCE_FOREGROUND_ENV`), raising only the max cap so a long
 explicit-timeout or default build can run foreground to completion; the default
 (`BASH_DEFAULT_TIMEOUT_MS`) is left untouched, so short commands keep the 2-min
-default. The var name was verified at source by grepping the bundled CLI binary —
-both `BASH_MAX_TIMEOUT_MS` (max, `Math.max(r, default)`) and
-`BASH_DEFAULT_TIMEOUT_MS` (default, falls back to 120 000 ms) are present, and
+default. **The cap is kept strictly BELOW claude-pilot's own `toolWaitCeilingMs`
+(1_800_000 ms = 1800 s):** a Bash command that ran exactly to a 30-min cap would
+race the pilot's tool-wait guardrail (cpp#276 post-merge note), so 28 min sits
+under the ceiling with margin. The var name was verified at source by grepping
+the bundled CLI binary — both `BASH_MAX_TIMEOUT_MS` (max, `Math.max(r, default)`)
+and `BASH_DEFAULT_TIMEOUT_MS` (default, falls back to 120 000 ms) are present, and
 the max-cap symbol is the one we raise.
 
 ## The belt — FORCE `run_in_background=False` on the already-reached hook

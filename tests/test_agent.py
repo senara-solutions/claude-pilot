@@ -710,10 +710,13 @@ async def test_cpp267_run_agent_sets_disable_background_tasks_env_in_cli_subproc
     # cap, because disabling background tasks forces a long build (e.g.
     # `cargo test --workspace`) to run FOREGROUND under the Bash tool's timeout.
     # `BASH_MAX_TIMEOUT_MS` (the max cap, not the `BASH_DEFAULT_TIMEOUT_MS`
-    # default) is raised to 30 min = 1_800_000 ms so the foreground build can run
-    # to completion. Asserted as the exact integer-as-string the CLI parses.
-    assert env.get("BASH_MAX_TIMEOUT_MS") == "1800000"
-    assert int(env["BASH_MAX_TIMEOUT_MS"]) == 30 * 60 * 1000
+    # default) is raised to 28 min = 1_680_000 ms — kept strictly UNDER the 1800 s
+    # toolWaitCeilingMs so a cap-length command never races the guardrail.
+    # Asserted as the exact integer-as-string the CLI parses.
+    assert env.get("BASH_MAX_TIMEOUT_MS") == "1680000"
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) == 28 * 60 * 1000
+    # strictly below claude-pilot's 1800 s tool-wait ceiling (no race).
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) < 1800 * 1000
     # A COPY of the module constant, not the shared object: a later env merge (by
     # the SDK or a future caller) must not corrupt the constant across sessions.
     assert env is not agent_module._CLI_FORCE_FOREGROUND_ENV
@@ -727,12 +730,14 @@ def test_cpp267_force_foreground_env_constant_is_canonical_truthy() -> None:
     env = agent_module._CLI_FORCE_FOREGROUND_ENV
     assert env == {
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-        "BASH_MAX_TIMEOUT_MS": "1800000",
+        "BASH_MAX_TIMEOUT_MS": "1680000",
     }
     assert env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "value must be truthy"
-    # cpp#267 follow-up (mika#2630): the raised Bash MAX timeout cap, 30 min, so a
-    # foreground long build survives after background detach was removed.
-    assert int(env["BASH_MAX_TIMEOUT_MS"]) == 30 * 60 * 1000
+    # cpp#267 follow-up (mika#2630): the raised Bash MAX timeout cap, 28 min, kept
+    # strictly UNDER the 1800 s toolWaitCeilingMs so a cap-length foreground build
+    # survives after background detach was removed WITHOUT racing the guardrail.
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) == 28 * 60 * 1000
+    assert int(env["BASH_MAX_TIMEOUT_MS"]) < 1800 * 1000
 
 
 # ── cpp#55: _extract_session_id / _extract_model read SystemMessage.data ──────
