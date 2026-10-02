@@ -24,14 +24,17 @@ from claude_pilot.tier1 import (
     INTRA_PLATFORM_AGENTS,
     TIER3_PATTERNS,
     _ce_scratch_variable_names,
+    _command_creates_link,
     _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_mktemp_scratch_redirect_target,
+    _is_pilot_scratch_rel,
     _is_safe_command_builtin,
     _is_safe_sed_print_only,
     _is_safe_sort_command,
     _is_safe_xargs_command,
     _is_transitive_ce_scratch_mkdir_target,
+    _is_transitive_ce_scratch_redirect_target,
     _is_uid_tolerant_tmp_scratch,
     _last_assignment_value,
     _last_real_assignment_value,
@@ -4560,6 +4563,236 @@ class TestCeScratchSanctionUnit:
         chain += '; mkdir -p "$V50"'
         start = time.perf_counter()
         _is_transitive_ce_scratch_mkdir_target(chain, "$V50")
+        assert (time.perf_counter() - start) < 0.05
+
+    # ── cpp#272: the worktree `.pilot-scratch/` root joins the resolver ───────
+    def test_pilot_scratch_rel_recognizer(self) -> None:
+        # Worktree-relative `.pilot-scratch/<path>` (and the bare root) → scratch.
+        for v in (
+            ".pilot-scratch",
+            ".pilot-scratch/git-probe",
+            ".pilot-scratch/a/b/c.txt",
+        ):
+            assert _is_pilot_scratch_rel(v) is True, v
+        # `..`, a leading `/`, a `$`-bearing value, or a different dir → NOT.
+        for v in (
+            ".pilot-scratch/../etc",
+            "../.pilot-scratch/x",
+            "/abs/.pilot-scratch/x",
+            ".pilot-scratch-evil/x",
+            ".pilot-scratchX",
+            "$PWD/.pilot-scratch/x",  # not a LITERAL root (goes via the resolver)
+            "src/x",
+            "",
+        ):
+            assert _is_pilot_scratch_rel(v) is False, v
+
+    def test_transitive_mkdir_roots_at_pilot_scratch(self) -> None:
+        # The c722b251 shapes: a bare `$VAR` assigned the `.pilot-scratch` root,
+        # directly and via `$PWD`/`$PWD/$D` composition. LEXICAL (cwd=None).
+        for cmd, var in (
+            ('D=.pilot-scratch/git-probe; mkdir -p "$D"', "$D"),
+            ('R="$PWD/.pilot-scratch/repo"; mkdir -p "$R"', "$R"),
+            ('R="${PWD}/.pilot-scratch/repo"; mkdir -p "$R"', "$R"),
+            (
+                "D=.pilot-scratch/git-probe; "
+                'R="$PWD/$D/repo"; mkdir -p "$R"',
+                "$R",
+            ),
+        ):
+            assert _is_transitive_ce_scratch_mkdir_target(cmd, var) is True, cmd
+
+    def test_transitive_redirect_roots_at_pilot_scratch(self) -> None:
+        # A redirect target CARRYING a suffix (`"$D/a.txt"`) — the mkdir predicate
+        # is bare-`$VAR`-only, so the redirect twin handles the tail.
+        for cmd, dest in (
+            ('D=.pilot-scratch/x; printf x > "$D/a.txt"', '"$D/a.txt"'),
+            ('D=.pilot-scratch/x; printf x > "$D/a.txt"', "$D/a.txt"),
+            ('R="$PWD/.pilot-scratch/r"; printf x > "$R/a"', "$R/a"),
+            ("D=.pilot-scratch/x; printf x > \"$D\"", "$D"),  # bare, no tail
+        ):
+            assert (
+                _is_transitive_ce_scratch_redirect_target(cmd, dest) is True
+            ), (cmd, dest)
+
+    def test_pilot_scratch_negatives_stay_unrecognized(self) -> None:
+        # Traversal out, out-of-worktree `$PWD/..`, a `..` redirect tail, and a
+        # non-`.pilot-scratch` `$PWD/<x>` all fail LEXICALLY (cwd=None).
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/../../etc; mkdir -p "$D"', "$D"
+            )
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_mkdir_target('R="$PWD/../x"; mkdir -p "$R"', "$R")
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_mkdir_target('R="$PWD/foo"; mkdir -p "$R"', "$R")
+            is False
+        )
+        assert (
+            _is_transitive_ce_scratch_redirect_target(
+                'D=.pilot-scratch/x; printf x > "$D/../../etc/p"', "$D/../../etc/p"
+            )
+            is False
+        )
+
+    def test_pilot_scratch_reads_only_reassignment_still_catches(self) -> None:
+        # The cpp#270 inverted reads-only rule is UNCHANGED for a `.pilot-scratch`
+        # var: a reassignment OUT of scratch, in ANY form, un-recognizes it.
+        for reassign in (
+            "D=/etc",
+            "export D=/etc",
+            ": ${D:=/etc}",
+            "{ D=/etc; }",
+            "read D < f",
+            "let D=1",
+            "for D in /etc; do :; done",
+        ):
+            cmd = f'D=.pilot-scratch/x; {reassign}; mkdir -p "$D"'
+            assert (
+                _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is False
+            ), cmd
+            rcmd = f'D=.pilot-scratch/x; {reassign}; printf x > "$D/a"'
+            assert (
+                _is_transitive_ce_scratch_redirect_target(rcmd, "$D/a") is False
+            ), rcmd
+        # A reassignment BEFORE the scratch establisher does not disqualify
+        # (last-wins establisher is scratch, read-only after).
+        cmd = 'D=/etc; D=.pilot-scratch/x; mkdir -p "$D"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$D") is True
+
+    def test_pilot_scratch_pwd_reassignment_fails_closed(self) -> None:
+        # If the command reassigns PWD, the `$PWD` fast-path is skipped and PWD is
+        # resolved as an ordinary (here non-scratch) var → NOT recognized.
+        cmd = 'PWD=/etc; R="$PWD/.pilot-scratch/x"; mkdir -p "$R"'
+        assert _is_transitive_ce_scratch_mkdir_target(cmd, "$R") is False
+
+    def test_pilot_scratch_cwd_containment_is_symlink_aware(self, tmp_path: Path) -> None:
+        # With a cwd supplied (the sink path), a `.pilot-scratch` that is an
+        # OUTBOUND symlink fails fs-aware containment (cpp#213/#38), while a real
+        # (or not-yet-created) worktree `.pilot-scratch` passes.
+        good = tmp_path / "good"
+        (good / ".git").mkdir(parents=True)
+        (good / ".pilot-scratch").mkdir()
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(good)
+            )
+            is True
+        )
+        bad = tmp_path / "bad"
+        (bad / ".git").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (bad / ".pilot-scratch").symlink_to(outside, target_is_directory=True)
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(bad)
+            )
+            is False
+        )
+        # An unresolvable cwd fails closed too.
+        assert (
+            _is_transitive_ce_scratch_mkdir_target(
+                'D=.pilot-scratch/x; mkdir -p "$D"', "$D", str(tmp_path / "nope")
+            )
+            is False
+        )
+
+    # ── cpp#272 gate-KO: a link creator defeats the `.pilot-scratch` carve ────
+    def test_link_creator_detected_at_command_position(self) -> None:
+        # `ln` (any flags), hard `ln`, GNU `link`, and `cp` WITH a symbolic-link
+        # flag (`-s`/`-sf`/`-rs`/`--symbolic-link`), behind keywords / env-assign /
+        # exec-prefix / group-opener, in any segment → detected.
+        for cmd in (
+            'ln -s /etc "$D/l"',
+            'ln -sf /etc x',
+            "ln /a /b",  # hard link
+            "link a b",  # GNU link
+            'D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/passwd"',
+            "mkdir -p x && ln -s /etc y",
+            "sudo ln -s /etc x",
+            "env ln -s /etc x",
+            "true; then ln -s /etc x",
+            "FOO=1 ln -s /etc x",
+            "(ln -s /etc x)",
+            "{ ln -s /etc x; }",
+            'cp -s /etc "$D/l"',  # cp symbolic-link == ln -s
+            "cp --symbolic-link /etc x",
+            "cp -sf /etc x",  # grouped short flags carrying `s`
+            "cp -rs src x",  # recursive + symbolic
+            "sudo cp -s /etc x",
+            "mkdir -p x && cp -s /etc y",
+        ):
+            assert _command_creates_link(cmd) is True, cmd
+
+    def test_link_creator_quoted_or_glued_is_not_a_command(self) -> None:
+        # `ln`/`link`/`cp -s` NAMED in a quoted string, glued in a path, or sitting
+        # as an argument is NOT a command head — no false trigger (the carve's
+        # positives survive). A quoted separator stays inert (quote-aware split).
+        for cmd in (
+            'echo "use ln -s to link"',
+            "printf 'ln' > out",
+            "cat $D/ln",
+            "/usr/bin/ln -s /etc x",  # path-glued: not the bare `ln` token
+            'D=.pilot-scratch/ln-cache; mkdir -p "$D"',
+            'D=.pilot-scratch/x; echo "; ln foo" > "$D/a"',  # `;ln` inside quotes
+            "unlink foo",  # not a link creator, and `ln` is glued in `unlink`
+            'D=.pilot-scratch/x; mkdir -p "$D"; printf x > "$D/a.txt"',
+            'echo "cp -s /etc x"',  # quoted cp -s
+            "printf 'cp -s' > out",
+            "cat $D/cp",  # path-glued cp
+        ):
+            assert _command_creates_link(cmd) is False, cmd
+
+    def test_cp_is_a_link_creator_only_with_symbolic_flag(self) -> None:
+        # The gate's sharp edge: `cp` WITH `-s`/`--symbolic-link` plants a symlink
+        # (detected); an ORDINARY `cp` (no `-s`) is a plain copy and must NOT
+        # trigger — else a legitimate `cp a "$D/b"` / `cp -r src "$D/"` in a
+        # `.pilot-scratch` script would be wrongly re-terminalized.
+        for yes in ("cp -s a b", "cp -sf a b", "cp -rs a b", "cp --symbolic-link a b"):
+            assert _command_creates_link(yes) is True, yes
+        for no in (
+            'cp a "$D/b"',  # ordinary copy
+            'cp -r src "$D/"',  # recursive, no -s
+            "cp -p -r a b",
+            "cp -S .bak a b",  # -S (uppercase) is --suffix, takes an arg, NOT symbolic
+            "cp --suffix=.s a b",  # long option carrying `s` but not symbolic
+            "cp --sparse=always a b",
+            "cp -- -s a b",  # `--` ends options; `-s` is then a filename
+        ):
+            assert _command_creates_link(no) is False, no
+
+    def test_link_creator_gates_pilot_scratch_carve_not_tmp(self) -> None:
+        # Scoped: the `ln` guard re-terminalizes a `.pilot-scratch` root, but the
+        # `/tmp`/mktemp roots (recognized earlier) are UNTOUCHED — a link creator
+        # there does not flip their recognition (lexical cwd=None).
+        assert (
+            _is_transitive_ce_scratch_redirect_target(
+                'D=.pilot-scratch/x; ln -s /etc "$D/l"; printf x > "$D/l/p"',
+                "$D/l/p",
+            )
+            is False
+        )
+        # Same resolver, `/tmp` root + a link creator: still recognized (the guard
+        # lives only in the `.pilot-scratch` branch).
+        assert (
+            _is_transitive_ce_scratch_redirect_target(
+                'D=/tmp/ce-x; ln -s /etc "$D/l"; printf x > "$D/a"', "$D/a"
+            )
+            is True
+        )
+
+    def test_link_creator_detection_under_50ms(self) -> None:
+        import time
+
+        chain = "; ".join(f'mkdir -p "$V{i}"' for i in range(200))
+        chain = 'D=.pilot-scratch/x; ' + chain + '; ln -s /etc "$D/l"'
+        start = time.perf_counter()
+        _command_creates_link(chain)
         assert (time.perf_counter() - start) < 0.05
 
 

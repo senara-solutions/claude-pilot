@@ -38,6 +38,7 @@ from .tier1 import (
     _is_lexically_disqualified_redirect_target,
     _is_mktemp_scratch_redirect_target,
     _is_transitive_ce_scratch_mkdir_target,
+    _is_transitive_ce_scratch_redirect_target,
     _is_uid_tolerant_tmp_scratch,
     _mask_lethality_heredoc_redirect_chars,
     _mask_lethality_redirect_chars,
@@ -1610,8 +1611,21 @@ def _destination_veto_reason(
                     # regresses the ratified `$HOME`-stays-terminal invariant
                     # (cpp#154 D3 / cpp#157) — see
                     # `_is_mktemp_scratch_redirect_target`'s block comment.
-                    if for_lethality and _is_mktemp_scratch_redirect_target(
-                        command, dest
+                    # cpp#272: the mktemp carve's derived-scratch twin — a
+                    # redirect target rooted at a variable that (LAST-WINS,
+                    # transitively, reads-only) roots at a recognized scratch:
+                    # `/tmp` (cpp#266), `$(mktemp -d)` (cpp#270), or the
+                    # repo-prescribed worktree `.pilot-scratch/` /
+                    # `$PWD/.pilot-scratch/` root. The SAME resolver the `bash-
+                    # mkdir` transitive carve uses (`_value_roots_at_scratch`),
+                    # so a var reassigned OUT of scratch stays terminal and
+                    # admission is byte-identical (for_lethality-gated). `$HOME`,
+                    # `..`-tails, and non-scratch roots fall through, vetoed.
+                    if for_lethality and (
+                        _is_mktemp_scratch_redirect_target(command, dest)
+                        or _is_transitive_ce_scratch_redirect_target(
+                            command, dest, cwd
+                        )
                     ):
                         continue
                     return (
@@ -1764,7 +1778,7 @@ def _destination_veto_reason(
             if (
                 for_lethality
                 and kind == "bash-mkdir"
-                and _is_transitive_ce_scratch_mkdir_target(command, dest)
+                and _is_transitive_ce_scratch_mkdir_target(command, dest, cwd)
             ):
                 continue
             if kind == "bash-mkdir" and (
