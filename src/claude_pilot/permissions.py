@@ -423,8 +423,25 @@ def _is_sanctioned_pure_heredoc(command: str) -> bool:
 # statement separators only (`_FOR_STMT_SEP`).
 _FOR_BLANK = r"(?:[ \t]|\\\r?\n)"
 
-# Statement separator inside the loop body: `;` or a newline, either padded.
-_FOR_STMT_SEP = r"(?:[ \t]*(?:;|\r?\n)[ \t]*)+"
+# Statement separator inside the loop body: one or more `;` / newline, each
+# optionally followed by blanks.
+#
+# UNAMBIGUOUS BY CONSTRUCTION (cpp#283 ReDoS). Every blank has exactly ONE owner:
+#   - blanks BEFORE the first `;`/newline belong to the preceding `_FOR_CMD`,
+#     whose trailing `{_FOR_BLANK}*` already covers `[ \t]` (and the backslash
+#     continuation). The separator therefore has NO leading blank: the old
+#     `[ \t]*` head re-matched the same characters as `_FOR_CMD`'s tail.
+#   - blanks AFTER a `;`/newline belong to that repetition's tail. Each
+#     repetition starts on a `;`/newline, which no blank can match, so the
+#     boundary between two repetitions is forced.
+# The old form `(?:[ \t]*(?:;|\r?\n)[ \t]*)+` let a blank run between two
+# separators be the tail of one repetition OR the head of the next: a failed
+# match retried all 2^n splits (n=16 indented blank lines froze the classifier
+# > 20 s). The language recognized by the composed regex is unchanged — this
+# constant is only ever used right after a `_FOR_PIPELINE` (which ends in
+# `_FOR_CMD`), and `{_FOR_BLANK}*[ \t]*` == `{_FOR_BLANK}*`. Do NOT use it
+# anywhere a `_FOR_CMD` does not immediately precede it.
+_FOR_STMT_SEP = r"(?:(?:;|\r?\n)[ \t]*)+"
 
 # One argument, quote-aware. A double-quoted region may hold `|`, `>`, `\` and
 # `$var` because bash treats them as text there — that is exactly the grep
