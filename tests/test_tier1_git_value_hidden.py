@@ -192,6 +192,9 @@ def test_handler_refuses_hidden_values_without_ending_the_run(command: str, hand
     [
         "git push -u origin fix/foo",
         "git push -u origin $(git branch --show-current)",
+        # Parity: an allowlisted substitution is redacted to `_SUB_` BEFORE the
+        # veto runs; checked on the raw text, these real pilot reads would flip.
+        "git diff --name-only $(git merge-base HEAD origin/main)",
         "git diff $BASE HEAD",
         "git status",
         'git commit -m "fix [ci] thing?"',
