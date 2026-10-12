@@ -3375,8 +3375,8 @@ _GIT_DENIED_GLOBAL_FLAG_RE = re.compile(
 #   (c) any expansion at all in a git subcommand that writes (everything but
 #       `_GIT_READ_SUBCOMMANDS`, and anything after a global option), or in
 #       the subcommand word itself;
-#   (d) `push`: an unquoted glob, `--all`/`--mirror`, a `+` force refspec, a
-#       force flag, or a refspec whose destination resolves to main/master
+#   (d) `push`: an unquoted glob, `--all`/`--mirror`, a `+` force refspec,
+#       or a refspec whose destination resolves to main/master
 #       (`main`, `heads/main`, `refs/heads/main`) — judged on the quote-removed
 #       words, i.e. on what git actually receives;
 #   (e) any git argument that is a quoted or escaped spelling of a guarded flag
@@ -3585,7 +3585,7 @@ def _git_push_target_hidden(args: list[_ShellWord]) -> bool:
         t = w.text
         if w.glob:
             return True
-        if t in ("--all", "--mirror") or _FORCE_FLAG_RE.search(t):
+        if t in ("--all", "--mirror"):
             return True
         if t.startswith("-"):
             continue
@@ -3669,18 +3669,6 @@ def _git_words_hide_value(words: list[_ShellWord]) -> bool:
     return False
 
 
-def _raw_and_evaluated_tokens(sub: str) -> list[str] | None:
-    """Whitespace tokens of *sub*, then the quote-removed words git receives.
-
-    Token guards run on both so quote splicing (`-"D"`) is seen. ``None`` when
-    the lexer cannot follow *sub* — callers refuse.
-    """
-    words = _lex_shell_words(sub)
-    if words is None:
-        return None
-    return sub.split() + [w.text for w in words]
-
-
 def git_argument_value_hidden(command: str) -> bool:
     """True when a git argument's value cannot be read off *command*'s text.
 
@@ -3709,27 +3697,18 @@ def is_safe_git_command(sub: str) -> bool:
     if git_sub not in SAFE_GIT_SUBCOMMANDS:
         return False
 
-    # Expansion / hidden-assignment refusal (`git_argument_value_hidden`) is
-    # applied once, to the WHOLE command, at the top of `is_safe_bash_command`
-    # — a sub-command alone cannot see an assignment made in a sibling segment.
-    # The guards below read text; run them on what git receives as well as on
-    # the raw spelling, so quote splicing (`-"f"`, `HEAD:"ma"in`) is seen.
-    tokens = _raw_and_evaluated_tokens(sub)
-    if tokens is None:
+    if _FORCE_FLAG_RE.search(sub):
         return False
-    evaluated = " ".join(tokens[len(sub.split()):])
-    for text in (sub, evaluated):
-        if _FORCE_FLAG_RE.search(text):
-            return False
-        if _GIT_DENIED_GLOBAL_FLAG_RE.search(text):
-            return False
-        if git_sub == "push" and _MAIN_MASTER_RE.search(text):
-            return False
+    if _GIT_DENIED_GLOBAL_FLAG_RE.search(sub):
+        return False
+    if git_sub == "push" and _MAIN_MASTER_RE.search(sub):
+        return False
     if git_sub == "branch":
         # cpp#103 minor resserrement: extend mutant-flag deny beyond `-D` to
         # cover `-d`/`-m`/`-M`/`--delete`/`--move`. `--force`/`-f` already
         # caught by `_FORCE_FLAG_RE`. Token-based check avoids the
         # `-\w*[dDmM]` false-positive on `--diff-filter=D` and similar.
+        tokens = sub.split()
         for tok in tokens:
             if tok in _GIT_BRANCH_MUTANT_TOKENS:
                 return False
@@ -3967,11 +3946,8 @@ def _is_safe_git_readonly_sub(sub: str) -> bool:
     if ">" in sub or "<" in sub:
         return False
 
-    # Tokenize on whitespace; check each token against deny sets — both the raw
-    # tokens and the quote-removed words git receives (`-"D"`, `--"output"=`).
-    tokens = _raw_and_evaluated_tokens(sub)
-    if tokens is None:
-        return False
+    # Tokenize on whitespace; check each token against deny sets.
+    tokens = sub.split()
     for tok in tokens:
         if tok in _GIT_READONLY_DENIED_TOKENS:
             return False
