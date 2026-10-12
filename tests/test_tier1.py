@@ -5467,7 +5467,7 @@ class TestMika1686BaseScopeProbe:
             "BASE=main; echo XBASE=$(git merge-base HEAD main)",
             'BASE=main; echo "x; BASE=$(git merge-base HEAD main)"',
             "PATH=/tmp; git status",
-            "PATH=bin; git status",
+            "BASE=main; PATH=bin; git log $BASE",
             'BASE=main; echo "x; BASE=$(git merge-base HEAD main) y"',
             "BASE=a$X; echo $BASE",
             "BASE=_SUB_; git diff $BASE",
