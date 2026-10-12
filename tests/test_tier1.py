@@ -5463,6 +5463,14 @@ class TestMika1686BaseScopeProbe:
             # the assignment alone (how the chain-safe path sees one segment)
             "BASE=main",
             "BASE=$(git merge-base HEAD main)",
+            # each condition of the shape, isolated next to a valid assignment
+            "BASE=main; echo XBASE=$(git merge-base HEAD main)",
+            'BASE=main; echo "x; BASE=$(git merge-base HEAD main)"',
+            "PATH=/tmp; git status",
+            "BASE=a$X; echo $BASE",
+            "BASE=_SUB_; git diff $BASE",
+            "BASE=main; echo $(id)",
+            "BASE=main; echo hi > ~/.bashrc",
         ],
     )
     def test_out_of_shape_stays_refused(self, command: str) -> None:
