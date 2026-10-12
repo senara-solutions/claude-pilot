@@ -2956,7 +2956,8 @@ _GIT_MERGE_BASE_SUBSTITUTIONS: tuple[str, ...] = (
 #
 #   * The assignment is to the exact name `BASE`, from one of the merge-base
 #     tokens above or a literal ref. A token is rewritten to a placeholder only
-#     at a statement start, outside quotes, followed by a boundary. The
+#     at a statement start and outside quotes; the anchored assignment
+#     pattern refuses anything glued after the placeholder. The
 #     placeholder is deliberately NOT the policy path's `_SUB_`, which also
 #     stands for `$(pwd)`, `$(date …)` and `$(git rev-parse …)`.
 #   * Every statement that READS BASE must be read-only git (minus `branch`,
@@ -2975,7 +2976,7 @@ _BASE_PROBE_PLACEHOLDER = "_MERGE_BASE_"
 _BASE_MERGE_BASE_ASSIGN_RE = re.compile(
     r"(?:^|(?<=[;&|\n\r]))[ \t]*BASE=(?:"
     + "|".join(re.escape(tok) for tok in _GIT_MERGE_BASE_SUBSTITUTIONS)
-    + r")(?=[\s;&|]|\Z)"
+    + r")"
 )
 _BASE_ASSIGNMENT_RE = re.compile(
     r"^BASE=(?:" + _BASE_PROBE_PLACEHOLDER
