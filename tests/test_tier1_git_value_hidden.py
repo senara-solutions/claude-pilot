@@ -145,6 +145,8 @@ _SPLICED_OR_EXPANDED_ARG = [
     'git diff --"output"=/tmp/a',
     'git fetch --"upload-pack"=x origin',
     "git diff {--output=/tmp/a,HEAD}",
+    "git diff HEAD{,--output=/tmp/a}",
+    "git log {1..3}",
     "git log *",
     "git log ?ain",
     # Arity: a global option before the subcommand proves nothing about it.
@@ -177,6 +179,10 @@ _STILL_ADMITTED = [
     "git log --oneline -3  # don't care",
     'git log --grep="fix"',
     "git push -u origin feat/heads-up",
+    # Parity (10 pilots): git revision syntax is not brace expansion.
+    "git log --oneline @{u}..HEAD",
+    "git rev-parse @{upstream}",
+    "git rev-parse HEAD^{tree}",
 ]
 
 

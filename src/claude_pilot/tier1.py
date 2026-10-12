@@ -3527,7 +3527,14 @@ def _lex_shell_words(segment: str) -> list[_ShellWord] | None:
             w.glob = True
             w.lead_glob = w.lead_glob or (w.text == "" and not w.quoted)
         elif ch == "{":
-            w.brace = True
+            # Brace expansion needs a `,` or `..` before the closing brace;
+            # git revision syntax (`@{u}`, `HEAD@{1}`, `^{tree}`) has neither.
+            j = i + 1
+            while j < n and segment[j] not in "}" and segment[j] not in _WORD_BREAKS:
+                j += 1
+            body = segment[i + 1:j]
+            if j < n and segment[j] == "}" and ("," in body or ".." in body):
+                w.brace = True
         w.text += ch
         i += 1
 
