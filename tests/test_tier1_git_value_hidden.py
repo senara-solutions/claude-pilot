@@ -92,6 +92,9 @@ _NON_PLAIN_EXPANSION = [
     'git log "$@"',
     "git diff $_",
     "git diff ${_}",
+    # Only the PID is inert; the other special parameters are not.
+    'git stash push -u -m "wip-$!"',
+    'git stash push -u -m "wip-$-"',
 ]
 
 # ── Refused: an assignment the text does not spell (clause a) ────────────────
@@ -136,6 +139,8 @@ _STILL_ADMITTED = [
     "git push -u origin feat/x-y",
     'git commit -m "fix [ci] thing?"',
     "git commit -m 'costs $5'",
+    # Parity (3 pilots): the PID is digits the pilot does not choose.
+    'git stash push -u -m "mika2118-wip-$$"',
     "git add src/a.py tests/test_a.py",
     "printf '%s\\n' a",
     "printf -- -v",

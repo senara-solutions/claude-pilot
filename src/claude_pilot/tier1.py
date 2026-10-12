@@ -3592,6 +3592,11 @@ def _git_words_hide_value(words: list[_ShellWord]) -> bool:
         read_only = sub_word is not None and sub_word.text in _GIT_READ_SUBCOMMANDS
         for a in args:
             for e in a.expansions:
+                if e == "$":
+                    # `$$` is the shell's PID: digits the pilot does not choose,
+                    # so it can carry no flag, branch name or glob. Parity: the
+                    # `git stash push -u -m "<tag>-$$"` uniqueness idiom (3 pilots).
+                    continue
                 if not _is_plain_param(e) or not read_only:
                     return True
         if sub_word is not None and sub_word.text == "push":
