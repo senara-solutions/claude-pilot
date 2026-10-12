@@ -2896,6 +2896,54 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     return False
 
 
+# ── Allowlisted merge-base substitutions (cpp#95, cpp#98; hoisted mika#1686) ──
+#
+# The `git merge-base` entries of `permissions._SUBSTITUTION_ALLOWLIST`, which
+# splices this tuple in place. They live here because the ce-code-review
+# scope-probe predicate below rewrites exactly these tokens — one definition,
+# two consumers, no drift.
+_GIT_MERGE_BASE_SUBSTITUTIONS: tuple[str, ...] = (
+    # `merge-base` prints the best common ancestor SHA on stdout — same class as
+    # the rev-parse tokens of `permissions._SUBSTITUTION_ALLOWLIST` (short identifier output, no side effects, no
+    # nested `$(`, backtick, redirect, or pipe). The main / origin/main variants
+    # are the base-drift detection idiom used by dispatch-lib and dev-groom
+    # (`BASE=$(git merge-base main HEAD); git diff --name-only $BASE HEAD`).
+    # 18-incident policy:deny class 2026-07-26 → 2026-07-27 (mika#1852/#1849
+    # groom/pilot halted on this shape). Coupled pair with the `merge-base`
+    # addition to `SAFE_GIT_SUBCOMMANDS` in tier1.py — both must land together
+    # to unblock the compound and its standalone form.
+    "$(git merge-base main HEAD)",
+    "$(git merge-base origin/main HEAD)",
+    # cpp#95: reverse argument order — `git merge-base` is commutative, so the
+    # HEAD-first variants are the same read-only-plumbing-emits-short-SHA safety
+    # class as the main-first variants above. mika-dev pilots write both orders
+    # organically: `BASE=$(git merge-base HEAD main) || BASE="main"`. Adding both
+    # orderings drops one of the three sampled cpp#95 prod-failure classes
+    # (mika-db tasks id `27ea7dc4-5dfb-40cf-bc44-85970cd28e72`, mika#1824).
+    #
+    # cpp#98: 2>/dev/null variants for merge-base — the branch-drift detection
+    # idiom uses stderr silencing when HEAD/base are unresolvable (fresh clone,
+    # detached HEAD). Invariant expansion RATIFIED: `2>/dev/null` is the ONE
+    # accepted redirect inside `$(...)` because:
+    #   1. `2>` targets stderr only (never stdout — the substituted value)
+    #   2. `/dev/null` is a literal inert bytes sink (no filesystem write to
+    #      attacker-chosen path — `/dev/null` is a kernel-owned device with no
+    #      state, no observability channel, no side effect)
+    #   3. Combined: the sole effect of `2>/dev/null` is dropping stderr; the
+    #      command's stdout capture (which the substitution embeds) is unchanged
+    # Founding evidence: mika-dev pilot sessions 57f7c3fb + 53917b4e halted on
+    # `BASE=$(git merge-base HEAD main 2>/dev/null) || BASE=main; ...` shape
+    # (2026-07-29 post cpp#96 deploy). All 4 orderings (main/HEAD, origin/main,
+    # both directions) added to match the commutative git-merge-base semantics.
+    "$(git merge-base HEAD main)",
+    "$(git merge-base HEAD origin/main)",
+    "$(git merge-base HEAD main 2>/dev/null)",
+    "$(git merge-base HEAD origin/main 2>/dev/null)",
+    "$(git merge-base main HEAD 2>/dev/null)",
+    "$(git merge-base origin/main HEAD 2>/dev/null)",
+)
+
+
 def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
     # a legitimate multi-line compound (for-loop + if + $()) that stalls the

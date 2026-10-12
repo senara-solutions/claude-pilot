@@ -34,6 +34,7 @@ from .guardrails import SessionGuardrails
 from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
+    _GIT_MERGE_BASE_SUBSTITUTIONS,
     _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_lexically_disqualified_redirect_target,
@@ -211,44 +212,11 @@ _SUBSTITUTION_ALLOWLIST = (
     "$(git rev-parse --abbrev-ref HEAD)",
     "$(git rev-parse HEAD)",
     "$(git rev-parse --short HEAD)",
-    # `merge-base` prints the best common ancestor SHA on stdout — same class as
-    # the rev-parse tokens above (short identifier output, no side effects, no
-    # nested `$(`, backtick, redirect, or pipe). The main / origin/main variants
-    # are the base-drift detection idiom used by dispatch-lib and dev-groom
-    # (`BASE=$(git merge-base main HEAD); git diff --name-only $BASE HEAD`).
-    # 18-incident policy:deny class 2026-07-26 → 2026-07-27 (mika#1852/#1849
-    # groom/pilot halted on this shape). Coupled pair with the `merge-base`
-    # addition to `SAFE_GIT_SUBCOMMANDS` in tier1.py — both must land together
-    # to unblock the compound and its standalone form.
-    "$(git merge-base main HEAD)",
-    "$(git merge-base origin/main HEAD)",
-    # cpp#95: reverse argument order — `git merge-base` is commutative, so the
-    # HEAD-first variants are the same read-only-plumbing-emits-short-SHA safety
-    # class as the main-first variants above. mika-dev pilots write both orders
-    # organically: `BASE=$(git merge-base HEAD main) || BASE="main"`. Adding both
-    # orderings drops one of the three sampled cpp#95 prod-failure classes
-    # (mika-db tasks id `27ea7dc4-5dfb-40cf-bc44-85970cd28e72`, mika#1824).
-    #
-    # cpp#98: 2>/dev/null variants for merge-base — the branch-drift detection
-    # idiom uses stderr silencing when HEAD/base are unresolvable (fresh clone,
-    # detached HEAD). Invariant expansion RATIFIED: `2>/dev/null` is the ONE
-    # accepted redirect inside `$(...)` because:
-    #   1. `2>` targets stderr only (never stdout — the substituted value)
-    #   2. `/dev/null` is a literal inert bytes sink (no filesystem write to
-    #      attacker-chosen path — `/dev/null` is a kernel-owned device with no
-    #      state, no observability channel, no side effect)
-    #   3. Combined: the sole effect of `2>/dev/null` is dropping stderr; the
-    #      command's stdout capture (which the substitution embeds) is unchanged
-    # Founding evidence: mika-dev pilot sessions 57f7c3fb + 53917b4e halted on
-    # `BASE=$(git merge-base HEAD main 2>/dev/null) || BASE=main; ...` shape
-    # (2026-07-29 post cpp#96 deploy). All 4 orderings (main/HEAD, origin/main,
-    # both directions) added to match the commutative git-merge-base semantics.
-    "$(git merge-base HEAD main)",
-    "$(git merge-base HEAD origin/main)",
-    "$(git merge-base HEAD main 2>/dev/null)",
-    "$(git merge-base HEAD origin/main 2>/dev/null)",
-    "$(git merge-base main HEAD 2>/dev/null)",
-    "$(git merge-base origin/main HEAD 2>/dev/null)",
+    # The 8 `git merge-base` tokens (cpp#95, cpp#98) live in tier1 since mika#1686
+    # F1: tier1's ce-code-review scope-probe predicate rewrites exactly these
+    # tokens, so both consumers share one definition and cannot drift. Same
+    # order as before the hoist.
+    *_GIT_MERGE_BASE_SUBSTITUTIONS,
     # cpp#95: `$(date +%F)` and `$(date +%Y-%m-%d)`. `date` is a POSIX read-only
     # utility with no filesystem or ref-mutation side effects. `+%F` and
     # `+%Y-%m-%d` are literal format specifiers producing a fixed-length
