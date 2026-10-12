@@ -92,6 +92,7 @@ _NON_PLAIN_EXPANSION = [
     'git log "$@"',
     "git diff $_",
     "git diff ${_}",
+    "git log $[B]",
     # Only the PID is inert; the other special parameters are not.
     'git stash push -u -m "wip-$!"',
     'git stash push -u -m "wip-$-"',
@@ -105,6 +106,11 @@ _HIDDEN_ASSIGNMENT = [
     'printf "-v" X %s --output=/tmp/a; git diff $X',
     "echo ${X:=--output=/tmp/a}; git diff $X",
     "echo ${X=--output=/tmp/a}; git diff $X",
+    # Review: nested and array forms, and a quoted / escaped `printf`.
+    "echo ${Z:-${X:=--output=/tmp/a}}; git diff $X",
+    "echo ${A[0]:=x}; git diff $A",
+    '"printf" -v X %s --output=/tmp/a; git diff $X',
+    "\\printf -v X %s --output=/tmp/a; git diff $X",
 ]
 
 # ── Refused: what git receives differs from the text read (clause d) ─────────
@@ -123,6 +129,27 @@ _PUSH_TARGET_SPLICED = [
     # policy re-admitted it: destination main via a refspec.
     "git push origin HEAD:main",
     "git push origin HEAD:refs/heads/main",
+    # Review: git resolves these DWIM spellings to refs/heads/main too.
+    "git push origin HEAD:heads/main",
+    "git push origin heads/master",
+    "git push origin @:heads/main",
+    'git push origin HEAD:"heads/ma"in',
+]
+
+# ── Refused: a quoted flag, a brace, a leading glob (clause e) ───────────────
+
+_SPLICED_OR_EXPANDED_ARG = [
+    'git branch -"D" feat/x',
+    "git branch -\\D feat/x",
+    'git branch --"delete" feat/x',
+    'git diff --"output"=/tmp/a',
+    'git fetch --"upload-pack"=x origin',
+    "git diff {--output=/tmp/a,HEAD}",
+    "git log *",
+    "git log ?ain",
+    # Arity: a global option before the subcommand proves nothing about it.
+    "git --git-dir x status $X",
+    "git -c a=b log $X",
 ]
 
 # ── Admitted before AND after: legitimate forms that must not regress ────────
@@ -145,12 +172,18 @@ _STILL_ADMITTED = [
     "printf '%s\\n' a",
     "printf -- -v",
     'grep -n "git push origin $X" docs/x.md',
+    "git diff -- *.py",
+    "git add src/*.py",
+    "git log --oneline -3  # don't care",
+    'git log --grep="fix"',
+    "git push -u origin feat/heads-up",
 ]
 
 
 @pytest.mark.parametrize(
     "command",
-    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED,
+    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED
+    + _SPLICED_OR_EXPANDED_ARG,
 )
 def test_predicate_flags_hidden_values(command: str) -> None:
     assert git_argument_value_hidden(command)
@@ -163,7 +196,8 @@ def test_predicate_leaves_visible_values_alone(command: str) -> None:
 
 @pytest.mark.parametrize(
     "command",
-    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED,
+    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED
+    + _SPLICED_OR_EXPANDED_ARG,
 )
 def test_tier1_refuses_hidden_values(command: str, containment: str) -> None:
     assert not is_safe_bash_command(command)
@@ -179,7 +213,8 @@ def test_tier1_still_admits_visible_values(command: str, containment: str) -> No
 
 @pytest.mark.parametrize(
     "command",
-    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED,
+    _PUSH_BY_EXPANSION + _NON_PLAIN_EXPANSION + _HIDDEN_ASSIGNMENT + _PUSH_TARGET_SPLICED
+    + _SPLICED_OR_EXPANDED_ARG,
 )
 def test_handler_refuses_hidden_values_without_ending_the_run(command: str, handler) -> None:
     # The policy's `bash-git-push` / `bash-git-readonly` prefix rules used to
