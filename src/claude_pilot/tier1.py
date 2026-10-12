@@ -2960,8 +2960,10 @@ _GIT_MERGE_BASE_SUBSTITUTIONS: tuple[str, ...] = (
 #     pattern refuses anything glued after the placeholder. The
 #     placeholder is deliberately NOT the policy path's `_SUB_`, which also
 #     stands for `$(pwd)`, `$(date …)` and `$(git rev-parse …)`.
-#   * Every statement that READS BASE must be read-only git (minus `branch`,
-#     which creates a branch from a positional argument) or an echo/printf.
+#   * Every statement that READS BASE must be one of a few read-only git
+#     subcommands (an allowlist: `branch` and `symbolic-ref` both write when
+#     handed a ref) or an echo/printf other than `printf -v`, and may only use
+#     the plain `$BASE` / `${BASE}` expansion. No statement may write BASE.
 #     This is the load-bearing condition: tier1 already passes
 #     `git push origin $BASE`, `git checkout $BASE`, `git tag $BASE` — their
 #     main/master guards are literal text and cannot see through a variable —
@@ -2983,6 +2985,21 @@ _BASE_ASSIGNMENT_RE = re.compile(
     + r'|"[A-Za-z0-9][A-Za-z0-9._/-]*"|[A-Za-z0-9][A-Za-z0-9._/-]*)$'
 )
 _BASE_REFERENCE_RE = re.compile(r"\$\{?[#!]?BASE(?![A-Za-z0-9_])")
+# Only the plain reads `$BASE` / `${BASE}` are allowed: an operator-bearing
+# expansion (`${BASE:+--output=…}`, `${BASE/#/…}`, `${#BASE}`, `${!BASE}`)
+# turns a reader into an option injector.
+_BASE_NONPLAIN_EXPANSION_RE = re.compile(r"\$\{(?:[#!]BASE|BASE(?!\}))")
+# Bash does not split on an escaped separator, but `_split_compound_command`
+# and the rewrite's lookbehind do; a probe never writes one.
+_BASE_ESCAPED_SEPARATOR_RE = re.compile(r"\\[;&|\n\r]")
+# The git subcommands the probe reads BASE with — an allowlist, not
+# `_is_safe_git_readonly_sub`'s set minus exceptions: that set includes
+# `symbolic-ref`, which WRITES HEAD when given a ref (review round
+# 20261012-115006: `git symbolic-ref HEAD refs/heads/$BASE` then commit and
+# push laundered a push to main).
+_BASE_READER_GIT_SUBCOMMANDS = frozenset(
+    {"diff", "log", "show", "rev-parse", "ls-files", "merge-base"}
+)
 
 
 def _redact_base_merge_base_assignments(command: str) -> str:
@@ -3005,14 +3022,19 @@ def _redact_base_merge_base_assignments(command: str) -> str:
 
 
 def _is_safe_base_reader(sub: str, cwd: str | None) -> bool:
-    """A statement that reads BASE: read-only git other than `branch`, or an
-    echo/printf that is otherwise tier1-safe."""
+    """A statement that reads BASE: one of the allowlisted read-only git
+    subcommands, or an echo/printf that is otherwise tier1-safe and is not
+    `printf -v` (which copies BASE into a variable nothing checks)."""
+    if _BASE_NONPLAIN_EXPANSION_RE.search(sub):
+        return False
     git = _GIT_CMD_RE.match(sub)
     if git:
-        return git.group(1) != "branch" and _is_safe_git_readonly_sub(
-            _STDERR_DEVNULL_RE.sub("", sub).strip()
+        return git.group(1) in _BASE_READER_GIT_SUBCOMMANDS and (
+            _is_safe_git_readonly_sub(_STDERR_DEVNULL_RE.sub("", sub).strip())
         )
     words = sub.split()
+    if words[0] == "printf" and any(w.startswith("-v") for w in words[1:]):
+        return False
     return words[0] in ("echo", "printf") and _is_safe_sub_command(sub, cwd)
 
 
@@ -3020,6 +3042,8 @@ def is_ce_review_scope_probe(command: str, cwd: str | None = None) -> bool:
     """Admit the ce-code-review scope probe (mika#1686 F1); see the block
     comment above for every condition."""
     if "BASE=" not in command or "BASE" in os.environ:
+        return False
+    if _BASE_ESCAPED_SEPARATOR_RE.search(command):
         return False
     redacted = _redact_base_merge_base_assignments(command)
     if contains_unquoted_metacharacter(redacted) or is_tier3_dangerous(redacted):
@@ -3029,6 +3053,10 @@ def is_ce_review_scope_probe(command: str, cwd: str | None = None) -> bool:
     if len(others) == len(subs) or not others:
         return False
     for sub in others:
+        # A statement that WRITES BASE (`printf -v BASE`, `read BASE`,
+        # `${BASE:=…}`, …) would replace the value the assignment shape vetted.
+        if _var_has_nonread_occurrence(sub, "BASE"):
+            return False
         if _BASE_REFERENCE_RE.search(sub):
             if not _is_safe_base_reader(sub, cwd):
                 return False

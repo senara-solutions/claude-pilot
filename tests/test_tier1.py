@@ -5473,6 +5473,17 @@ class TestMika1686BaseScopeProbe:
             "BASE=_SUB_; git diff $BASE",
             "BASE=main; echo $(id)",
             "BASE=main; echo hi > ~/.bashrc",
+            # review round (ce-code-review 20261012-115006): readers that write
+            "BASE=main; git symbolic-ref HEAD refs/heads/$BASE; git commit -am x; git push origin HEAD",
+            "BASE=refs/heads/main; git symbolic-ref HEAD $BASE && git status",
+            "BASE=x; git symbolic-ref -d $BASE",
+            "BASE=main; printf -v X %s $BASE; git push origin $X",
+            "BASE=main; printf -v BASE %s --output=/tmp/a; git diff $BASE",
+            "BASE=main; git diff ${BASE:+--output=/tmp/a}",
+            "BASE=main; git diff ${BASE/#/--output=/tmp/a}",
+            # an escaped separator is not a statement boundary
+            "git push origin \\;BASE=main",
+            "git tag \\\nBASE=$(git merge-base main HEAD); git status",
         ],
     )
     def test_out_of_shape_stays_refused(self, command: str) -> None:
@@ -5489,3 +5500,51 @@ class TestMika1686BaseScopeProbe:
 
         monkeypatch.setenv("BASE", "x")
         assert not is_safe_bash_command(_F1_VERBATIM_2BD6FCA0)
+
+
+@pytest.mark.parametrize(
+    "sub",
+    sorted(
+        {
+            "status", "log", "diff", "show", "branch", "rev-parse", "symbolic-ref",
+            "ls-files", "describe", "shortlog", "blame", "merge-base", "push",
+            "fetch", "tag", "checkout", "switch", "reset", "update-ref", "config",
+            "worktree", "stash", "commit", "notes", "remote",
+        }
+        - {"log", "diff", "show", "rev-parse", "ls-files", "merge-base"}
+    ),
+)
+def test_base_reader_outside_the_allowlist_is_refused(
+    sub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_pilot.tier1 import is_safe_bash_command
+
+    monkeypatch.delenv("BASE", raising=False)
+    for cmd in (f"BASE=main; git {sub} $BASE", f"BASE=main; git {sub} HEAD $BASE"):
+        assert not is_safe_bash_command(cmd), cmd
+
+
+def test_hoisted_merge_base_tokens_keep_their_allowlist_position() -> None:
+    from claude_pilot.permissions import _SUBSTITUTION_ALLOWLIST
+    from claude_pilot.tier1 import _GIT_MERGE_BASE_SUBSTITUTIONS
+
+    start = _SUBSTITUTION_ALLOWLIST.index(_GIT_MERGE_BASE_SUBSTITUTIONS[0])
+    assert (
+        _SUBSTITUTION_ALLOWLIST[start : start + len(_GIT_MERGE_BASE_SUBSTITUTIONS)]
+        == _GIT_MERGE_BASE_SUBSTITUTIONS
+    )
+    assert start == 4 and len(_GIT_MERGE_BASE_SUBSTITUTIONS) == 8
+
+
+def test_scope_probe_is_bounded_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_pilot.tier1 import is_ce_review_scope_probe
+
+    monkeypatch.delenv("BASE", raising=False)
+    for cmd in (
+        "BASE=" + "a" * 50000 + "; git diff $BASE >",
+        "BASE=main; " + "git diff $BASE; " * 2000 + "|",
+        "; BASE=$(git merge-base HEAD main" * 3000,
+    ):
+        start = time.perf_counter()
+        is_ce_review_scope_probe(cmd)
+        assert time.perf_counter() - start < 0.5, cmd[:40]
