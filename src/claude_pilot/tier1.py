@@ -2944,6 +2944,98 @@ _GIT_MERGE_BASE_SUBSTITUTIONS: tuple[str, ...] = (
 )
 
 
+# ── The ce-code-review scope probe (mika#1686 F1) ───────────────────────────
+#
+# The ce-code-review skill opens with a scope probe the pilot writes in a few
+# variants, e.g.
+#   BASE=$(git merge-base HEAD origin/main 2>/dev/null) || BASE="origin/main";
+#   echo "BASE:$BASE" && git diff --name-only $BASE && git ls-files --others …
+# Verbatim replay (2026-10-12) found it refused in 7 distinct pilots between
+# 2026-09-28 and 10-02, and the `BASE=` assignment was its only refused
+# segment. This predicate admits that shape and nothing more:
+#
+#   * The assignment is to the exact name `BASE`, from one of the merge-base
+#     tokens above or a literal ref. A token is rewritten to a placeholder only
+#     at a statement start, outside quotes, followed by a boundary. The
+#     placeholder is deliberately NOT the policy path's `_SUB_`, which also
+#     stands for `$(pwd)`, `$(date …)` and `$(git rev-parse …)`.
+#   * Every statement that READS BASE must be read-only git (minus `branch`,
+#     which creates a branch from a positional argument) or an echo/printf.
+#     This is the load-bearing condition: tier1 already passes
+#     `git push origin $BASE`, `git checkout $BASE`, `git tag $BASE` — their
+#     main/master guards are literal text and cannot see through a variable —
+#     so an unrestricted `BASE=main` admission would launder a push to main.
+#   * The predicate needs the assignment AND another statement in the same
+#     call. `permissions._bash_allow_is_chain_safe` checks segments one at a
+#     time; a bare `BASE=…` segment must never pass there, or the reader rule
+#     above would be bypassed by splitting it across segments.
+#   * An inherited BASE in the environment (exported, so visible to child
+#     processes) disqualifies the shape.
+_BASE_PROBE_PLACEHOLDER = "_MERGE_BASE_"
+_BASE_MERGE_BASE_ASSIGN_RE = re.compile(
+    r"(?:^|(?<=[;&|\n\r]))[ \t]*BASE=(?:"
+    + "|".join(re.escape(tok) for tok in _GIT_MERGE_BASE_SUBSTITUTIONS)
+    + r")(?=[\s;&|]|\Z)"
+)
+_BASE_ASSIGNMENT_RE = re.compile(
+    r"^BASE=(?:" + _BASE_PROBE_PLACEHOLDER
+    + r'|"[A-Za-z0-9][A-Za-z0-9._/-]*"|[A-Za-z0-9][A-Za-z0-9._/-]*)$'
+)
+_BASE_REFERENCE_RE = re.compile(r"\$\{?[#!]?BASE(?![A-Za-z0-9_])")
+
+
+def _redact_base_merge_base_assignments(command: str) -> str:
+    """Rewrite each unquoted, statement-start `BASE=<merge-base token>` to
+    `BASE=_MERGE_BASE_`. Every other `$(` is left in place for the
+    metacharacter guard to refuse; a command without a match is returned
+    unchanged."""
+    spans = _quote_spans(command)
+    out: list[str] = []
+    last = 0
+    for m in _BASE_MERGE_BASE_ASSIGN_RE.finditer(command):
+        if any(start <= m.start() < end for start, end, _closed in spans):
+            continue
+        leading = m.group(0)[: m.group(0).index("BASE=")]
+        out.append(command[last : m.start()])
+        out.append(f"{leading}BASE={_BASE_PROBE_PLACEHOLDER}")
+        last = m.end()
+    out.append(command[last:])
+    return "".join(out)
+
+
+def _is_safe_base_reader(sub: str, cwd: str | None) -> bool:
+    """A statement that reads BASE: read-only git other than `branch`, or an
+    echo/printf that is otherwise tier1-safe."""
+    git = _GIT_CMD_RE.match(sub)
+    if git:
+        return git.group(1) != "branch" and _is_safe_git_readonly_sub(
+            _STDERR_DEVNULL_RE.sub("", sub).strip()
+        )
+    words = sub.split()
+    return words[0] in ("echo", "printf") and _is_safe_sub_command(sub, cwd)
+
+
+def is_ce_review_scope_probe(command: str, cwd: str | None = None) -> bool:
+    """Admit the ce-code-review scope probe (mika#1686 F1); see the block
+    comment above for every condition."""
+    if "BASE=" not in command or "BASE" in os.environ:
+        return False
+    redacted = _redact_base_merge_base_assignments(command)
+    if contains_unquoted_metacharacter(redacted) or is_tier3_dangerous(redacted):
+        return False
+    subs = _split_compound_command(redacted)
+    others = [sub for sub in subs if not _BASE_ASSIGNMENT_RE.match(sub)]
+    if len(others) == len(subs) or not others:
+        return False
+    for sub in others:
+        if _BASE_REFERENCE_RE.search(sub):
+            if not _is_safe_base_reader(sub, cwd):
+                return False
+        elif not _is_safe_sub_command(sub, cwd):
+            return False
+    return True
+
+
 def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
     # a legitimate multi-line compound (for-loop + if + $()) that stalls the
@@ -2966,6 +3058,13 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # glue in ce-work branch-check compounds (SKILL.md §Setup Environment).
     # Fail-closed on any unrecognized sub-command shape.
     if is_git_readonly_compound_when_contained(command):
+        return True
+
+    # mika#1686 F1: the ce-code-review scope probe's `BASE=` assignment.
+    # Before the metachar guard because the probe carries an allowlisted
+    # merge-base `$(…)`; the predicate re-runs that guard itself on the
+    # rewritten command.
+    if is_ce_review_scope_probe(command, cwd):
         return True
 
     if contains_unquoted_metacharacter(command):

@@ -5364,3 +5364,118 @@ class TestReadonlyProcsubSurvivable:
         adversarial = "diff <(cat " + ("a" * 100000) + ";) b"
         _, elapsed2 = _elapsed(readonly_procsub_survivable, adversarial)
         assert elapsed2 < _REDOS_BUDGET_S, f"adversarial took {elapsed2 * 1000:.1f} ms"
+
+
+# ── mika#1686 F1: the ce-code-review scope probe's BASE assignment ──────────
+#
+# Verbatim replay of 271 refusals (67 pilots, 2026-09-28 → 10-02) found the
+# ce-code-review scope probe refused in 7 distinct pilots, its only refused
+# segment being the `BASE=` assignment. Admission is a whole-command shape:
+# BASE is assigned from an allowlisted merge-base substitution or a literal
+# ref, and every reader of BASE is read-only git or echo/printf — because
+# tier1 already passes `git push origin $BASE` (its main/master guards are
+# literal text), a bare `BASE=main` admission would be a push-to-main laundry.
+
+_F1_VERBATIM_9C880B93 = (
+    'BASE=$(git merge-base HEAD origin/main 2>/dev/null) || BASE="origin/main"; '
+    'echo "BASE:$BASE" && echo "FILES:" && git diff --name-only $BASE && '
+    'echo "UNTRACKED:" && git ls-files --others --exclude-standard'
+)
+_F1_VERBATIM_2BD6FCA0 = (
+    'BASE=$(git merge-base HEAD origin/main) && echo "BASE:$BASE" && '
+    'echo "FILES:" && git diff --name-only $BASE && echo "UNTRACKED:" && '
+    "git ls-files --others --exclude-standard"
+)
+_F1_MULTILINE = (
+    'BASE=$(git merge-base HEAD origin/main 2>/dev/null) || BASE="origin/main"\n'
+    'echo "BASE:$BASE" && git diff --name-only $BASE && git diff --stat $BASE'
+)
+
+
+class TestMika1686BaseScopeProbe:
+    @pytest.fixture(autouse=True)
+    def _no_inherited_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("BASE", raising=False)
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "$(git merge-base main HEAD)",
+            "$(git merge-base origin/main HEAD)",
+            "$(git merge-base HEAD main)",
+            "$(git merge-base HEAD origin/main)",
+            "$(git merge-base HEAD main 2>/dev/null)",
+            "$(git merge-base HEAD origin/main 2>/dev/null)",
+            "$(git merge-base main HEAD 2>/dev/null)",
+            "$(git merge-base origin/main HEAD 2>/dev/null)",
+        ],
+    )
+    def test_each_merge_base_token_is_admitted(self, token: str) -> None:
+        from claude_pilot.tier1 import is_safe_bash_command
+
+        assert is_safe_bash_command(f"BASE={token}; git diff --name-only $BASE")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "BASE=main; git log $BASE",
+            'BASE="origin/main"; echo "BASE:$BASE"',
+            "BASE=6d835590; git diff ${BASE}",
+            _F1_VERBATIM_9C880B93,
+            _F1_VERBATIM_2BD6FCA0,
+            _F1_MULTILINE,
+        ],
+    )
+    def test_probe_shapes_are_admitted(self, command: str) -> None:
+        from claude_pilot.tier1 import is_safe_bash_command
+
+        assert is_safe_bash_command(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # a reader that writes: the push-to-main laundry and its siblings
+            "BASE=main; git push origin $BASE",
+            "BASE=master && git push origin $BASE",
+            "BASE=main; git checkout $BASE",
+            "BASE=main; git branch $BASE",
+            "BASE=main; git tag $BASE",
+            "BASE=main; cat $BASE",
+            'BASE=main; git push origin "${BASE}"',
+            # names and values outside the shape
+            "PATH=$(pwd); git status",
+            "BASE=$(id -u); echo $BASE",
+            "BASE=$(git merge-base HEAD main || echo main); echo $BASE",
+            "BASE=$X; echo $BASE",
+            "XBASE=$(git merge-base HEAD main); echo $XBASE",
+            "BASE=$(git merge-base HEAD main)x; echo $BASE",
+            "BASE='a b'; echo $BASE",
+            "BASE=-x; echo $BASE",
+            "BASE=..; echo $BASE",
+            "BASE=$(pwd); git diff $BASE",
+            "BASE=$(git rev-parse HEAD); git diff $BASE",
+            # not an assignment statement
+            "BASE=main git log",
+            "export BASE=main; echo $BASE",
+            'echo "x; BASE=$(git merge-base HEAD main)"',
+            # a dangerous neighbour
+            "BASE=main; rm -rf x",
+            # the assignment alone (how the chain-safe path sees one segment)
+            "BASE=main",
+            "BASE=$(git merge-base HEAD main)",
+        ],
+    )
+    def test_out_of_shape_stays_refused(self, command: str) -> None:
+        from claude_pilot.tier1 import is_safe_bash_command
+
+        assert not is_safe_bash_command(command)
+
+    def test_inherited_base_in_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An exported BASE would reach child processes; the shape is admitted
+        # only while the pilot's environment does not carry one.
+        from claude_pilot.tier1 import is_safe_bash_command
+
+        monkeypatch.setenv("BASE", "x")
+        assert not is_safe_bash_command(_F1_VERBATIM_2BD6FCA0)
