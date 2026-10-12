@@ -49,6 +49,7 @@ from .tier1 import (
     _needs_lethality_redirect_mask,
     _redirect_targets,
     _split_compound_command,
+    git_argument_value_hidden,
     is_readonly_waitloop_script,
     is_safe_bash_command,
     is_tier1_auto_approve,
@@ -556,6 +557,16 @@ def _bash_allow_is_chain_safe(
             return False  # an unrecognized ``$(`` substitution remains
         command = redacted
     if _BARE_AMP_RE.search(command):
+        return False
+
+    # A git argument whose value the text does not show is not honored on a
+    # policy allow either. The YAML rules (`bash-git-push`, `bash-git-readonly`)
+    # are prefix matches and `is_tier3_dangerous` below reads raw text, so a
+    # tier1 refusal of `git push origin $X` or `git push origin HEAD:main`
+    # would otherwise be re-admitted here. Runs AFTER the allowlisted `$(…)`
+    # redaction so a sanctioned substitution stays one literal `_SUB_` word,
+    # and BEFORE the sanctioned-shape exceptions so none of them bypass it.
+    if git_argument_value_hidden(command):
         return False
 
     # Sanctioned `git show <rev>:<path> > <relative-path>` (cpp#35, ref shape
