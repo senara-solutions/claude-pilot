@@ -33,13 +33,14 @@ Constat clé : quand tier1 refuse, la policy en aval (`bash-git-push`, `bash-git
 - R1. Toute sous-commande git qui écrit (hors lecture seule) refuse toute expansion `$` hors quotes simples, y compris dans la sous-commande elle-même.
 - R2. Tout argument git refuse une expansion qui n'est pas une référence simple `$NAME` / `${NAME}` (NAME identifiant régulier, différent de `_`) : opérateurs, indirection, longueur, paramètres spéciaux et positionnels, `$(`, `$'`, `$"`.
 - R3. Une assignation cachée dans la commande (`printf -v…` en position de commande, `${NAME=…}` / `${NAME:=…}`) refuse la commande entière.
-- R4. `git push` refuse un glob ou une accolade non quotés, et ses gardes main/master et force s'appliquent aussi au texte après retrait des quotes. Dans tier1, les gardes force / drapeaux globaux / mutants de `branch` s'appliquent aussi au texte dé-quoté pour toutes les sous-commandes.
+- R4. `git push` refuse un glob non quoté, `--all`/`--mirror`, un refspec `+`, et une destination qui résout vers main/master (`main`, `heads/main`, `refs/heads/main`), jugés sur le texte après retrait des quotes.
+- R4b. Tout argument git qui est l'épellation quotée ou échappée d'un drapeau gardé (`-"D"`, `--"output"=`), une expansion d'accolades (avec `,` ou `..` seulement : `@{u}`, `^{tree}` restent admis) ou un glob de tête avant `--` est refusé. (Révisé après revue : remplace le rejeu des gardes tier1 sur le texte dé-quoté, devenu redondant.)
 - R5. Le même prédicat est un veto du chemin policy (`_bash_allow_is_chain_safe`), évalué après la rédaction des substitutions allowlistées.
 - R6. Refus = non-admission. Aucun nouveau chemin d'admission ; létalité inchangée (le refus reste non terminal).
 
 ### Scope Boundaries
 
-- Préservé : `$NAME` / `${NAME}` simples dans les lectures git (`log`, `diff`, `show`, `rev-parse`, …) — forme F1 de mika#1686 ; messages de commit entre quotes sans `$` ; `$(git branch --show-current)` et les autres substitutions déjà allowlistées sur le chemin policy.
+- Préservé : `$$` (PID) dans un argument git (idiome `git stash push -m "<tag>-$$"`, parité) ; `$NAME` / `${NAME}` simples dans les lectures git (`log`, `diff`, `show`, `rev-parse`, …) — forme F1 de mika#1686 ; messages de commit entre quotes sans `$` ; `$(git branch --show-current)` et les autres substitutions déjà allowlistées sur le chemin policy.
 - Hors périmètre, résiduel déclaré : une variable d'environnement héritée du dispatcher et lue telle quelle dans une lecture git. Sa valeur n'est pas fixée par le pilote.
 - Hors périmètre : le chemin `per_spawn` (bashlex, opt-in, mika#1708) et l'élargissement des règles YAML.
 
