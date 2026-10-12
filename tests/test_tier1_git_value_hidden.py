@@ -218,7 +218,20 @@ def test_tier1_guards_see_through_quote_splicing(command: str, containment: str)
 
 @pytest.mark.parametrize(
     "command",
-    ['git push origin "unterminated', "git log ${X", "git log ${X:-a"],
+    [
+        'git push origin "unterminated',
+        "git log ${X",
+        "git log ${X:-a",
+        "git $SUB origin HEAD",
+        # An unlexable segment must not end the scan: the next one is judged.
+        "echo ${X\ngit push origin $X",
+        "printf -v X %s ${Y",
+    ],
 )
-def test_unlexable_git_command_fails_closed(command: str) -> None:
+def test_unlexable_or_dynamic_git_command_fails_closed(command: str) -> None:
     assert git_argument_value_hidden(command)
+
+
+def test_unlexable_segment_without_git_or_assignment_is_not_flagged() -> None:
+    # Fail-closed is scoped: an unbalanced quote elsewhere is bash's problem.
+    assert not git_argument_value_hidden("echo it's fine")

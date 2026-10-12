@@ -3520,7 +3520,11 @@ def _hidden_assignment(command: str) -> bool:
     for seg in _split_compound_command(command) or [command]:
         words = _lex_shell_words(seg)
         if words is None:
-            return True
+            # Unlexable (unterminated quote or `${`): fail closed only where an
+            # assignment could hide — elsewhere bash itself would not run it.
+            if "printf" in seg or "${" in seg:
+                return True
+            continue
         for idx, w in enumerate(words):
             if any(_ASSIGN_EXPANSION_RE.match(e) for e in w.expansions):
                 return True
@@ -3583,8 +3587,8 @@ def _git_words_hide_value(words: list[_ShellWord]) -> bool:
                 continue
             sub_word = a
             break
-        if sub_word is not None and sub_word.expansions:
-            return True
+        # `sub_word` is one of `args`, so an expansion in the subcommand word
+        # itself is refused by (c) below: its text is never a read subcommand.
         read_only = sub_word is not None and sub_word.text in _GIT_READ_SUBCOMMANDS
         for a in args:
             for e in a.expansions:
@@ -3608,7 +3612,9 @@ def git_argument_value_hidden(command: str) -> bool:
     for seg in _split_compound_command(command) or [command]:
         words = _lex_shell_words(seg)
         if words is None:
-            return "git" in seg
+            if "git" in seg:
+                return True
+            continue  # later segments are still judged
         if _git_words_hide_value(words):
             return True
     return False
