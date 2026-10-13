@@ -2896,6 +2896,175 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     return False
 
 
+# ── Allowlisted merge-base substitutions (cpp#95, cpp#98; hoisted mika#1686) ──
+#
+# The `git merge-base` entries of `permissions._SUBSTITUTION_ALLOWLIST`, which
+# splices this tuple in place. They live here because the ce-code-review
+# scope-probe predicate below rewrites exactly these tokens — one definition,
+# two consumers, no drift.
+_GIT_MERGE_BASE_SUBSTITUTIONS: tuple[str, ...] = (
+    # `merge-base` prints the best common ancestor SHA on stdout — same class as
+    # the rev-parse tokens of `permissions._SUBSTITUTION_ALLOWLIST` (short identifier output, no side effects, no
+    # nested `$(`, backtick, redirect, or pipe). The main / origin/main variants
+    # are the base-drift detection idiom used by dispatch-lib and dev-groom
+    # (`BASE=$(git merge-base main HEAD); git diff --name-only $BASE HEAD`).
+    # 18-incident policy:deny class 2026-07-26 → 2026-07-27 (mika#1852/#1849
+    # groom/pilot halted on this shape). Coupled pair with the `merge-base`
+    # addition to `SAFE_GIT_SUBCOMMANDS` in tier1.py — both must land together
+    # to unblock the compound and its standalone form.
+    "$(git merge-base main HEAD)",
+    "$(git merge-base origin/main HEAD)",
+    # cpp#95: reverse argument order — `git merge-base` is commutative, so the
+    # HEAD-first variants are the same read-only-plumbing-emits-short-SHA safety
+    # class as the main-first variants above. mika-dev pilots write both orders
+    # organically: `BASE=$(git merge-base HEAD main) || BASE="main"`. Adding both
+    # orderings drops one of the three sampled cpp#95 prod-failure classes
+    # (mika-db tasks id `27ea7dc4-5dfb-40cf-bc44-85970cd28e72`, mika#1824).
+    #
+    # cpp#98: 2>/dev/null variants for merge-base — the branch-drift detection
+    # idiom uses stderr silencing when HEAD/base are unresolvable (fresh clone,
+    # detached HEAD). Invariant expansion RATIFIED: `2>/dev/null` is the ONE
+    # accepted redirect inside `$(...)` because:
+    #   1. `2>` targets stderr only (never stdout — the substituted value)
+    #   2. `/dev/null` is a literal inert bytes sink (no filesystem write to
+    #      attacker-chosen path — `/dev/null` is a kernel-owned device with no
+    #      state, no observability channel, no side effect)
+    #   3. Combined: the sole effect of `2>/dev/null` is dropping stderr; the
+    #      command's stdout capture (which the substitution embeds) is unchanged
+    # Founding evidence: mika-dev pilot sessions 57f7c3fb + 53917b4e halted on
+    # `BASE=$(git merge-base HEAD main 2>/dev/null) || BASE=main; ...` shape
+    # (2026-07-29 post cpp#96 deploy). All 4 orderings (main/HEAD, origin/main,
+    # both directions) added to match the commutative git-merge-base semantics.
+    "$(git merge-base HEAD main)",
+    "$(git merge-base HEAD origin/main)",
+    "$(git merge-base HEAD main 2>/dev/null)",
+    "$(git merge-base HEAD origin/main 2>/dev/null)",
+    "$(git merge-base main HEAD 2>/dev/null)",
+    "$(git merge-base origin/main HEAD 2>/dev/null)",
+)
+
+
+# ── The ce-code-review scope probe (mika#1686 F1) ───────────────────────────
+#
+# The ce-code-review skill opens with a scope probe the pilot writes in a few
+# variants, e.g.
+#   BASE=$(git merge-base HEAD origin/main 2>/dev/null) || BASE="origin/main";
+#   echo "BASE:$BASE" && git diff --name-only $BASE && git ls-files --others …
+# Verbatim replay (2026-10-12) found it refused in 7 distinct pilots between
+# 2026-09-28 and 10-02, and the `BASE=` assignment was its only refused
+# segment. This predicate admits that shape and nothing more:
+#
+#   * The assignment is to the exact name `BASE`, from one of the merge-base
+#     tokens above or a literal ref. A token is rewritten to a placeholder only
+#     at a statement start and outside quotes; the anchored assignment
+#     pattern refuses anything glued after the placeholder. The
+#     placeholder is deliberately NOT the policy path's `_SUB_`, which also
+#     stands for `$(pwd)`, `$(date …)` and `$(git rev-parse …)`.
+#   * Every statement that READS BASE must be one of a few read-only git
+#     subcommands (an allowlist: `branch` and `symbolic-ref` both write when
+#     handed a ref) or an echo/printf other than `printf -v`, and may only use
+#     the plain `$BASE` / `${BASE}` expansion. No statement may write BASE.
+#     This is the load-bearing condition: tier1 already passes
+#     `git push origin $BASE`, `git checkout $BASE`, `git tag $BASE` — their
+#     main/master guards are literal text and cannot see through a variable —
+#     so an unrestricted `BASE=main` admission would launder a push to main.
+#   * The predicate needs the assignment AND another statement in the same
+#     call. `permissions._bash_allow_is_chain_safe` checks segments one at a
+#     time; a bare `BASE=…` segment must never pass there, or the reader rule
+#     above would be bypassed by splitting it across segments.
+#   * An inherited BASE in the environment (exported, so visible to child
+#     processes) disqualifies the shape.
+_BASE_PROBE_PLACEHOLDER = "_MERGE_BASE_"
+_BASE_MERGE_BASE_ASSIGN_RE = re.compile(
+    r"(?:^|(?<=[;&|\n\r]))[ \t]*BASE=(?:"
+    + "|".join(re.escape(tok) for tok in _GIT_MERGE_BASE_SUBSTITUTIONS)
+    + r")"
+)
+_BASE_ASSIGNMENT_RE = re.compile(
+    r"^BASE=(?:" + _BASE_PROBE_PLACEHOLDER
+    + r'|"[A-Za-z0-9][A-Za-z0-9._/-]*"|[A-Za-z0-9][A-Za-z0-9._/-]*)$'
+)
+_BASE_REFERENCE_RE = re.compile(r"\$\{?[#!]?BASE(?![A-Za-z0-9_])")
+# Only the plain reads `$BASE` / `${BASE}` are allowed: an operator-bearing
+# expansion (`${BASE:+--output=…}`, `${BASE/#/…}`, `${#BASE}`, `${!BASE}`)
+# turns a reader into an option injector.
+_BASE_NONPLAIN_EXPANSION_RE = re.compile(r"\$\{(?:[#!]BASE|BASE(?!\}))")
+# Bash does not split on an escaped separator, but `_split_compound_command`
+# and the rewrite's lookbehind do; a probe never writes one.
+_BASE_ESCAPED_SEPARATOR_RE = re.compile(r"\\[;&|\n\r]")
+# The git subcommands the probe reads BASE with — an allowlist, not
+# `_is_safe_git_readonly_sub`'s set minus exceptions: that set includes
+# `symbolic-ref`, which WRITES HEAD when given a ref (review round
+# 20261012-115006: `git symbolic-ref HEAD refs/heads/$BASE` then commit and
+# push laundered a push to main).
+_BASE_READER_GIT_SUBCOMMANDS = frozenset(
+    {"diff", "log", "show", "rev-parse", "ls-files", "merge-base"}
+)
+
+
+def _redact_base_merge_base_assignments(command: str) -> str:
+    """Rewrite each unquoted, statement-start `BASE=<merge-base token>` to
+    `BASE=_MERGE_BASE_`. Every other `$(` is left in place for the
+    metacharacter guard to refuse; a command without a match is returned
+    unchanged."""
+    spans = _quote_spans(command)
+    out: list[str] = []
+    last = 0
+    for m in _BASE_MERGE_BASE_ASSIGN_RE.finditer(command):
+        if any(start <= m.start() < end for start, end, _closed in spans):
+            continue
+        leading = m.group(0)[: m.group(0).index("BASE=")]
+        out.append(command[last : m.start()])
+        out.append(f"{leading}BASE={_BASE_PROBE_PLACEHOLDER}")
+        last = m.end()
+    out.append(command[last:])
+    return "".join(out)
+
+
+def _is_safe_base_reader(sub: str, cwd: str | None) -> bool:
+    """A statement that reads BASE: one of the allowlisted read-only git
+    subcommands, or an echo/printf that is otherwise tier1-safe and is not
+    `printf -v` (which copies BASE into a variable nothing checks)."""
+    if _BASE_NONPLAIN_EXPANSION_RE.search(sub):
+        return False
+    git = _GIT_CMD_RE.match(sub)
+    if git:
+        return git.group(1) in _BASE_READER_GIT_SUBCOMMANDS and (
+            _is_safe_git_readonly_sub(_STDERR_DEVNULL_RE.sub("", sub).strip())
+        )
+    words = sub.split()
+    if words[0] == "printf" and any(w.startswith("-v") for w in words[1:]):
+        return False
+    return words[0] in ("echo", "printf") and _is_safe_sub_command(sub, cwd)
+
+
+def is_ce_review_scope_probe(command: str, cwd: str | None = None) -> bool:
+    """Admit the ce-code-review scope probe (mika#1686 F1); see the block
+    comment above for every condition."""
+    if "BASE=" not in command or "BASE" in os.environ:
+        return False
+    if _BASE_ESCAPED_SEPARATOR_RE.search(command):
+        return False
+    redacted = _redact_base_merge_base_assignments(command)
+    if contains_unquoted_metacharacter(redacted) or is_tier3_dangerous(redacted):
+        return False
+    subs = _split_compound_command(redacted)
+    others = [sub for sub in subs if not _BASE_ASSIGNMENT_RE.match(sub)]
+    if len(others) == len(subs) or not others:
+        return False
+    for sub in others:
+        # A statement that WRITES BASE (`printf -v BASE`, `read BASE`,
+        # `${BASE:=…}`, …) would replace the value the assignment shape vetted.
+        if _var_has_nonread_occurrence(sub, "BASE"):
+            return False
+        if _BASE_REFERENCE_RE.search(sub):
+            if not _is_safe_base_reader(sub, cwd):
+                return False
+        elif not _is_safe_sub_command(sub, cwd):
+            return False
+    return True
+
+
 def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
     # a legitimate multi-line compound (for-loop + if + $()) that stalls the
@@ -2918,6 +3087,13 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # glue in ce-work branch-check compounds (SKILL.md §Setup Environment).
     # Fail-closed on any unrecognized sub-command shape.
     if is_git_readonly_compound_when_contained(command):
+        return True
+
+    # mika#1686 F1: the ce-code-review scope probe's `BASE=` assignment.
+    # Before the metachar guard because the probe carries an allowlisted
+    # merge-base `$(…)`; the predicate re-runs that guard itself on the
+    # rewritten command.
+    if is_ce_review_scope_probe(command, cwd):
         return True
 
     if contains_unquoted_metacharacter(command):

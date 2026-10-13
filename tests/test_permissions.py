@@ -22,7 +22,11 @@ from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot import permissions as permissions_module
 from claude_pilot.guardrails import SessionGuardrails
-from claude_pilot.permissions import create_permission_handler, try_tier_1_5_auto_answer
+from claude_pilot.permissions import (
+    CanUseTool,
+    create_permission_handler,
+    try_tier_1_5_auto_answer,
+)
 from claude_pilot.types import (
     GUARDRAIL_DEFAULTS,
     PilotConfig,
@@ -5680,3 +5684,54 @@ def test_262_hash_is_of_the_full_untruncated_command(tmp_path: Path) -> None:
     got = permissions_module._command_hash(long_cmd)
     assert got == hashlib.sha256(long_cmd.encode()).hexdigest()[:12]
     assert len(got) == 12
+
+
+# ── mika#1686 F1: the ce-code-review scope probe, through the real handler ──
+
+
+_F1_HANDLER_VERBATIM = (
+    'BASE=$(git merge-base HEAD origin/main 2>/dev/null) || BASE="origin/main"; '
+    'echo "BASE:$BASE" && echo "FILES:" && git diff --name-only $BASE && '
+    'echo "UNTRACKED:" && git ls-files --others --exclude-standard'
+)
+
+
+def _bundled_policy_handler(
+    monkeypatch: pytest.MonkeyPatch, cwd: Path
+) -> CanUseTool:
+    monkeypatch.delenv("MIKA_PILOT_POLICY_PATH", raising=False)
+    monkeypatch.delenv("MIKA_PERMISSION_POLICY_MODE", raising=False)
+    monkeypatch.delenv("BASE", raising=False)
+    monkeypatch.setenv("MIKA_PILOT_CONTAINED", "1")
+    return create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(cwd)
+    )
+
+
+def test_handler_admits_the_ce_review_scope_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(
+        handler("Bash", {"command": _F1_HANDLER_VERBATIM}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultAllow), result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # policy allows the whole command on its `git status` prefix, then the
+        # chain-safe path checks segment by segment: no segment may carry the
+        # BASE shape across the split.
+        "git status; BASE=main; git push origin $BASE",
+        "git status; BASE=$(pwd)",
+        "git status; BASE=$(pwd); git diff $BASE",
+    ],
+)
+def test_handler_refuses_base_outside_the_probe_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), result
