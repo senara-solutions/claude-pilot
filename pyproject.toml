@@ -16,7 +16,7 @@ dependencies = [
   # directly import them; pinning here forces uv lock to select patched versions across the
   # tree. See cpp#66 body for full CVE inventory + rationale.
   "python-multipart>=0.0.32",   # CVEs 42561/53537/53538/53539/53540 — DoS + parameter smuggling
-  "pyjwt>=2.13.0",              # CVEs 48522/48523/48524/48525/48526 — SSRF + algorithm bypass + HS256 forgery
+  "pyjwt>=2.14.0",              # CVEs 48522/48523/48524/48525/48526 — SSRF + algorithm bypass + HS256 forgery
   "starlette>=1.6.0",           # CVEs 48710/48817/48818/54282/54283 — host header poisoning + DoS
   "cryptography>=50.0.1",       # vulnerable OpenSSL included in cryptography wheels
   "idna>=3.19",                 # CVE-2026-45409 — IDNA encoding bypass of CVE-2024-3651 fix
