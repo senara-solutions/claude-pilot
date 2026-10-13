@@ -2907,6 +2907,12 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     if is_ce_work_preamble_when_contained(command):
         return True
 
+    # A git argument whose value the text does not show (expansion, hidden
+    # assignment, quote-spliced push target) is never admitted — on any path
+    # below, the read-only compound included. See `git_argument_value_hidden`.
+    if git_argument_value_hidden(command):
+        return False
+
     # cpp#103: read-only git compounds under containment attestation. Must
     # match BEFORE the metachar guard — `&&`/`|`/`2>/dev/null` are legitimate
     # glue in ce-work branch-check compounds (SKILL.md §Setup Environment).
@@ -3341,6 +3347,345 @@ _GIT_DENIED_GLOBAL_FLAG_RE = re.compile(
     r"|(^|\s)--upload-pack(\s|=)"   # arbitrary transport exec (fetch/pull)
     r"|(^|\s)--receive-pack(\s|=)"  # arbitrary transport exec (push)
 )
+
+
+# ── Git argument values the text does not show ───────────────────────────────
+#
+# Every git guard above and in TIER3_PATTERNS reads the RAW command text. Bash
+# evaluates that text before git sees it — parameter expansion, special
+# parameters, quote and backslash removal, globbing — so a value a guard refuses
+# as a literal (`main`, `--force`, `--output=…`) can reach git without ever
+# appearing in the text the guard read. Measured on main 1581d74: push targets
+# and global flags carried by an expansion, or spliced out of quotes, were
+# admitted while their literal spelling was refused. The policy layer re-admitted
+# the same forms when tier1 refused them (`bash-git-push` / `bash-git-readonly`
+# + a chain-safe check that only consults `is_tier3_dangerous`, raw text again).
+#
+# `git_argument_value_hidden` is the ONE predicate both layers consult: tier1 at
+# its git admission points, and `permissions._bash_allow_is_chain_safe` as a
+# veto on a policy allow. It only ever REFUSES — it is never a reason to admit.
+#
+#   (a) a hidden assignment anywhere in the command (`printf -v…` in command
+#       position, quoted or not; an assignment operator anywhere in a `${…}`
+#       body) — it would let a later plain `$NAME` carry any value;
+#   (b) any expansion in a git argument other than a plain `$NAME` / `${NAME}`
+#       (operators, indirection, length, `$_`, positional and special
+#       parameters, `$(`, `$[`, `$'`, `$"`); `$$` (the PID) is the one
+#       special parameter tolerated;
+#   (c) any expansion at all in a git subcommand that writes (everything but
+#       `_GIT_READ_SUBCOMMANDS`, and anything after a global option), or in
+#       the subcommand word itself;
+#   (d) `push`: an unquoted glob, `--all`/`--mirror`, a `+` force refspec,
+#       or a refspec whose destination resolves to main/master
+#       (`main`, `heads/main`, `refs/heads/main`) — judged on the quote-removed
+#       words, i.e. on what git actually receives;
+#   (e) any git argument that is a quoted or escaped spelling of a guarded flag
+#       (`-"D"`, `--"output"=…`), a brace expansion, or a leading glob before
+#       `--` (it can expand to a `-`-led filename).
+#
+# Literal flags the policy layer admits although tier1 refuses them
+# (`bash-git-readonly` is a prefix match) are a separate, pre-existing defect:
+# this predicate is about values the TEXT does not show, not about widening the
+# policy's guards.
+#
+# A plain `$NAME` stays admitted in a READ subcommand: with (a) closed its value
+# is either inherited from the dispatcher or assigned in the clear in the same
+# command (the mika#1686 F1 `BASE=…; git diff $BASE` shape). Inherited
+# environment is the declared residual — the pilot does not set it.
+
+# `branch` is excluded on purpose: it carries mutant flags (`-D`, `-m`) a
+# variable could supply.
+_GIT_READ_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "log", "diff", "show", "rev-parse", "symbolic-ref", "ls-files",
+    "describe", "shortlog", "blame", "merge-base",
+})
+_PLAIN_PARAM_RE = re.compile(r"\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+# An assignment operator anywhere in a `${…}` body: `${X:=v}`, `${A[0]=v}`,
+# `${X:-${Y:=v}}`. Over-matches `${X:-a=b}` — refusing that is the safe side.
+_ASSIGN_IN_EXPANSION_RE = re.compile(r"[A-Za-z0-9_\]]:?=")
+_NAME_START = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_NAME_CHARS = _NAME_START | frozenset("0123456789")
+_SPECIAL_PARAMS = frozenset("0123456789@*#?$!-")
+_WORD_BREAKS = frozenset(" \t\n\r;&|()<>")
+_GLOB_CHARS = frozenset("*?[")
+_MAIN_BRANCHES = frozenset({"main", "master"})
+
+
+class _ShellWord:
+    """One shell word: quote-removed text plus what evaluation would change."""
+
+    __slots__ = ("brace", "expansions", "glob", "lead_glob", "quoted", "text")
+
+    def __init__(self) -> None:
+        self.text = ""
+        # Source form of each `$…` bash would expand: "NAME", "{…}", or a
+        # one-char marker ("(", "[", "'", '"', or a special parameter).
+        self.expansions: list[str] = []
+        self.glob = False       # an unquoted `*`, `?` or `[`
+        self.lead_glob = False  # ... as the word's first character
+        self.brace = False      # an unquoted `{` (brace expansion)
+        self.quoted = False     # any quoting or backslash escape in the word
+
+
+def _lex_shell_words(segment: str) -> list[_ShellWord] | None:
+    """Split *segment* into shell words, tracking quotes, escapes, expansions.
+
+    Returns ``None`` on an unterminated quote or `${`, which callers treat as
+    "value hidden" (fail closed).
+    """
+    words: list[_ShellWord] = []
+    cur: _ShellWord | None = None
+    quote = ""
+    i, n = 0, len(segment)
+
+    def word() -> _ShellWord:
+        nonlocal cur
+        if cur is None:
+            cur = _ShellWord()
+            words.append(cur)
+        return cur
+
+    while i < n:
+        ch = segment[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            else:
+                word().text += ch
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n:
+                word().text += ch
+                i += 1
+                continue
+            nxt = segment[i + 1]
+            if quote == '"' and nxt not in '$`"\\\n':
+                word().text += ch
+                i += 1
+                continue
+            if nxt != "\n":
+                w = word()
+                w.text += nxt
+                w.quoted = True
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n:
+            nxt = segment[i + 1]
+            if nxt == "{":
+                depth, j = 1, i + 2
+                while j < n and depth:
+                    if segment[j] == "{":
+                        depth += 1
+                    elif segment[j] == "}":
+                        depth -= 1
+                    j += 1
+                if depth:
+                    return None
+                body = segment[i + 1:j]
+                w = word()
+                w.expansions.append(body)
+                w.text += "$" + body
+                i = j
+                continue
+            if nxt in _NAME_START:
+                j = i + 1
+                while j < n and segment[j] in _NAME_CHARS:
+                    j += 1
+                w = word()
+                w.expansions.append(segment[i + 1:j])
+                w.text += segment[i:j]
+                i = j
+                continue
+            # `$[…]` is legacy arithmetic; `$(`, `$'`, `$"` substitute or quote.
+            if nxt in _SPECIAL_PARAMS or nxt in "([" or (not quote and nxt in "'\""):
+                w = word()
+                w.expansions.append(nxt)
+                w.text += "$"
+                i += 1
+                continue
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            else:
+                word().text += ch
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            word().quoted = True
+            i += 1
+            continue
+        if ch in _WORD_BREAKS:
+            cur = None
+            i += 1
+            continue
+        if ch == "#" and cur is None:
+            break  # an unquoted `#` starting a word comments out the rest
+        w = word()
+        if ch in _GLOB_CHARS:
+            w.glob = True
+            w.lead_glob = w.lead_glob or (w.text == "" and not w.quoted)
+        elif ch == "{":
+            # Brace expansion needs a `,` or `..` before the closing brace;
+            # git revision syntax (`@{u}`, `HEAD@{1}`, `^{tree}`) has neither.
+            j = i + 1
+            while j < n and segment[j] not in "}" and segment[j] not in _WORD_BREAKS:
+                j += 1
+            body = segment[i + 1:j]
+            if j < n and segment[j] == "}" and ("," in body or ".." in body):
+                w.brace = True
+        w.text += ch
+        i += 1
+
+    if quote:
+        return None
+    return words
+
+
+def _hidden_assignment(command: str) -> bool:
+    """(a) An assignment the text does not spell as `NAME=value`."""
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            # Unlexable (unterminated quote or `${`): fail closed only where an
+            # assignment could hide — elsewhere bash itself would not run it.
+            if "printf" in seg or "${" in seg:
+                return True
+            continue
+        for idx, w in enumerate(words):
+            if any(
+                e.startswith("{") and _ASSIGN_IN_EXPANSION_RE.search(e)
+                for e in w.expansions
+            ):
+                return True
+            # Quoting does not stop `"printf"` / `\printf` running the builtin.
+            if w.text != "printf":
+                continue
+            for opt in words[idx + 1:]:
+                if opt.text == "--" or not opt.text.startswith("-"):
+                    break
+                if opt.text.startswith("-v"):
+                    return True
+    return False
+
+
+def _is_plain_param(expansion: str) -> bool:
+    m = _PLAIN_PARAM_RE.fullmatch(expansion)
+    if m is None or m.group(1) == "_":
+        return False
+    # `{NAME` / `NAME}` alone are not plain references.
+    return expansion.startswith("{") == expansion.endswith("}")
+
+
+def _git_push_target_hidden(args: list[_ShellWord]) -> bool:
+    """(d) What `git push` really targets, read off the quote-removed words."""
+    positional = 0
+    for w in args:
+        t = w.text
+        if w.glob:
+            return True
+        if t in ("--all", "--mirror"):
+            return True
+        if t.startswith("-"):
+            continue
+        positional += 1
+        if positional == 1:
+            continue  # the remote
+        if t.startswith("+"):
+            return True
+        # git resolves `heads/main` and `refs/heads/main` to the same ref.
+        dest = t.rsplit(":", 1)[-1].removeprefix("refs/").removeprefix("heads/")
+        if dest in _MAIN_BRANCHES:
+            return True
+    return False
+
+
+def _is_guarded_git_flag(t: str) -> bool:
+    """A flag some raw-text git guard refuses when it is spelled literally."""
+    if not t.startswith("-"):
+        return False
+    return bool(
+        _FORCE_FLAG_RE.match(t)
+        or _GIT_DENIED_GLOBAL_FLAG_RE.search(t)
+        or t in _GIT_BRANCH_MUTANT_TOKENS
+        or t in _GIT_READONLY_DENIED_TOKENS
+        or t.startswith(_GIT_READONLY_DENIED_PREFIXES[:-1])
+    )
+
+
+def _git_words_hide_value(words: list[_ShellWord]) -> bool:
+    """(b)(c)(d) for every unquoted `git` word in one segment."""
+    for idx, w in enumerate(words):
+        if w.text != "git" or w.quoted or w.expansions:
+            continue
+        args = words[idx + 1:]
+        sub_word: _ShellWord | None = None
+        skip = False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a.text in ("-c", "-C"):
+                skip = True
+                continue
+            if a.text.startswith("-") and not a.expansions:
+                continue
+            sub_word = a
+            break
+        # Read-only only when the subcommand is git's FIRST argument: a global
+        # option before it (`--git-dir X`, `-c k=v`) has an arity this finder
+        # does not model, so the word it lands on proves nothing. An expansion
+        # in the subcommand word itself is refused by (c): it is never a read.
+        read_only = (
+            sub_word is not None
+            and sub_word is args[0]
+            and sub_word.text in _GIT_READ_SUBCOMMANDS
+        )
+        past_pathspec = False
+        for a in args:
+            # A quoted or escaped word whose VALUE is a guarded flag (`-"D"`,
+            # `--"output"=…`): the raw-text guards cannot see it.
+            if a.quoted and _is_guarded_git_flag(a.text):
+                return True
+            # Brace expansion, or a glob that can expand to a `-`-led filename,
+            # produces arguments the text does not show.
+            if a.brace or (a.lead_glob and not past_pathspec):
+                return True
+            if a.text == "--" and not a.quoted:
+                past_pathspec = True
+            for e in a.expansions:
+                if e == "$":
+                    # `$$` is the shell's PID: digits the pilot does not choose,
+                    # so it can carry no flag, branch name or glob. Parity: the
+                    # `git stash push -u -m "<tag>-$$"` uniqueness idiom (3 pilots).
+                    continue
+                if not _is_plain_param(e) or not read_only:
+                    return True
+        if sub_word is not None and sub_word.text == "push":
+            push_args = args[args.index(sub_word) + 1:]
+            if _git_push_target_hidden(push_args):
+                return True
+    return False
+
+
+def git_argument_value_hidden(command: str) -> bool:
+    """True when a git argument's value cannot be read off *command*'s text.
+
+    See the block comment above for the four clauses. Fails closed on input
+    the lexer cannot follow (unterminated quote or `${`).
+    """
+    if _hidden_assignment(command):
+        return True
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            if "git" in seg:
+                return True
+            continue  # later segments are still judged
+        if _git_words_hide_value(words):
+            return True
+    return False
 
 
 def is_safe_git_command(sub: str) -> bool:
