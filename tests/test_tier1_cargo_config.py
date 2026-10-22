@@ -312,6 +312,6 @@ class TestCargoDirTier1Git:
     ) -> None:
         assert is_tier1_auto_approve("Bash", {"command": cmd}, str(tmp_path)) is False
 
-    @pytest.mark.parametrize("cmd", ["cat .cargo/config.toml", "git worktree add ../wt-x"])
+    @pytest.mark.parametrize("cmd", ["cat .cargo/config.toml", "git checkout HEAD -- src/main.rs"])
     def test_reads_and_other_git_stay_auto_approved(self, tmp_path: Path, cmd: str) -> None:
         assert is_tier1_auto_approve("Bash", {"command": cmd}, str(tmp_path)) is True
