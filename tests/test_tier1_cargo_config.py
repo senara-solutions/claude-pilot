@@ -305,7 +305,7 @@ class TestCargoDirPolicyVeto:
 class TestCargoDirTier1Git:
     @pytest.mark.parametrize(
         "cmd",
-        ["git worktree add .cargo", "git checkout HEAD -- .cargo/config.toml"],
+        ["git checkout HEAD -- .cargo", "git checkout HEAD -- .cargo/config.toml"],
     )
     def test_git_write_into_cargo_dir_is_not_auto_approved(
         self, tmp_path: Path, cmd: str

@@ -40,7 +40,7 @@ Ce que la règle resserre, pour ses sous-commandes et sur tous les chemins de ti
 
 ### Scope Boundaries
 
-- Préservé : les sous-commandes que tier1 admet comme écritures (`commit`, `push`, `checkout`, `add`, `rebase`, `pull`…) ne sont pas des lectures. La liste fermée ne les vise pas et elles gardent leur décision.
+- Préservé : la liste fermée ne vise que les sous-commandes de lecture de `bash-git-readonly`. Les autres gardent leur décision.
 - La table des formes admises reste celle de `bash-git-readonly`. L'élargir pour une bascule serait une admission nouvelle sur le chemin policy.
 - Des résiduels hors de ce périmètre sont suivis en privé.
 

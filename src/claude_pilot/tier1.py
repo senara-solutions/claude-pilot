@@ -4048,10 +4048,10 @@ def bash_names_cargo_dir(command: str) -> bool:
 #     when tier1 admits first.
 #   * `git_read_overreaches` — the closed list of forms each of the ten
 #     subcommands is admitted in. Consulted by tier1 on every segment of the
-#     command as bash splits it (`is_safe_bash_command`, ahead of every tier1
-#     admission path), and on a policy allow, keyed on the segment's
-#     subcommand rather than on the rule id, so no earlier rule can claim the
-#     segment around it.
+#     command (`is_safe_bash_command`, ahead of the paths that judge a git
+#     segment), and on a policy allow, keyed on the segment's subcommand
+#     rather than on the rule id, so no earlier rule can claim the segment
+#     around it.
 #
 # `--output` is `git_option_writes_a_file`'s, on both paths; it is not repeated
 # here.

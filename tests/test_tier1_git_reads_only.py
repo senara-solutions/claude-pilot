@@ -2,10 +2,10 @@
 
 `git_read_overreaches` holds the closed list of forms `bash-git-readonly`'s
 subcommands are admitted in. `is_safe_bash_command` consults it on every
-segment of the command, as bash splits it, so no tier1 path admits a form the
-list refuses: the simple path, each segment of a policy-judged chain, the
-contained read-only compound, and the review scope probe. Each term has a test
-that turns red when it alone is removed.
+segment of the command, ahead of the tier1 paths that judge a git segment:
+the simple path, each segment of a policy-judged chain, the contained
+read-only compound, and the review scope probe. Each term has a test that
+turns red when it alone is removed.
 
 No test touches the network or GitHub: the handler tests use the bundled policy
 with the cm emitter and the notify hook replaced by no-ops.
@@ -32,7 +32,7 @@ _BUNDLED_POLICY = (
 )
 
 # Not a read: each changes a ref, its config, a worktree, or leaves the read
-# mode. tier1 used to admit every one of them on its own.
+# mode.
 _NOT_A_READ = [
     "git branch newb",
     "git branch newb origin/main",
@@ -103,6 +103,15 @@ _ADMITTED = [
     "BASE=$(git merge-base HEAD main 2>/dev/null); git diff --stat $BASE",
 ]
 
+# The ce-work branch check, admitted by tier1's read-only compound path under
+# containment.
+_CE_WORK_BRANCH_CHECK = (
+    'git branch --show-current && echo "---" && '
+    "git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | "
+    "sed 's@^refs/remotes/origin/@@' && "
+    'echo "---" && git status --short | head -30'
+)
+
 
 @pytest.fixture(params=[False, True], ids=["uncontained", "contained"])
 def contained(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> bool:
@@ -143,6 +152,11 @@ class TestTier1:
     @pytest.mark.parametrize("cmd", _ADMITTED)
     def test_read_is_safe(self, contained: bool, cmd: str) -> None:
         assert is_safe_bash_command(cmd) is True
+
+    def test_contained_ce_work_branch_check_is_safe(self, contained: bool) -> None:
+        if not contained:
+            pytest.skip("the read-only compound path is gated on containment")
+        assert is_safe_bash_command(_CE_WORK_BRANCH_CHECK) is True
 
 
 class TestHandler:
