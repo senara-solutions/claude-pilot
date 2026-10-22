@@ -48,7 +48,7 @@ Voie fichier, vérifiée : `Write`/`Edit` sur `.cargo/config.toml` dans le workt
 - Choix assumé : `--config` est refusé même après `--`, où il irait au binaire de test et non à cargo. Sur-refus sans usage connu, au profit d'un prédicat sans cas particulier.
 - Choix assumé : une écriture Bash vers `.cargo/audit.toml` est refusée aussi (le prédicat vise le répertoire) ; `Write`/`Edit` sur ce fichier restent admis.
 - Choix assumé : une expansion (`$NAME`) est lue à sa graphie littérale. Toute destination d'écriture qui en porte une est déjà vetoée par `_destination_veto_reason`, et toute sous-commande git qui écrit la refuse (`git_argument_value_hidden`). La lire comme « n'importe quoi » refusait 46 commandes réelles (boucles, `$?`).
-- Résiduel déclaré : `cargo test` compile et exécute du code du worktree ; ce correctif ferme le canal déclaratif de configuration, il ne fait pas de cargo un bac à sable. Restent aussi : un ref déjà porteur du fichier, amené par `git merge`/`cherry-pick`/`stash pop` (le pilote ne peut plus le créer) ; une variable héritée de l'environnement du dispatcher ; `rust-toolchain.toml`, autre fichier de configuration côté rustup.- Hors périmètre : l'évaluateur `per_spawn` (opt-in, politique vide par défaut) ; l'absence générale de liste de plan de contrôle sur `Write`/`Edit` (seuls les chemins de config cargo sont ajoutés ici).
+- Des résiduels hors de ce périmètre sont suivis en privé.
 
 ## Planning Contract
 

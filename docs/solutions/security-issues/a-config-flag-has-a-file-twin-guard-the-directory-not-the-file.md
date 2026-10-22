@@ -50,4 +50,4 @@ Rejeu final, ancien (`caf7e82`) contre neuf : 39 352 appels Bash/Write/Edit dist
 - Une découverte par ancêtres fait d'une racine scratch hors worktree une surface de configuration.
 - Mesurer chaque clause « prudente » sur le corpus réel avant de la garder : un faux refus coûte un tour de pilote à chaque fois.
 
-Résiduels déclarés : un ref déjà porteur du fichier (le pilote ne peut plus le créer) ; une variable héritée du dispatcher ; `rust-toolchain.toml`, côté rustup.
+Des résiduels hors de ce périmètre sont suivis en privé.
