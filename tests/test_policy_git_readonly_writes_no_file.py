@@ -107,6 +107,10 @@ class TestPredicate:
     def test_every_segment_is_read(self) -> None:
         assert git_option_writes_a_file("echo x; git log --output out.txt") is True
 
+    def test_a_comment_ends_its_line_only(self) -> None:
+        # The lexer stops at `#`; the next line is still a command bash runs.
+        assert git_option_writes_a_file("git status # note\ngit diff --output=out.txt") is True
+
 
 class TestHandler:
     @pytest.mark.parametrize("cmd", _OUTPUT_FORMS + _QUOTED_FORMS)
