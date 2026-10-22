@@ -66,6 +66,7 @@ from .tier1 import (
     rm_confined_to_pilot_scratch,
     rm_targets_mktemp_scratch,
     sed_i_confined_to_worktree,
+    split_is_ambiguous,
 )
 from .transport import invoke_command
 from .types import (
@@ -533,6 +534,13 @@ def _bash_allow_is_chain_safe(
         if bash_names_cargo_dir(command.split("\n", 1)[0]):
             return False
         return _is_sanctioned_pure_heredoc(command)
+
+    # A command whose split may differ from bash's is never honored: every
+    # check below, the sanctioned shapes included, reads its segments or its
+    # raw text. The sanctioned heredoc above is a whole-command proof that
+    # never consults the split, and its body is data bash does not join.
+    if split_is_ambiguous(command):
+        return False
 
     # Command substitution. Backtick / ``$'`` / bash 5.3 K-style funsub (``${ … }``)
     # forms are never allowlistable → veto outright. For ``$(`` forms, admit only
