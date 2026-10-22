@@ -42,7 +42,7 @@ _OUTPUT_FORMS = [
     "git show --output out.txt HEAD",
     "git status && git diff --output=out.txt",
     "git log -1 -p --output out.txt | head",
-    "git diff -- --output=out.txt",
+    "git diff '--' --output=out.txt",
 ]
 
 # Quoted or escaped spellings: already refused on the policy path by the
@@ -51,6 +51,16 @@ _QUOTED_FORMS = [
     "git diff '--output=out.txt'",
     'git diff --"output"=out.txt',
     "git diff \\--output out.txt",
+]
+
+# An unquoted glob whose literal head can still spell the option: bash may
+# expand it to a matching filename. tier1 admitted these before.
+_GLOB_FORMS = [
+    "git log -p --outpu?=out.txt",
+    "git diff --outpu[t]=out.txt",
+    "git show --outp*=out.txt HEAD",
+    "git diff -*",
+    "git diff HEAD --output*",
 ]
 
 # Ordinary reads: decision unchanged (admitted).
@@ -65,6 +75,11 @@ _ADMITTED = [
     "git log -p --output-indicator-old=- -1",
     "git status && git diff --name-only",
     "git show HEAD:README.md > notes.md",
+    "git log --grep=fix* -1",
+    "git diff -- src/*.py",
+    "git diff -- *.py",
+    # After `--` git reads a path: this names a file, it writes none.
+    "git diff -- --output=out.txt",
 ]
 
 
@@ -93,7 +108,7 @@ def handler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 
 class TestPredicate:
-    @pytest.mark.parametrize("cmd", _OUTPUT_FORMS + _QUOTED_FORMS)
+    @pytest.mark.parametrize("cmd", _OUTPUT_FORMS + _QUOTED_FORMS + _GLOB_FORMS)
     def test_output_option_is_detected(self, cmd: str) -> None:
         assert git_option_writes_a_file(cmd) is True
 
@@ -113,7 +128,7 @@ class TestPredicate:
 
 
 class TestHandler:
-    @pytest.mark.parametrize("cmd", _OUTPUT_FORMS + _QUOTED_FORMS)
+    @pytest.mark.parametrize("cmd", _OUTPUT_FORMS + _QUOTED_FORMS + _GLOB_FORMS)
     def test_output_option_is_refused(self, handler, cmd: str) -> None:
         assert handler(cmd) == "deny"
 

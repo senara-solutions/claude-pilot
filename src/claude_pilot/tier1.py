@@ -3081,6 +3081,10 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # below, the read-only compound included. See `git_argument_value_hidden`.
     if git_argument_value_hidden(command):
         return False
+    # Nor a git invocation that may write its output to a file (`--output`,
+    # including a glob bash could expand into it).
+    if git_option_writes_a_file(command):
+        return False
 
     # cpp#103: read-only git compounds under containment attestation. Must
     # match BEFORE the metachar guard — `&&`/`|`/`2>/dev/null` are legitimate
@@ -3864,15 +3868,31 @@ def git_argument_value_hidden(command: str) -> bool:
     return False
 
 
+def _glob_may_spell_output(w: _ShellWord) -> bool:
+    """An unquoted glob whose literal head is still compatible with `--output`.
+
+    Bash expands it to a matching filename before git reads it. The head is
+    cut at the first glob character, quoted or not: a shorter head only
+    refuses more.
+    """
+    if not w.glob:
+        return False
+    # A head longer than `--output` is either `--output=…`, already caught as
+    # a literal, or a word that cannot become the option.
+    head = w.text[:min(i for i, c in enumerate(w.text) if c in _GLOB_CHARS)]
+    return "--output".startswith(head)
+
+
 def git_option_writes_a_file(command: str) -> bool:
-    """True when a git invocation in *command* carries `--output`.
+    """True when a git invocation in *command* may carry `--output`.
 
     `git log`, `git show` and `git diff` write their output to the named file
-    (`--output=F` or `--output F`; git accepts no abbreviation). tier1 refuses
-    it through `_GIT_DENIED_GLOBAL_FLAG_RE`; this is the same refusal for
+    (`--output=F` or `--output F`; git accepts no abbreviation). Judged on
+    quote-removed words, plus any unquoted glob that bash could expand into
+    that option, up to an unquoted `--`. Consulted by `is_safe_bash_command` and by
     `permissions._bash_allow_is_chain_safe`, where `bash-git-readonly` is a
-    prefix match. Judged on quote-removed words. An unlexable segment is left
-    to `git_argument_value_hidden`, which already refuses it.
+    prefix match. An unlexable segment is left to `git_argument_value_hidden`,
+    which already refuses it on both paths.
     """
     for seg in _split_compound_command(command) or [command]:
         words = _lex_shell_words(seg)
@@ -3882,7 +3902,12 @@ def git_option_writes_a_file(command: str) -> bool:
             if w.text != "git":
                 continue
             for a in words[idx + 1:]:
+                # After `--` git reads paths, not options.
+                if a.text == "--" and not a.quoted:
+                    break
                 if a.text == "--output" or a.text.startswith("--output="):
+                    return True
+                if _glob_may_spell_output(a):
                     return True
     return False
 
