@@ -60,7 +60,7 @@ Ce que la règle resserre, pour ses sous-commandes et sur tous les chemins de ti
 **Goal :** R1, R2, R3.
 **Files :** `src/claude_pilot/tier1.py`, `tests/test_tier1_git_reads_only.py`.
 **Approach :**
-1. `is_safe_bash_command` : après `git_option_names_a_program`, refuser quand `git_read_overreaches` est vrai pour un segment de `_split_compound_command(command)`. Si le découpage échoue, juger la commande entière.
+1. `is_safe_bash_command` : après `git_option_names_a_program`, refuser quand `git_read_overreaches` est vrai pour un segment de `_split_compound_command(command)`. Le découpeur ne rend une liste vide que pour une commande sans segment, qui ne contient aucun mot `git` : aucun repli n'est nécessaire.
 2. Mettre à jour le commentaire de section de `git_read_overreaches`, qui dit aujourd'hui que le prédicat n'est consulté que sur un allow de la policy.
 
 **Patterns to follow :** `git_option_names_a_program` (boucle sur `_split_compound_command(command) or [command]`, appel dans `is_safe_bash_command`) ; les tests via le handler de `tests/test_policy_git_readonly_reads_only.py`.
@@ -77,7 +77,7 @@ Ce que la règle resserre, pour ses sous-commandes et sur tous les chemins de ti
 - Directs sur le prédicat d'entrée : `is_safe_bash_command` refuse une forme de chaque famille, hors et sous confinement.
 - Positifs, mêmes chemins, qui restent admis : `git branch --show-current`, `git branch -a`, `git branch --list 'fix/*'`, `git worktree list --porcelain`, `git fetch origin main`, `git fetch --prune origin`, `git diff --stat origin/main`, `git log --oneline -5`, `git show HEAD:README.md`, `git log '--grep=a|b' --oneline`, la sonde de revue ordinaire (`git diff --stat $BASE`) et le compound `ce-work` sous confinement.
 
-**Execution note :** commencer par le commit vert, puis mesurer le rouge-avant terme par terme. Le site d'appel neutralisé, la boucle réduite à la commande entière, et le repli sur la commande entière doivent chacun faire rougir au moins un test. Un mutant identité de contrôle doit rester vert.
+**Execution note :** commencer par le commit vert, puis mesurer le rouge-avant terme par terme. Le site d'appel neutralisé et la boucle réduite à la commande entière doivent chacun faire rougir au moins un test. Un mutant identité de contrôle doit rester vert.
 
 ## Verification Contract
 

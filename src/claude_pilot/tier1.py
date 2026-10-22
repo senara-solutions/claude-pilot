@@ -3092,7 +3092,7 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     if git_option_names_a_program(command):
         return False
     # Nor a git read subcommand in a form that is not a read, in any segment.
-    if any(git_read_overreaches(seg) for seg in _split_compound_command(command) or [command]):
+    if any(git_read_overreaches(seg) for seg in _split_compound_command(command)):
         return False
 
     # cpp#103: read-only git compounds under containment attestation. Must
