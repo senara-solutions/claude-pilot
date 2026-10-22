@@ -3864,6 +3864,29 @@ def git_argument_value_hidden(command: str) -> bool:
     return False
 
 
+def git_option_writes_a_file(command: str) -> bool:
+    """True when a git invocation in *command* carries `--output`.
+
+    `git log`, `git show` and `git diff` write their output to the named file
+    (`--output=F` or `--output F`; git accepts no abbreviation). tier1 refuses
+    it through `_GIT_DENIED_GLOBAL_FLAG_RE`; this is the same refusal for
+    `permissions._bash_allow_is_chain_safe`, where `bash-git-readonly` is a
+    prefix match. Judged on quote-removed words. An unlexable segment is left
+    to `git_argument_value_hidden`, which already refuses it.
+    """
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            continue
+        for idx, w in enumerate(words):
+            if w.text != "git":
+                continue
+            for a in words[idx + 1:]:
+                if a.text == "--output" or a.text.startswith("--output="):
+                    return True
+    return False
+
+
 def is_safe_git_command(sub: str) -> bool:
     match = _GIT_CMD_RE.match(sub)
     if not match:

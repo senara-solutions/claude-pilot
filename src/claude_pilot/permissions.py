@@ -51,6 +51,7 @@ from .tier1 import (
     _redirect_targets,
     _split_compound_command,
     git_argument_value_hidden,
+    git_option_writes_a_file,
     is_readonly_waitloop_script,
     is_safe_bash_command,
     is_tier1_auto_approve,
@@ -552,6 +553,11 @@ def _bash_allow_is_chain_safe(
     # redaction so a sanctioned substitution stays one literal `_SUB_` word,
     # and BEFORE the sanctioned-shape exceptions so none of them bypass it.
     if git_argument_value_hidden(command):
+        return False
+    # Nor a git invocation that writes its output to a file (`--output`):
+    # `bash-git-readonly` admits the subcommand without reading its options.
+    # Rule-id independent, like the veto above.
+    if git_option_writes_a_file(command):
         return False
 
     # Sanctioned `git show <rev>:<path> > <relative-path>` (cpp#35, ref shape
