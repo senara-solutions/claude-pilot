@@ -53,7 +53,9 @@ from .tier1 import (
     bash_names_cargo_dir,
     cargo_carries_config,
     git_argument_value_hidden,
+    git_option_names_a_program,
     git_option_writes_a_file,
+    git_read_overreaches,
     is_readonly_waitloop_script,
     is_safe_bash_command,
     is_tier1_auto_approve,
@@ -565,6 +567,10 @@ def _bash_allow_is_chain_safe(
     # Rule-id independent, like the veto above.
     if git_option_writes_a_file(command):
         return False
+    # Nor a git option whose value git runs as a program. Rule-id independent,
+    # like the veto above.
+    if git_option_names_a_program(command):
+        return False
     # A cargo invocation that carries `--config` is not honored on a policy
     # allow either: `bash-cargo` is a prefix match that stops at the
     # subcommand. Rule-id independent, like the git veto above.
@@ -697,7 +703,13 @@ def _bash_allow_is_chain_safe(
         if is_safe_bash_command(seg):
             continue
         pd = evaluate(policy, tool_name, {"command": seg})
-        if pd.decision == "allow" and not is_tier3_dangerous(seg):
+        # A git read subcommand is honored only in a read form: the
+        # `bash-git-readonly` pattern does not read past the subcommand.
+        if (
+            pd.decision == "allow"
+            and not is_tier3_dangerous(seg)
+            and not git_read_overreaches(seg)
+        ):
             continue
         return False
     return True
@@ -3179,8 +3191,14 @@ def _segment_refusal_cause(policy: Policy, segment: str, cwd: str) -> str | None
     if is_safe_bash_command(segment):
         return None
     pd = evaluate(policy, "Bash", {"command": segment})
-    if pd.decision == "allow" and not is_tier3_dangerous(segment):
+    if (
+        pd.decision == "allow"
+        and not is_tier3_dangerous(segment)
+        and not git_read_overreaches(segment)
+    ):
         return None
+    if pd.decision == "allow" and not is_tier3_dangerous(segment):
+        return "chain-unsafe"
     if pd.decision == "allow":
         # allow but tier3 — already caught above; defensive.
         return "tier3"

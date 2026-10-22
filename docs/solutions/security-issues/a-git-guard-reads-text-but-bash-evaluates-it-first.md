@@ -48,7 +48,7 @@ Clauses: (a) hidden assignment anywhere in the command; (b) any expansion in a g
 
 ## Not fixed here
 
-The policy layer also admits **literal** git options that tier1 refuses (`--upload-pack=`, `--output=`, `branch -m`, `worktree remove --force`), because `bash-git-readonly` is a prefix match and chain-safety never replays tier1's flag guards. That is a different class (nothing is hidden from the text) and needs its own ticket. Residuals: environment variables inherited from the dispatcher and read through a plain `$NAME` in a read subcommand, and the opt-in `per_spawn` evaluator, which does not consult this predicate.
+Residuals: environment variables inherited from the dispatcher and read through a plain `$NAME` in a read subcommand, and the opt-in `per_spawn` evaluator, which does not consult this predicate.
 
 ## Prevention
 

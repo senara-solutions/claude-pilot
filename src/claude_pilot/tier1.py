@@ -3088,6 +3088,9 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # including a glob bash could expand into it).
     if git_option_writes_a_file(command):
         return False
+    # Nor a git option whose value git runs as a program.
+    if git_option_names_a_program(command):
+        return False
 
     # cpp#103: read-only git compounds under containment attestation. Must
     # match BEFORE the metachar guard — `&&`/`|`/`2>/dev/null` are legitimate
@@ -4028,6 +4031,237 @@ def bash_names_cargo_dir(command: str) -> bool:
         if any(_word_may_name_cargo_dir(w) for w in words):
             return True
     return False
+
+
+# ── A git read is a read (`bash-git-readonly`) ───────────────────────────────
+#
+# `bash-git-readonly` admits ten subcommands as reads. A read writes nothing,
+# runs no program, and touches neither local refs, config nor worktrees. Two
+# predicates hold that, both on quote-removed words (`_lex_shell_words`):
+#
+#   * `git_option_names_a_program` — an option whose value git runs as a
+#     program. Consulted by tier1 and as a policy veto, for every git
+#     invocation: a guard that only lives on the policy path is never reached
+#     when tier1 admits first.
+#   * `git_read_overreaches` — the closed list of forms each of the ten
+#     subcommands is admitted in. Consulted on a policy allow, keyed on the
+#     segment's subcommand rather than on the rule id, so no earlier rule can
+#     claim the segment around it.
+#
+# `--output` is `git_option_writes_a_file`'s, on both paths; it is not repeated
+# here.
+
+# git runs the value of these options as the remote-side program, and accepts
+# any unambiguous abbreviation of them.
+_GIT_PROGRAM_OPTIONS = ("--upload-pack", "--receive-pack", "--exec")
+# Subcommands that take such options. Some of their options take a separate
+# value that may itself be `--`, so their reading does not stop there.
+_GIT_TRANSPORT_SUBCOMMANDS = frozenset({
+    "fetch", "pull", "push", "ls-remote", "fetch-pack", "send-pack", "clone",
+    "archive",
+})
+
+
+def _glob_head(w: _ShellWord) -> str | None:
+    """The literal head of an unquoted glob word, cut at its first glob char.
+
+    Bash expands the word before git reads it, so only the head is known. A
+    shorter head only refuses more.
+    """
+    if not w.glob:
+        return None
+    return w.text[:min(i for i, c in enumerate(w.text) if c in _GLOB_CHARS)]
+
+
+def _names_a_program(w: _ShellWord) -> bool:
+    if w.text.startswith("--"):
+        name = w.text.split("=", 1)[0]
+        if len(name) > 2 and any(o.startswith(name) for o in _GIT_PROGRAM_OPTIONS):
+            return True
+    head = _glob_head(w)
+    return head is not None and any(o.startswith(head) for o in _GIT_PROGRAM_OPTIONS)
+
+
+def git_option_names_a_program(command: str) -> bool:
+    """True when a git invocation in *command* may carry an option whose value
+    git runs as a program (`_GIT_PROGRAM_OPTIONS`, abbreviated or not, or an
+    unquoted glob bash could expand into one). Read up to an unquoted `--`,
+    except for a transport subcommand, or when a global option precedes the
+    subcommand, where the whole invocation is read.
+
+    Consulted by `is_safe_bash_command` and by
+    `permissions._bash_allow_is_chain_safe`. An unlexable segment is left to
+    `git_argument_value_hidden`, which already refuses it on both paths.
+    """
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            continue
+        for idx, w in enumerate(words):
+            if w.text != "git":
+                continue
+            args = words[idx + 1:]
+            stops = bool(args) and not args[0].text.startswith("-") and (
+                args[0].text not in _GIT_TRANSPORT_SUBCOMMANDS
+            )
+            for a in args:
+                # After `--` git reads paths, not options.
+                if stops and a.text == "--" and not a.quoted:
+                    break
+                if _names_a_program(a):
+                    return True
+    return False
+
+
+# `log`, `diff` and `show` have no mode but reading. Of their many display
+# options, these two leave it: an external diff program, a diff of files
+# outside the repository. git takes neither abbreviated. `status`, `rev-parse`
+# and `merge-base` are reads with no such option, so they have no entry below.
+_GIT_NOT_A_READ_FLAGS = ("--ext-diff", "--no-index")
+
+# `branch` lists only when given no name or when in list mode, where a name is a
+# pattern. Every other option changes a ref, its config, or opens an editor.
+_GIT_BRANCH_LIST_FLAGS = frozenset({
+    "--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged",
+    "--points-at",
+})
+_GIT_BRANCH_DISPLAY_FLAGS = frozenset({
+    "--show-current", "-a", "--all", "-r", "--remotes", "-v", "-vv",
+    "--verbose", "--format", "--sort", "--color", "--no-color", "--column",
+    "--no-column", "-i", "--ignore-case", "--abbrev", "--no-abbrev",
+    "--omit-empty",
+})
+_GIT_BRANCH_LIST_EQ = ("--contains=", "--no-contains=", "--merged=", "--no-merged=", "--points-at=")
+_GIT_BRANCH_DISPLAY_EQ = ("--format=", "--sort=", "--color=", "--column=", "--abbrev=")
+# Their value is the next word, which may itself start with `-`.
+_GIT_BRANCH_VALUE_FLAGS = frozenset({"--points-at", "--format", "--sort"})
+
+_GIT_WORKTREE_LIST_FLAGS = frozenset({"--porcelain", "-v", "--verbose", "-z"})
+
+# `fetch` updates remote-tracking refs: that is its read in this loop. These
+# options keep it there.
+_GIT_FETCH_FLAGS = frozenset({
+    "--prune", "-p", "--all", "--tags", "-t", "--no-tags", "-n", "--quiet",
+    "-q", "--verbose", "-v", "--progress", "--no-progress", "--dry-run",
+})
+
+_GIT_LS_REMOTE_FLAGS = frozenset({
+    "--heads", "-h", "--branches", "-b", "--tags", "-t", "--refs", "--quiet", "-q",
+    "--exit-code", "--get-url", "--symref", "--help",
+})
+
+
+def _read_mode_overreaches(args: list[_ShellWord]) -> bool:
+    for a in args:
+        if a.text == "--" and not a.quoted:
+            return False
+        if a.text in _GIT_NOT_A_READ_FLAGS:
+            return True
+        head = _glob_head(a)
+        if head is not None and any(f.startswith(head) for f in _GIT_NOT_A_READ_FLAGS):
+            return True
+    return False
+
+
+def _diff_overreaches(args: list[_ShellWord]) -> bool:
+    """`_read_mode_overreaches`, plus a path outside the repository: given two
+    paths of which one is outside, git diffs them with no index, `--` or not."""
+    if _read_mode_overreaches(args):
+        return True
+    return any(
+        a.text.startswith(("/", "~")) or ".." in a.text.split("/") for a in args
+    )
+
+
+def _branch_overreaches(args: list[_ShellWord]) -> bool:
+    listing = named = skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        t = a.text
+        if t in _GIT_BRANCH_LIST_FLAGS or t.startswith(_GIT_BRANCH_LIST_EQ):
+            listing = True
+        elif not (t in _GIT_BRANCH_DISPLAY_FLAGS or t.startswith(_GIT_BRANCH_DISPLAY_EQ)):
+            if t.startswith("-"):
+                return True
+            named = True
+        skip = t in _GIT_BRANCH_VALUE_FLAGS
+    return named and not listing
+
+
+def _worktree_overreaches(args: list[_ShellWord]) -> bool:
+    if not args or args[0].text != "list":
+        return True
+    return any(a.text not in _GIT_WORKTREE_LIST_FLAGS for a in args[1:])
+
+
+def _fetch_overreaches(args: list[_ShellWord]) -> bool:
+    repository = True
+    for a in args:
+        t = a.text
+        if t.startswith("-"):
+            if t not in _GIT_FETCH_FLAGS:
+                return True
+            continue
+        # `<transport>::<address>` hands the address to a remote helper.
+        if a.glob or "::" in t:
+            return True
+        # A refspec with a destination or a `+` writes or forces a ref.
+        if not repository and (t.startswith("+") or ":" in t):
+            return True
+        repository = False
+    return False
+
+
+def _ls_remote_overreaches(args: list[_ShellWord]) -> bool:
+    repository = True
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        t = a.text
+        if t.startswith("-"):
+            skip = t == "--sort"
+            if not (skip or t in _GIT_LS_REMOTE_FLAGS or t.startswith("--sort=")):
+                return True
+            continue
+        if repository and "::" in t:
+            return True
+        repository = False
+    return False
+
+
+_GIT_READ_FORMS = {
+    "log": _read_mode_overreaches,
+    "diff": _diff_overreaches,
+    "show": _read_mode_overreaches,
+    "branch": _branch_overreaches,
+    "worktree": _worktree_overreaches,
+    "fetch": _fetch_overreaches,
+    "ls-remote": _ls_remote_overreaches,
+}
+
+
+def git_read_overreaches(segment: str) -> bool:
+    """True when *segment* is one of `bash-git-readonly`'s subcommands in a
+    form that is not a read (`_GIT_READ_FORMS`).
+
+    Judged on the arguments git receives: redirects are blanked first and stay
+    judged by the segment's own guards. A segment that is not such a git
+    invocation, or that the lexer cannot follow, is left to the other guards
+    (`git_argument_value_hidden` refuses an unlexable git segment).
+    """
+    unredirected = _REDIRECT_RE.sub(" ", _mask_quoted_redirect_chars(segment))
+    words = _lex_shell_words(unredirected)
+    if not words or len(words) < 2 or words[0].text != "git":
+        return False
+    # A quoted or escaped subcommand is not the word the rule's pattern read.
+    if words[1].quoted:
+        return True
+    check = _GIT_READ_FORMS.get(words[1].text)
+    return check is not None and check(words[2:])
 
 
 def is_safe_git_command(sub: str) -> bool:

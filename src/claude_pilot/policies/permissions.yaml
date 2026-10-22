@@ -318,11 +318,15 @@ rules:
     decision: allow
     reason: "git show <ref>:<path> > <relative-path> -- source is ANY git-ref-shaped token (SHA, HEAD, FETCH_HEAD, ORIG_HEAD, branch/tag, origin/main, ...; cpp#166 widened from hex-only); NOT immutable -- mutability was never the safety boundary (cpp#43); safety rests entirely on the literal redirect target (no absolute / ~ / .. / shell-expansion) plus the control-plane denylist (cpp#42), never on source-immutability; permissions.py _bash_allow_is_chain_safe honors this rule_id as a sanctioned redirect (cpp#35)"
 
+  # The subcommand must be a whole word. The forms each one is admitted in
+  # (reads only: no write, no program run, no local ref, config or worktree
+  # change) are a closed list in `tier1.git_read_overreaches`, which
+  # `_bash_allow_is_chain_safe` consults on every allowed segment.
   - id: bash-git-readonly
     tool: Bash
-    pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree|merge-base)"
+    pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree|merge-base)(?![\\w-])"
     decision: allow
-    reason: "git read-only operations (merge-base is common-ancestor SHA lookup, no side effects — added 2026-07-27 with 18-incident compound-bash class)"
+    reason: "git read-only operations, closed list of read forms in tier1.git_read_overreaches (merge-base is common-ancestor SHA lookup, no side effects — added 2026-07-27 with 18-incident compound-bash class)"
 
   # ---- Dispatch-lib deterministic helper scripts ----
   # `./scripts/derive-{branch-name,worktree-path,phase-from-body}` are the
