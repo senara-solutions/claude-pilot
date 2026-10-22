@@ -25,6 +25,7 @@ contract.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
@@ -98,7 +99,9 @@ def is_tier1_auto_approve(tool_name: str, tool_input: dict[str, Any], cwd: str) 
         file_path = tool_input.get("file_path", "")
         if not isinstance(file_path, str) or not file_path:
             return False
-        return is_within_project(file_path, cwd)
+        return is_within_project(file_path, cwd) and not is_cargo_config_path(
+            file_path, cwd
+        )
 
     if tool_name == "Skill":
         skill = tool_input.get("skill", "")
@@ -3912,6 +3915,121 @@ def git_option_writes_a_file(command: str) -> bool:
     return False
 
 
+# ── cargo `--config` is not a safe build ─────────────────────────────────────
+#
+# `--config` changes cargo's configuration for one invocation, including the
+# environment of every process cargo starts. The closed `NAME=value` prefix list
+# of cpp#242 governs what a pilot may set before `cargo`; `--config` would set
+# the same things from inside the argument list, where the subcommand-only
+# guards (`_CARGO_RE`, `bash-cargo`) never look. Cargo accepts no abbreviation
+# of the flag, so the literal spelling is the whole surface — once quotes are
+# removed, which is why this reads `_lex_shell_words` output, not raw text.
+#
+# Like `git_argument_value_hidden`, this is ONE predicate consulted by tier1 and
+# by `permissions._bash_allow_is_chain_safe` as a veto on a policy allow, and it
+# only ever REFUSES. A `cargo` word (basename, after quote removal) makes the
+# command unsafe when any later word in its segment:
+#
+#   (a) is `--config` or `--config=…` — before or after the subcommand, and
+#       after `--` too (an over-refusal accepted to keep the rule case-free);
+#   (b) could become `--config` once bash evaluates it: a word that starts with
+#       an expansion, a `-`-led word whose option name (before `=`) carries an
+#       expansion or glob, a leading glob, or a brace expansion.
+#
+# A segment the lexer cannot follow is unsafe when it mentions `cargo`.
+
+_CARGO_CONFIG_FLAG = "--config"
+
+
+def _cargo_word_may_be_config(w: _ShellWord) -> bool:
+    t = w.text
+    if t == _CARGO_CONFIG_FLAG or t.startswith(_CARGO_CONFIG_FLAG + "="):
+        return True
+    if w.brace or w.lead_glob:
+        return True
+    if w.expansions and t.startswith("$"):
+        return True
+    if t.startswith("-"):
+        name = t.split("=", 1)[0]
+        if "$" in name and w.expansions:
+            return True
+        if w.glob and any(c in name for c in _GLOB_CHARS):
+            return True
+    return False
+
+
+def cargo_carries_config(command: str) -> bool:
+    """True when a `cargo` invocation in *command* carries, or may carry, `--config`."""
+    # bash drops a backslash-newline before splitting words: `--con\<NL>fig`
+    # is `--config`.
+    command = command.replace("\\\n", "")
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            if "cargo" in seg:
+                return True
+            continue
+        for idx, w in enumerate(words):
+            if w.text.rsplit("/", 1)[-1] != "cargo":
+                continue
+            if any(_cargo_word_may_be_config(a) for a in words[idx + 1:]):
+                return True
+    return False
+
+
+# ── A `.cargo` directory is cargo configuration ──────────────────────────────
+#
+# Cargo reads `.cargo/config.toml` from its working directory and every
+# ancestor, scratch roots outside the worktree included, so a `.cargo/`
+# directory is cargo configuration wherever it sits. Write/Edit are closed by
+# path (`is_cargo_config_path`); a Bash write can target the directory without
+# naming the file (a directory operand, creating the directory, a git
+# subcommand that writes a path, a flag value), so Bash is judged on the
+# directory.
+#
+# `bash_names_cargo_dir` refuses any command one of whose words may name a
+# `.cargo` path component — split on `/` and `=`, after quote removal, with a
+# brace group read as "anything" and a glob following the shell's no-dotfile
+# rule. An expansion is read at its literal spelling: every write destination
+# carrying one is already vetoed by `permissions._destination_veto_reason`, and
+# every git subcommand that writes refuses one (`git_argument_value_hidden`);
+# reading `$f` as "anything" refused 46 real loop and status commands. It only
+# ever REFUSES, and it is consulted where a write can be admitted: tier1's git
+# admission and the policy chain-safe veto. Reads elsewhere in tier1
+# (`cat .cargo/config.toml`) are untouched.
+
+_CARGO_DIR = ".cargo"
+_BRACE_GROUP_RE = re.compile(r"\{[^}]*\}")
+
+
+def _word_may_name_cargo_dir(w: _ShellWord) -> bool:
+    t = _BRACE_GROUP_RE.sub("*", w.text) if w.brace else w.text
+    for comp in re.split(r"[/=]", t):
+        if comp == _CARGO_DIR:
+            return True
+        # Only an unquoted glob or brace expands, and a glob never reaches a
+        # dotfile unless it spells the leading dot.
+        if not (w.glob or w.brace) or not fnmatch.fnmatchcase(_CARGO_DIR, comp):
+            continue
+        if comp.startswith(".") or w.brace:
+            return True
+    return False
+
+
+def bash_names_cargo_dir(command: str) -> bool:
+    """True when a word of *command* may name a `.cargo` path component."""
+    command = command.replace("\\\n", "")
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            if _CARGO_DIR in seg:
+                return True
+            continue
+        if any(_word_may_name_cargo_dir(w) for w in words):
+            return True
+    return False
+
+
 def is_safe_git_command(sub: str) -> bool:
     match = _GIT_CMD_RE.match(sub)
     if not match:
@@ -3919,6 +4037,10 @@ def is_safe_git_command(sub: str) -> bool:
 
     git_sub = match.group(1)
     if git_sub not in SAFE_GIT_SUBCOMMANDS:
+        return False
+    # Several admitted git subcommands write the paths they name. See
+    # `bash_names_cargo_dir`.
+    if bash_names_cargo_dir(sub):
         return False
 
     if _FORCE_FLAG_RE.search(sub):
@@ -4308,7 +4430,7 @@ _NPX_RE = re.compile(r"^\s*npx\s+(tsc|vitest|prettier|eslint)\b")
 def is_safe_build_command(sub: str) -> bool:
     m = _CARGO_RE.match(sub)
     if m and m.group(1) in SAFE_CARGO_SUBCOMMANDS:
-        return True
+        return not cargo_carries_config(sub)
 
     m = _NPM_RUN_RE.match(sub)
     if m and m.group(1) in SAFE_NPM_RUN_SCRIPTS:
@@ -4837,6 +4959,40 @@ def is_within_project(file_path: str, cwd: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# Cargo reads `.cargo/config.toml` (or legacy `.cargo/config`) from the current
+# directory and every ancestor, so a file written at any depth of the worktree
+# configures the next bare `cargo test` — the file-side twin of `--config`.
+# `Write`/`Edit` are not auto-approved onto these paths (Bash writes are
+# `bash_names_cargo_dir`'s). Matched at any depth of the worktree-relative
+# path; other `.cargo/` files (`audit.toml`) are not cargo configuration and
+# stay ordinary for Write/Edit.
+CARGO_CONFIG_PATH_RE = re.compile(r"^(?:.*/)?\.cargo/config(?:\.toml)?$")
+
+
+def is_cargo_config_path(file_path: str, cwd: str) -> bool:
+    """Whether *file_path* names a cargo configuration file, literally or once resolved.
+
+    Both forms are checked: the literal path catches a target that does not
+    exist yet, the resolved one a symlink that lands on a config file.
+    """
+    if not file_path:
+        return False
+    literal = os.path.normpath(file_path)
+    if CARGO_CONFIG_PATH_RE.search(literal):
+        return True
+    try:
+        resolved_cwd = Path(cwd).resolve(strict=True)
+    except OSError:
+        return False
+    p = Path(file_path)
+    resolved = (p if p.is_absolute() else resolved_cwd / p).resolve(strict=False)
+    try:
+        rel = resolved.relative_to(resolved_cwd).as_posix()
+    except ValueError:
+        return False
+    return bool(CARGO_CONFIG_PATH_RE.search(rel))
 
 
 # ── cpp#213: designated `.pilot-scratch/` carve-out for rm/rmdir LETHALITY ───

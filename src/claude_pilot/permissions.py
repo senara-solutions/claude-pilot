@@ -50,6 +50,8 @@ from .tier1 import (
     _needs_lethality_redirect_mask,
     _redirect_targets,
     _split_compound_command,
+    bash_names_cargo_dir,
+    cargo_carries_config,
     git_argument_value_hidden,
     git_option_writes_a_file,
     is_readonly_waitloop_script,
@@ -524,6 +526,10 @@ def _bash_allow_is_chain_safe(
     if "<<" in command:
         # The ONLY ``<<`` admitted is the sanctioned, fully-anchored /tmp
         # cat-heredoc (delimiter fixed to EOF). Everything else routes to relay.
+        # Its target, on the first line, must not be a `.cargo` directory;
+        # the body is data and is not read for this.
+        if bash_names_cargo_dir(command.split("\n", 1)[0]):
+            return False
         return _is_sanctioned_pure_heredoc(command)
 
     # Command substitution. Backtick / ``$'`` / bash 5.3 K-style funsub (``${ … }``)
@@ -558,6 +564,15 @@ def _bash_allow_is_chain_safe(
     # `bash-git-readonly` admits the subcommand without reading its options.
     # Rule-id independent, like the veto above.
     if git_option_writes_a_file(command):
+        return False
+    # A cargo invocation that carries `--config` is not honored on a policy
+    # allow either: `bash-cargo` is a prefix match that stops at the
+    # subcommand. Rule-id independent, like the git veto above.
+    if cargo_carries_config(command):
+        return False
+    # Nor one that may write into a `.cargo` directory: cargo reads its
+    # config from there. See `bash_names_cargo_dir`.
+    if bash_names_cargo_dir(command):
         return False
 
     # Sanctioned `git show <rev>:<path> > <relative-path>` (cpp#35, ref shape
