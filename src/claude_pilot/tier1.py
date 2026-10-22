@@ -2697,6 +2697,88 @@ def _quote_spans(command: str) -> list[tuple[int, int, bool]]:
     return spans
 
 
+def split_is_ambiguous(command: str) -> bool:
+    """Whether `_split_compound_command` may cut *command* where bash does
+    not, or read a word bash rebuilds. Such a command is refused on every
+    admission path, before any guard reads its segments: a cut bash does not
+    make hands the rest of a statement to a segment the guards of that
+    statement never see.
+
+    The forms, each where bash gives the character meaning (quotes as
+    `_quote_spans` computes them, a backslash paired with the character after
+    it, as `_quote_spans` pairs it):
+
+    - a carriage return, anywhere. The splitter cuts on it; bash reads a bare
+      ``\\r`` as an ordinary word character.
+    - outside quotes, a line continuation (backslash then newline) or an
+      escaped separator (``\\;``, ``\\|``, ``\\&``) followed by text of the
+      same statement. The splitter cuts there; bash deletes the continuation
+      and reads the escaped separator as a literal character, so that text
+      belongs to the statement before the cut. When only blanks follow, up to
+      a real separator or the end, the cut moves nothing and agrees with
+      bash's statement boundary: `find … -exec … {} \\;` and a continuation
+      before a line opening with ``|`` keep their reading. Right after ``<``
+      or ``>`` the cut is refused whatever follows: deleting a continuation
+      there joins that character into an operator.
+    - inside double quotes, a line continuation. Bash deletes the pair there
+      too and rebuilds the word; the guards read the raw text, where the pair
+      is still there (``shlex`` keeps the newline inside the token). Inside
+      single quotes the pair is literal to bash too.
+
+    ``\\\\`` followed by a newline is an escaped backslash then a real
+    separator, not a continuation.
+
+    The splitter itself is unchanged: the denial lethality walks its
+    segments, and the commands it cuts differently are refused here.
+    """
+    if "\r" in command:
+        return True
+    quoted_end_at = {
+        start: (end, command[start]) for start, end, _closed in _quote_spans(command)
+    }
+    n = len(command)
+    i = 0
+    while i < n:
+        if i in quoted_end_at:
+            end, quote_char = quoted_end_at[i]
+            if quote_char == '"':
+                # Same pairing inside the region: `"\\` + newline is not one.
+                j = i + 1
+                while j < end:
+                    if command[j] == "\\" and j + 1 < end:
+                        if command[j + 1] == "\n":
+                            return True
+                        j += 2
+                        continue
+                    j += 1
+            i = end
+            continue
+        if command[i] == "\\" and i + 1 < n:
+            if command[i + 1] in "\n;|&" and (
+                _text_follows_in_statement(command, i + 2)
+                # Right after `<` or `>`, what follows the deleted pair joins
+                # that character into one operator.
+                or command[i - 1 : i] in ("<", ">")
+            ):
+                return True
+            i += 2
+            continue
+        i += 1
+    return False
+
+
+def _text_follows_in_statement(command: str, i: int) -> bool:
+    """Whether non-blank text starts at or after *i* before the statement
+    ends: a real separator (``;``, newline, ``|``, ``&`` other than ``&>``)
+    or the end of *command*."""
+    n = len(command)
+    while i < n and command[i] in " \t":
+        i += 1
+    if i == n or command[i] in ";\n|":
+        return False
+    return not (command[i] == "&" and command[i + 1 : i + 2] != ">")
+
+
 def _split_compound_command(command: str) -> list[str]:
     """Quote-aware split on shell operators AND raw newlines.
 
@@ -2706,6 +2788,10 @@ def _split_compound_command(command: str) -> list[str]:
     opens and closes — are entirely `_quote_spans`'s concern; see its
     docstring for the atomic escape rule (inside AND outside quotes) that
     replaces this function's former ad hoc, ``\\"``-only escape handling.
+
+    Every admission path refuses, before reading these segments, a command
+    this function may cut where bash does not (`split_is_ambiguous`): a
+    ``\\r``, a line continuation, an escaped separator.
 
     Unterminated quotes: a `_quote_spans` region that never closes already
     extends to the end of the command, so every character in it — including
@@ -2742,12 +2828,11 @@ def _split_compound_command(command: str) -> list[str]:
         ch = command[i]
 
         if ch in (";", "\n", "\r"):
-            # `\r` treated as `\n`: some pipelines (Windows-authored payloads,
-            # copy-pasted heredocs) carry CR terminators. Bash on Unix ignores
-            # bare `\r` between tokens, but the classifier fails-closed here —
-            # splitting on `\r` prevents an obfuscation vector where a
-            # payload uses CR to hide a second statement from a `\n`-only
-            # splitter (coherence refute cpp#103 2026-08-06).
+            # `\r` treated as `\n` (coherence refute cpp#103 2026-08-06). Bash
+            # does not cut there — it reads a bare `\r` as a word character —
+            # so every admission path refuses a command carrying one
+            # (`split_is_ambiguous`); the cut remains for the denial
+            # lethality walk, which is unchanged.
             segments.append(command[seg_start:i].strip())
             i += 1
             seg_start = i
@@ -3069,6 +3154,12 @@ def is_ce_review_scope_probe(command: str, cwd: str | None = None) -> bool:
 
 
 def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
+    # Every path below reads `_split_compound_command` segments, directly or
+    # through a guard. A command whose split may differ from bash's is
+    # refused first, whole-command shapes included.
+    if split_is_ambiguous(command):
+        return False
+
     # Exec-si-contenu whole-command exception: the ce-work Setup preamble is
     # a legitimate multi-line compound (for-loop + if + $()) that stalls the
     # standard classifier BUT is bounded by containment when
