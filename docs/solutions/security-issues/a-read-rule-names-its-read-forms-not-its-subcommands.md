@@ -1,6 +1,7 @@
 ---
 title: "A read rule names its read forms, not its subcommands"
 date: 2026-10-22
+last_updated: 2026-10-22
 module: claude_pilot.tier1
 component: permission-classifier
 problem_type: security_issue
@@ -36,7 +37,9 @@ applies_when: "adding or reviewing a policy rule that admits a command family as
 
 **6. Judge the word bash hands to git, not the text the pattern read.** The closed list refuses a quoted or escaped subcommand word outright: what the pattern matched and what git receives must be the same word.
 
-**7. A closed list only bites where tier1 declines.** The segment loop of `_bash_allow_is_chain_safe` accepts a tier1-safe segment before consulting the policy. The closed list therefore decides the segments tier1 refuses. Its tests run through the handler where that is the case, and against the policy layer alone (tier1 refusing every segment) for the rest, so the rule's own contract is pinned independently of what tier1 admits.
+**7. A closed list only bites where it is consulted.** The segment loop of `_bash_allow_is_chain_safe` accepts a tier1-safe segment before consulting the policy, so a list consulted on the policy path alone decides only the segments tier1 refuses. Its tests run through the handler where that is the case, and against the policy layer alone (tier1 refusing every segment) for the rest, so the rule's own contract is pinned independently of what tier1 admits. tier1 now consults the same list too (item 8).
+
+**8. Consult it once, at the entry every path passes, on the segments bash runs.** tier1 admits git through several paths, each with its own matcher. The first plan put the veto inside two of those matchers. Review showed that was not enough: a matcher is an admission filter, and the pieces it cuts the command into are not guaranteed to be the words git receives. The veto now sits once at the entry of `is_safe_bash_command`, next to `git_option_names_a_program`, and judges every segment from the quote-aware splitter. Every tier1 path that judges a git segment comes after it. The predicate is reused as is: tier1 and the policy consult one list, and neither can drift from the other.
 
 ## Solution
 
@@ -47,15 +50,24 @@ In `src/claude_pilot/tier1.py`:
 
 In `permissions.yaml`, the rule takes the subcommand as a whole word.
 
+Follow-up, same day: `is_safe_bash_command` refuses a command when `git_read_overreaches` is true for any segment from `_split_compound_command`. tier1 now admits only real git reads, both outside and under containment.
+
 No new admission. Lethality unchanged: neither predicate is consulted by `_denial_is_terminal`.
 
 ## Verification
 
 - 55 mutants, one per clause, table entry, call site and the pattern's word boundary, each turned the dedicated tests red. Two controls (an identity mutant, a missing anchor) behaved as expected. Python mutants were applied in memory, not on disk. Three surviving terms were removed rather than kept: two clauses of the path check that no input could reach, and the table entries of the three subcommands that are reads whatever their options.
 - Real-corpus parity through the full handler, old against new, contained and uncontained: no command went from refused to admitted. The few that went from admitted to refused were forced ref or worktree writes, not reads.
+- Follow-up (tier1): the same parity on 35 925 distinct commands found 0 flips from refused to admitted. It found 11 flips from admitted to refused, identical in and out of containment, all non-terminal, none a read:
+  - 2 local branch creations.
+  - 4 fetches with an explicit destination under `refs/remotes/`. The substitute is a plain fetch, then `origin/<branch>` or `FETCH_HEAD`.
+  - 5 `worktree add` of a witness tree at the base, used to run tests there. This is an ordinary pilot gesture. It was weighed and accepted: creating a working tree writes to the repository's administration and is not a read. The refusal does not end the session.
+  
+  Red-before was measured term by term by in-memory mutation, starting from the green commit. The call site and the per-segment loop each turn the tests red. One equivalent term, a fallback the splitter can never reach, was removed.
 
 ## Prevention
 
 - When a rule admits a command "as a read", write down the read forms, then probe each excluded mode in a throwaway repository before refusing it, and keep only what the probe confirms.
 - Test the rule both through the handler and on the policy layer alone: the first shows end-to-end decisions, the second pins the rule's contract when another layer happens to decide first.
+- When a guard must hold on every admission path, place it at the one entry they share, and have it judge the segments bash will run. Do not place it inside each path's own matcher.
 - Residuals outside this scope are tracked privately.
