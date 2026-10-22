@@ -3091,6 +3091,9 @@ def is_safe_bash_command(command: str, cwd: str | None = None) -> bool:
     # Nor a git option whose value git runs as a program.
     if git_option_names_a_program(command):
         return False
+    # Nor a git read subcommand in a form that is not a read, in any segment.
+    if any(git_read_overreaches(seg) for seg in _split_compound_command(command)):
+        return False
 
     # cpp#103: read-only git compounds under containment attestation. Must
     # match BEFORE the metachar guard — `&&`/`|`/`2>/dev/null` are legitimate
@@ -4044,9 +4047,11 @@ def bash_names_cargo_dir(command: str) -> bool:
 #     invocation: a guard that only lives on the policy path is never reached
 #     when tier1 admits first.
 #   * `git_read_overreaches` — the closed list of forms each of the ten
-#     subcommands is admitted in. Consulted on a policy allow, keyed on the
-#     segment's subcommand rather than on the rule id, so no earlier rule can
-#     claim the segment around it.
+#     subcommands is admitted in. Consulted by tier1 on every segment of the
+#     command (`is_safe_bash_command`, ahead of the paths that judge a git
+#     segment), and on a policy allow, keyed on the segment's subcommand
+#     rather than on the rule id, so no earlier rule can claim the segment
+#     around it.
 #
 # `--output` is `git_option_writes_a_file`'s, on both paths; it is not repeated
 # here.

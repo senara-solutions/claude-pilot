@@ -305,13 +305,13 @@ class TestCargoDirPolicyVeto:
 class TestCargoDirTier1Git:
     @pytest.mark.parametrize(
         "cmd",
-        ["git worktree add .cargo", "git checkout HEAD -- .cargo/config.toml"],
+        ["git checkout HEAD -- .cargo", "git checkout HEAD -- .cargo/config.toml"],
     )
     def test_git_write_into_cargo_dir_is_not_auto_approved(
         self, tmp_path: Path, cmd: str
     ) -> None:
         assert is_tier1_auto_approve("Bash", {"command": cmd}, str(tmp_path)) is False
 
-    @pytest.mark.parametrize("cmd", ["cat .cargo/config.toml", "git worktree add ../wt-x"])
+    @pytest.mark.parametrize("cmd", ["cat .cargo/config.toml", "git checkout HEAD -- src/main.rs"])
     def test_reads_and_other_git_stay_auto_approved(self, tmp_path: Path, cmd: str) -> None:
         assert is_tier1_auto_approve("Bash", {"command": cmd}, str(tmp_path)) is True

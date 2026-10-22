@@ -14,7 +14,6 @@ with the cm emitter and the notify hook replaced by no-ops.
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 
 import pytest
@@ -84,8 +83,7 @@ _NOT_A_READ_FORMS = [
     "git diff''-files",
 ]
 
-# The same, refused by tier1 outside containment only: under containment
-# tier1's read-only compound path decides them on its own.
+# The same, refused by tier1 in and out of containment.
 _EXT_DIFF_FORMS = [
     "git diff --ext-diff",
     "git log -p --ext-diff",
@@ -277,9 +275,7 @@ class TestHandler:
         assert handler(cmd) == "deny"
 
     @pytest.mark.parametrize("cmd", _EXT_DIFF_FORMS)
-    def test_refused_uncontained(self, handler, cmd: str) -> None:
-        if os.environ.get("MIKA_PILOT_CONTAINED") == "1":
-            pytest.skip("tier1's contained read-only compound path decides it")
+    def test_refused_in_and_out_of_containment(self, handler, cmd: str) -> None:
         assert handler(cmd) == "deny"
 
     @pytest.mark.parametrize("cmd", _ADMITTED)
