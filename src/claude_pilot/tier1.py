@@ -25,6 +25,7 @@ contract.
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import os
 import re
@@ -2724,6 +2725,10 @@ def split_is_ambiguous(command: str) -> bool:
       too and rebuilds the word; the guards read the raw text, where the pair
       is still there (``shlex`` keeps the newline inside the token). Inside
       single quotes the pair is literal to bash too.
+    - a quoted region that opens where bash opens no quote
+      (`_quote_opens_where_bash_reads_none`). A region of `_quote_spans`
+      must open where bash opens a quote; one that bash does not open at
+      the same place is refused.
 
     ``\\\\`` followed by a newline is an escaped backslash then a real
     separator, not a continuation.
@@ -2732,6 +2737,8 @@ def split_is_ambiguous(command: str) -> bool:
     segments, and the commands it cuts differently are refused here.
     """
     if "\r" in command:
+        return True
+    if _quote_opens_where_bash_reads_none(command):
         return True
     quoted_end_at = {
         start: (end, command[start]) for start, end, _closed in _quote_spans(command)
@@ -2777,6 +2784,97 @@ def _text_follows_in_statement(command: str, i: int) -> bool:
     if i == n or command[i] in ";\n|":
         return False
     return not (command[i] == "&" and command[i + 1 : i + 2] != ">")
+
+
+# A `#` opens a comment at the start of a word: after one of these characters
+# when it is not escaped, or at the start of the command.
+_COMMENT_WORD_START_AFTER = " \t\n;&|()<>"
+
+
+def _quote_opens_where_bash_reads_none(command: str) -> bool:
+    """Whether a region of `_quote_spans` opens where bash opens no quote:
+
+    - in a comment, from a `#` at the start of a word to the end of its line,
+      when the region runs past that end;
+    - after a heredoc opener (``<<``, not ``<<<``), body or not, whatever
+      its delimiter;
+    - inside double quotes, in a ``${…}`` expansion: bash reads its quotes by
+      its own rules there, so a single quote inside it, or the end of the
+      region before its closing brace, is refused.
+
+    Outside the comment and the heredoc, regions and backslash pairs are
+    taken from `_quote_spans` as it computes them.
+    """
+    spans = _quote_spans(command)
+    starts = [start for start, _end, _closed in spans]
+    end_at = {start: end for start, end, _closed in spans}
+    n = len(command)
+    i = 0
+    after_escape = False
+    while i < n:
+        if i in end_at:
+            i = end_at[i]
+            after_escape = False
+            continue
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            after_escape = True
+            continue
+        if ch == "#" and not after_escape and (
+            i == 0 or command[i - 1] in _COMMENT_WORD_START_AFTER
+        ):
+            newline = command.find("\n", i)
+            comment_end = n if newline < 0 else newline
+            # Regions do not overlap: only the last one opening before the
+            # end of the comment can run past it. One that ends with the
+            # comment is not refused.
+            k = bisect.bisect_left(starts, comment_end) - 1
+            if k >= 0 and starts[k] > i and end_at[starts[k]] > comment_end:
+                return True
+            # A `#` read as a comment where bash reads a word (after the `)`
+            # of a substitution): a `<<` in it, with a region after it, is
+            # refused as an opener would be.
+            if "<<" in command[i:comment_end] and starts and starts[-1] > i:
+                return True
+            i = comment_end
+            continue
+        after_escape = False
+        if ch == "<" and command[i + 1 : i + 2] == "<":
+            opener = _parse_heredoc_opener(command, i)
+            if opener is None and command[i + 2 : i + 3] == "<":
+                i += 2  # a here-string, not a heredoc
+                continue
+            # An empty delimiter still opens a heredoc.
+            opener_end = i + 2 if opener is None else opener[3]
+            if starts and starts[-1] >= opener_end:
+                return True
+            i = opener_end
+            continue
+        i += 1
+
+    for start, end, _closed in spans:
+        if command[start] != '"':
+            continue
+        depth = 0
+        j = start + 1
+        while j < end:
+            c = command[j]
+            if c == "\\" and j + 1 < end:
+                j += 2
+                continue
+            if c == "$" and command[j + 1 : j + 2] == "{":
+                depth += 1
+                j += 2
+                continue
+            if depth and c == "}":
+                depth -= 1
+            elif depth and c == "'":
+                return True
+            j += 1
+        if depth:
+            return True
+    return False
 
 
 def _split_compound_command(command: str) -> list[str]:
