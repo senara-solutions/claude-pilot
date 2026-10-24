@@ -323,17 +323,28 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 # (`…-terms-of-service-is`, `…-v-rif-…`) or the `echo "---AHEAD---"` of a later
 # command. 5 pilot sessions died on it (~/.mika/data/pilot-transcripts,
 # 2026-10-24) without pushing by force or deleting anything. The twin reads the
-# flag as an OPTION TOKEN of that command's own segment: it starts a token
-# (after a blank or a quote), ends one (before a blank, a quote, a separator,
-# `)` or the end), and lies before the next `;`/`|`/`&`/newline — the `&` of a
-# redirect (`2>&1`, `&>`) is not a separator. What counts as the flag is
-# unchanged (`-\w*f` / `-\w*D`), so `-uf` and `-dD` still match and `-fu` still
-# does not. ADMISSION keeps the unanchored entries in `TIER3_PATTERNS`: anchoring
-# them there would admit `git push -u origin <branch>`, which is a separate
-# decision; these commands stay refused, and only stop ending the run.
-_SAME_SEGMENT = r"(?:[^;&|\n]|(?<=[<>])&|&(?=>))*?"
-_OPTION_START = r"(?<![^\s'\"])"
-_OPTION_END = r"(?![^\s'\";&|)])"
+# flag as an OPTION TOKEN of that command's own segment: it starts a word
+# (after a blank, optionally behind one quote and one backslash, as bash reads
+# `"-f"`, `$'-f'` and `\-f`), ends one (before an optional quote then a blank, a
+# separator, `)`, a backtick or the end), and lies before the next unquoted
+# `;`/`|`/`&`/newline. The segment walk consumes a quoted span or a `\X` pair
+# whole, so a `;` inside `--push-option="a;b"` does not end it; an unterminated
+# quote is consumed as one character, as the old pattern read it. The `&` of a
+# redirect (`2>&1`, `&>`) is not a separator. Every alternative of the walk
+# starts on a different character, so a failing search stays linear (a first
+# version let `>&>` match two ways and doubled per pair). What counts as the
+# flag is unchanged (`-\w*f` / `-\w*D`), so `-uf` and `-dD` still match and
+# `-fu` still does not. ADMISSION keeps the unanchored entries in
+# `TIER3_PATTERNS`: anchoring them there would admit `git push -u origin
+# <branch>`, which is a separate decision; these commands stay refused, and only
+# stop ending the run.
+_SAME_SEGMENT = (
+    r"""(?:'[^']*'|'(?![^']*')"""
+    r"""|"(?:[^"\\]|\\.)*"|"(?!(?:[^"\\]|\\.)*")"""
+    r"""|\\.|[^;&|\n'"\\]|(?<=[<>])&|(?<![<>])&(?=>))*?"""
+)
+_OPTION_START = r"""(?<![^\s])\$?['"]?\\?"""
+_OPTION_END = r"""(?=['"]?(?:[\s;&|)`]|$))"""
 _GIT_PUSH_F_OPTION_PATTERN = re.compile(
     rf"git\s+push\s+{_SAME_SEGMENT}{_OPTION_START}-\w*f{_OPTION_END}"
 )

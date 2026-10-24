@@ -2815,11 +2815,44 @@ def test_cpp300_branch_name_or_neighbour_echo_is_not_terminal(cmd: str, cwd: str
         # the flag after the refspec, and a quoted flag, are still flags
         "git push origin feat/x -f",
         'git push origin "-f"',
+        # review of cpp#300: forms the first twin let through
+        "`git push origin x -f`",
+        "echo `git push -f`",
+        "git push -o 'k=a|b' origin x -f",
+        'git push --push-option="a;b" origin main -f',
+        'git branch --format="%(refname);" -D x',
+        "git push origin \\-f",
+        "git branch \\-D x",
+        "git push origin $'-f'",
+        "git branch $'-D' x",
+        "git push origin x\t-f",
+        # still terminal through a redirect and inside a substitution
+        "git push origin x 2>&1 -f",
+        "$(git push origin x -f)",
     ],
 )
 def test_cpp300_force_and_delete_flags_stay_terminal(cmd: str, cwd: str) -> None:
     """cpp#300 AC2: a real force-push or branch-delete flag stays lethal."""
     assert permissions_module._denial_is_terminal("Bash", {"command": cmd}, cwd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push " + ">&" * 40 + "> x",
+        "git branch " + ">&" * 40 + "> x",
+        "git push " + "'a" * 400,
+        "git push " + '"a' * 400,
+    ],
+)
+def test_cpp300_option_twins_fail_in_linear_time(cmd: str) -> None:
+    """A first version of the segment walk let `>&>` match two ways, and a
+    failing search doubled per pair (n=20 took 0.3 s). Each input here must
+    fail fast against both twins."""
+    start = time.monotonic()
+    assert _GIT_PUSH_F_OPTION_PATTERN.search(cmd) is None
+    assert _GIT_BRANCH_D_OPTION_PATTERN.search(cmd) is None
+    assert time.monotonic() - start < 0.5
 
 
 @pytest.mark.xfail(
