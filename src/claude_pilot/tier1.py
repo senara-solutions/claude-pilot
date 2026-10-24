@@ -206,19 +206,32 @@ _SH_C_PATTERN = re.compile(r"\bsh\s+-c\b")
 # set and its lethality is decided instead by the cwd-aware destination veto —
 # terminal only when the redirect target is proven to escape the worktree.
 _GENERIC_REDIRECT_PATTERN = re.compile(r"(?<!<)>{1,2}(?!\(|&[\d-])")  # > or >> (not process sub, not fd-manipulation)
+# cpp#278 AC3: every other lethal TIER3 entry is named too, so the registry and
+# `_TERMINAL_FORM_EXEMPTIONS` can each reference the exact object they decide.
+_GIT_PUSH_FORCE_PATTERN = re.compile(r"git\s+push\s+.*--force\b")
+_GIT_PUSH_F_PATTERN = re.compile(r"git\s+push\s+.*-\w*f\b")
+_GIT_PUSH_PROTECTED_PATTERN = re.compile(r"git\s+push\s+\S+\s+(main|master)\b")
+_GIT_RESET_HARD_PATTERN = re.compile(r"git\s+reset\s+--hard\b")
+_GIT_BRANCH_D_PATTERN = re.compile(r"git\s+branch\s+.*-\w*D\b")
+_SQL_DROP_TABLE_PATTERN = re.compile(r"\bDROP\s+TABLE\b", re.IGNORECASE)
+_SQL_DELETE_FROM_PATTERN = re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE)
+_CARGO_PUBLISH_PATTERN = re.compile(r"\bcargo\s+publish\b")
+_GH_LABEL_MUTATE_PATTERN = re.compile(r"\bgh\s+label\s+(delete|edit)\b")
+_PROCSUB_IN_PATTERN = re.compile(r"<\(")
+_PROCSUB_OUT_PATTERN = re.compile(r">\(")
 
 TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     _RM_RF_PATTERN,                                         # rm -rf, rm -fr, rm -rfi
-    re.compile(r"git\s+push\s+.*--force\b"),                # git push --force
-    re.compile(r"git\s+push\s+.*-\w*f\b"),                  # git push -f
-    re.compile(r"git\s+push\s+\S+\s+(main|master)\b"),      # git push origin main/master
-    re.compile(r"git\s+reset\s+--hard\b"),                  # git reset --hard
-    re.compile(r"git\s+branch\s+.*-\w*D\b"),                # git branch -D
-    re.compile(r"\bDROP\s+TABLE\b", re.IGNORECASE),
-    re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE),
-    re.compile(r"\bcargo\s+publish\b"),
+    _GIT_PUSH_FORCE_PATTERN,                                # git push --force
+    _GIT_PUSH_F_PATTERN,                                    # git push -f
+    _GIT_PUSH_PROTECTED_PATTERN,                            # git push origin main/master
+    _GIT_RESET_HARD_PATTERN,                                # git reset --hard
+    _GIT_BRANCH_D_PATTERN,                                  # git branch -D
+    _SQL_DROP_TABLE_PATTERN,
+    _SQL_DELETE_FROM_PATTERN,
+    _CARGO_PUBLISH_PATTERN,
     _SED_I_SHORT_PATTERN,                                   # sed -i
-    re.compile(r"\bgh\s+label\s+(delete|edit)\b"),
+    _GH_LABEL_MUTATE_PATTERN,
     _BASH_C_PATTERN,
     _SH_C_PATTERN,
     # cpp#235: admission adopts the same command-position `eval` definition as
@@ -248,8 +261,8 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     # NOTE: $( and backtick patterns removed — replaced by quote-aware
     # contains_unquoted_metacharacter() check in is_safe_bash_command().
     # See mika#946 (resolution of mika#938 F5 sentinel divergence).
-    re.compile(r"<\("),                                     # <(...)
-    re.compile(r">\("),                                     # >(...)
+    _PROCSUB_IN_PATTERN,                                    # <(...)
+    _PROCSUB_OUT_PATTERN,                                   # >(...)
     _GENERIC_REDIRECT_PATTERN,                              # > or >> (not process sub, not fd-manipulation)
 )
 
@@ -332,14 +345,21 @@ _TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = TIER3_PATTERNS
 # safe); the non-recursive form is an ordinary single-file write, exactly the
 # kind of target a destination veto (not a verb ban) already governs when the
 # command also redirects, and stays covered by that path unchanged.
+_CHMOD_R_PATTERN = re.compile(r"\bchmod\s+(?:-\w*R\w*|--recursive\b)")  # chmod -R / --recursive
+_CHOWN_R_PATTERN = re.compile(r"\bchown\s+(?:-\w*R\w*|--recursive\b)")  # chown -R / --recursive
+_DD_PATTERN = re.compile(r"\bdd\b")                                      # dd (raw block-device copy)
+_MKFS_PATTERN = re.compile(r"\bmkfs(?:\.\w+)?\b")                        # mkfs / mkfs.ext4 / …
+_TRUNCATE_PATTERN = re.compile(r"\btruncate\b")                          # truncate -s …
+# Classic fork bomb, whitespace-tolerant: :(){ :|:& };:
+_FORK_BOMB_PATTERN = re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&?\s*\}\s*;\s*:")
+
 _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bchmod\s+(?:-\w*R\w*|--recursive\b)"),  # chmod -R / --recursive
-    re.compile(r"\bchown\s+(?:-\w*R\w*|--recursive\b)"),  # chown -R / --recursive
-    re.compile(r"\bdd\b"),                                 # dd (raw block-device copy)
-    re.compile(r"\bmkfs(?:\.\w+)?\b"),                     # mkfs / mkfs.ext4 / …
-    re.compile(r"\btruncate\b"),                           # truncate -s …
-    # Classic fork bomb, whitespace-tolerant: :(){ :|:& };:
-    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&?\s*\}\s*;\s*:"),
+    _CHMOD_R_PATTERN,
+    _CHOWN_R_PATTERN,
+    _DD_PATTERN,
+    _MKFS_PATTERN,
+    _TRUNCATE_PATTERN,
+    _FORK_BOMB_PATTERN,
 )
 
 
@@ -360,8 +380,19 @@ _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205: tuple[re.Pattern[str], ...] = (
 # (`sed_i_confined_to_worktree`: sole-`/dev/null` survivable, worktree target
 # survivable) reach the long form via `_sed_inplace_suffix`'s cpp#274 branch, so
 # the long form joins the short in BOTH directions.
+_SED_INPLACE_LONG_PATTERN = re.compile(r"\bsed\s+--in-place\b")
 _SED_INPLACE_LONG_FORM_FOR_LETHALITY: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bsed\s+--in-place\b"),
+    _SED_INPLACE_LONG_PATTERN,
+)
+
+
+# The union `_matches_proven_dangerous_lethality_verb` consults, in order. Named
+# so the cpp#278 drift guards walk the same set the predicate does: a fourth
+# lethal tuple added here is seen by both.
+_LETHALITY_VERB_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
+    *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+    *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
 )
 
 
@@ -376,12 +407,7 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
     twin `_SED_INPLACE_LONG_FORM_FOR_LETHALITY` (cpp#274). Never consulted by the
     REFUSAL path (`is_tier3_dangerous`); LETHALITY only."""
     return any(
-        p.search(stripped_command)
-        for p in (
-            *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
-            *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
-            *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
-        )
+        p.search(stripped_command) for p in _LETHALITY_VERB_PATTERNS
     )
 
 
@@ -409,10 +435,42 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
 # silently leaves the lethality set) forces a hint/registry update or the suite
 # goes red.
 #
-# `is_verb_lethal=True` → proven-danger regardless of target (the verb itself is
-# fatal: `bash -c`, `sh -c`, `eval`, `sed -i`, `rm -rf`). `False` → the generic
+# The other direction (AC3, cpp#278 follow-up): `test_every_lethal_pattern_is_
+# hinted_or_exempted` asserts every pattern in the lethality verb set is either a
+# verb-lethal entry here or an entry of `_TERMINAL_FORM_EXEMPTIONS` (below) with
+# a written reason, so a lethal pattern added without that decision goes red.
+# Several patterns of one family share a bullet (same string object); the
+# renderer emits each distinct bullet once, keeping the hint short.
+#
+# `is_verb_lethal=True` → the pattern is in the lethality verb set (the verb is
+# fatal: `bash -c`, `sh -c`, `eval`, `git reset --hard`, …). A few of these keep
+# a target carve-out that makes some shapes survivable (`rm -rf` under
+# `.pilot-scratch/`, `sed -i` on a worktree file, a read-only `<(…)`); the hint
+# names the fatal case, never the carve-out, because a survivable form described
+# as fatal costs nothing and the reverse kills the run. `False` → the generic
 # `>`/`>>` redirect, fatal ONLY when its target is proven out-of-worktree by the
 # cwd-aware destination veto (hence it is excluded from the lethality verb set).
+_SED_INPLACE_BULLET = (
+    "- `sed -i` / `sed --in-place` whose in-place target is outside this "
+    "worktree — refused AND the session ENDS."
+)
+_GIT_HISTORY_BULLET = (
+    "- `git push --force` / `-f` (`--force-with-lease` included), "
+    "`git push <remote> main`,\n  `git reset --hard`, `git branch -D` — refused "
+    "AND the session ENDS. A branch name with\n  a `-…f` segment (`-of`, "
+    "`-diff`, `-pdf`) trips the `-f` check: push with\n  "
+    "`git push -u origin HEAD`."
+)
+_PROCSUB_BULLET = (
+    "- process substitution `<(…)` / `>(…)` — refused AND the session ENDS. "
+    "Read both files\n  instead."
+)
+_SQL_BULLET = (
+    "- SQL `DROP TABLE` / `DELETE FROM` anywhere in the command, even inside a "
+    "quoted\n  `grep` pattern — refused AND the session ENDS. Search SQL text "
+    "with the **Grep** tool."
+)
+
 _TERMINAL_FORM_REGISTRY: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     (
         "- `bash -c` / `sh -c` (running a script through a shell) — refused AND "
@@ -431,12 +489,8 @@ _TERMINAL_FORM_REGISTRY: tuple[tuple[str, re.Pattern[str], bool], ...] = (
         _EVAL_COMMAND_POSITION_RE,
         True,
     ),
-    (
-        "- `sed -i` whose in-place target is outside this worktree — refused AND "
-        "the session ENDS.",
-        _SED_I_SHORT_PATTERN,
-        True,
-    ),
+    (_SED_INPLACE_BULLET, _SED_I_SHORT_PATTERN, True),
+    (_SED_INPLACE_BULLET, _SED_INPLACE_LONG_PATTERN, True),
     (
         "- a shell redirect (`>`, `>>`) whose target is outside this worktree — "
         "refused AND the session ENDS.",
@@ -449,15 +503,50 @@ _TERMINAL_FORM_REGISTRY: tuple[tuple[str, re.Pattern[str], bool], ...] = (
         _RM_RF_PATTERN,
         True,
     ),
+    # Measured on 36 907 pilot Bash calls (~/.mika/data/pilot-transcripts,
+    # 2026-10-24): `git push --force[-with-lease]` killed 47, `git reset --hard`
+    # 16, `<(…)` 6, `git branch -D` 2, `grep "DELETE FROM"` 1.
+    (_GIT_HISTORY_BULLET, _GIT_PUSH_FORCE_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_PUSH_F_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_PUSH_PROTECTED_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_RESET_HARD_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_BRANCH_D_PATTERN, True),
+    (_PROCSUB_BULLET, _PROCSUB_IN_PATTERN, True),
+    (_PROCSUB_BULLET, _PROCSUB_OUT_PATTERN, True),
+    (_SQL_BULLET, _SQL_DROP_TABLE_PATTERN, True),
+    (_SQL_BULLET, _SQL_DELETE_FROM_PATTERN, True),
+)
+
+# cpp#278 AC3: the lethal patterns the hint deliberately does NOT name, each with
+# its reason. A pilot doing development work never reaches for these (0 of the
+# 36 907 calls measured above was killed by one), and naming them would only
+# lengthen the hint every pilot reads. Lethality is unchanged: they stay
+# terminal; this list only records the decision not to advertise them.
+_NOT_DEV_WORK = "never part of a pilot's development work; operator-only"
+_BARE_WORD = (
+    "matches the bare word anywhere in a refused command (a test name, a commit "
+    "message); 0 of 36 907 measured calls killed, not advertised to keep the "
+    "hint short"
+)
+_TERMINAL_FORM_EXEMPTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (_CARGO_PUBLISH_PATTERN, f"release to crates.io: {_NOT_DEV_WORK}"),
+    (_GH_LABEL_MUTATE_PATTERN, f"repo label admin (adding a label is `gh issue edit`): {_NOT_DEV_WORK}"),
+    (_CHMOD_R_PATTERN, f"recursive permission change, system administration: {_NOT_DEV_WORK}"),
+    (_CHOWN_R_PATTERN, f"recursive ownership change, system administration: {_NOT_DEV_WORK}"),
+    (_DD_PATTERN, f"raw block-device copy; {_BARE_WORD}"),
+    (_MKFS_PATTERN, f"filesystem creation; {_BARE_WORD}"),
+    (_TRUNCATE_PATTERN, f"file truncation; {_BARE_WORD}"),
+    (_FORK_BOMB_PATTERN, "a fork bomb is never a legitimate command"),
 )
 
 
 def _render_terminal_forms_block() -> str:
     """The TERMINAL-forms section of ``DENIED_BASH_PATTERNS_HINT``, rendered from
     ``_TERMINAL_FORM_REGISTRY`` so the hint text is DERIVED from the same tier1
-    pattern objects the classifier enforces (cpp#278). Bullets are emitted in
-    registry order; see the registry's block comment for the drift guard."""
-    bullets = "\n".join(entry[0] for entry in _TERMINAL_FORM_REGISTRY)
+    pattern objects the classifier enforces (cpp#278). Distinct bullets are
+    emitted once each, in registry order; see the registry's block comment for
+    the drift guard."""
+    bullets = "\n".join(dict.fromkeys(entry[0] for entry in _TERMINAL_FORM_REGISTRY))
     return (
         "## These forms do not just get refused — they END the session\n"
         "\n"
@@ -2533,9 +2622,8 @@ _DENIED_BASH_PATTERNS_HINT_BODY: str = """\
 ## Bash commands the policy DENIES — use the native tool instead
 
 The permission policy DENIES the Bash patterns below. A denied call costs you a
-turn and comes back as an error you must work around. Some of them — `sed -i`,
-`eval`, `bash -c`, `sh -c`, and anything writing outside this worktree —
-additionally END this session immediately, with no retry and no recovery. A
+turn and comes back as an error you must work around. Those in the section
+above additionally END this session immediately, with no retry and no recovery. A
 shell redirect (`>`, `>>`) is DENIED but recoverable when its target is a
 working file inside this worktree or under `/tmp`; it still ENDS the session
 when the target is anywhere else, on the agent control plane (`.git/`,

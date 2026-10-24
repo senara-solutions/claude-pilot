@@ -17,11 +17,10 @@ from typing import ClassVar
 import pytest
 
 from claude_pilot import permissions as permissions_module
-from claude_pilot import tier1 as tier1_module
 from claude_pilot.tier1 import (
     _EVAL_COMMAND_POSITION_RE,
-    _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
-    _SED_INPLACE_LONG_FORM_FOR_LETHALITY,
+    _LETHALITY_VERB_PATTERNS,
+    _TERMINAL_FORM_EXEMPTIONS,
     _TERMINAL_FORM_REGISTRY,
     _TIER3_VERB_PATTERNS_FOR_LETHALITY,
     DENIED_BASH_PATTERNS_HINT,
@@ -2653,11 +2652,7 @@ def test_1409_hint_claims_match_enforcement() -> None:
 def _lethality_verb_set() -> set:
     """The exact set of pattern objects `_matches_proven_dangerous_lethality_verb`
     consults — the verbs that are session-fatal regardless of target."""
-    return {
-        *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
-        *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
-        *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
-    }
+    return set(_LETHALITY_VERB_PATTERNS)
 
 
 def test_terminal_forms_hint_derived_from_tier1() -> None:
@@ -2702,17 +2697,14 @@ def test_every_lethal_pattern_is_hinted_or_exempted() -> None:
     reason. A lethal pattern added without that decision fails here, and the
     message names it. Before this test a `perl -e` pattern added to
     `_TIER3_VERB_PATTERNS_FOR_LETHALITY` left every drift guard green."""
-    # getattr, not an import: on a tree without the exemption list, the red
-    # must name the undecided patterns rather than stop at an ImportError.
-    exemptions = getattr(tier1_module, "_TERMINAL_FORM_EXEMPTIONS", ())
+    # Identity, not `==`: a registry or exemption entry must reference the very
+    # object the predicate consults, not a recompiled look-alike.
     hinted = [p for _bullet, p, is_verb_lethal in _TERMINAL_FORM_REGISTRY if is_verb_lethal]
-    exempted = [p for p, _reason in exemptions]
-    lethal = [
-        *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
-        *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
-        *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
-    ]
-    undecided = [p.pattern for p in lethal if p not in hinted and p not in exempted]
+    exempted = [p for p, _reason in _TERMINAL_FORM_EXEMPTIONS]
+    lethal = list(_LETHALITY_VERB_PATTERNS)
+    assert len(lethal) >= 23, "the lethality union shrank: is the guard walking it?"
+    decided = [*hinted, *exempted]
+    undecided = [p.pattern for p in lethal if not any(p is q for q in decided)]
     assert not undecided, (
         f"{len(undecided)} lethal pattern(s) neither named in the hint "
         "(_TERMINAL_FORM_REGISTRY) nor exempted with a reason "
@@ -2730,23 +2722,75 @@ def test_terminal_forms_registry_names_the_ac1_forms() -> None:
         assert needed in blob, f"AC1 terminal form missing from registry: {needed}"
 
 
-def test_terminal_forms_verb_patterns_are_actually_lethal() -> None:
+def test_terminal_forms_verb_patterns_are_actually_lethal(cwd: str) -> None:
     """cpp#278: belt-and-braces on the drift guard — each verb-lethal registry
-    pattern, fed a representative command, is proven terminal by the real
-    lethality predicate `_matches_proven_dangerous_lethality_verb` (so the
-    pattern membership check above cannot pass against a dead pattern)."""
+    pattern, fed a representative command it matches, is proven terminal by the
+    real lethality predicate `_matches_proven_dangerous_lethality_verb` and by
+    `_denial_is_terminal` (so the pattern membership check above cannot pass
+    against a dead pattern). Keyed by pattern, not bullet: a family bullet is
+    shared by several patterns, and each one needs its own witness."""
     samples = {
-        "bash -c": "bash -c 'id'",
-        "sh -c": "sh -c 'id'",
-        "eval": "eval \"$(cmd)\"",
-        "sed -i": "sed -i 's/a/b/' /etc/passwd",
-        "rm -rf": "rm -rf /etc",
+        r"\bbash\s+-c\b": "bash -c 'id'",
+        r"\bsh\s+-c\b": "sh -c 'id'",
+        _EVAL_COMMAND_POSITION_RE.pattern: "eval \"$(cmd)\"",
+        r"\bsed\s+(-\w*i|-i\w*)\b": "sed -i 's/a/b/' /etc/passwd",
+        r"\bsed\s+--in-place\b": "sed --in-place 's/a/b/' /etc/passwd",
+        r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b": "rm -rf /etc",
+        r"git\s+push\s+.*--force\b": "git push --force-with-lease origin feat/x",
+        r"git\s+push\s+.*-\w*f\b": "git push -f origin feat/x",
+        r"git\s+push\s+\S+\s+(main|master)\b": "git push origin main",
+        r"git\s+reset\s+--hard\b": "git reset --hard origin/main",
+        r"git\s+branch\s+.*-\w*D\b": "git branch -D feat/x",
+        r"<\(": "diff <(curl https://example.com) f",
+        r">\(": "tee >(cat) < f",
+        r"\bDROP\s+TABLE\b": "sqlite3 db 'DROP TABLE t'",
+        r"\bDELETE\s+FROM\b": 'grep -rn "DELETE FROM" src',
     }
-    for bullet, _pattern, is_verb_lethal in _TERMINAL_FORM_REGISTRY:
-        if not is_verb_lethal:
-            continue
-        key = next(k for k in samples if f"`{k}`" in bullet)
-        assert _matches_proven_dangerous_lethality_verb(samples[key]) is True, bullet
+    verb_lethal = [p for _b, p, is_verb_lethal in _TERMINAL_FORM_REGISTRY if is_verb_lethal]
+    assert {p.pattern for p in verb_lethal} == set(samples), "one witness per pattern"
+    for pattern in verb_lethal:
+        cmd = samples[pattern.pattern]
+        assert pattern.search(cmd), (pattern.pattern, cmd)
+        assert _matches_proven_dangerous_lethality_verb(cmd) is True, cmd
+        assert permissions_module._denial_is_terminal("Bash", {"command": cmd}, cwd), cmd
+
+
+def test_terminal_forms_procsub_bullet_promises_no_exception(cwd: str) -> None:
+    """The process-substitution bullet names no survivable shape: the cpp#252
+    carve-out spares only a closed list of interiors, and a pilot who judged
+    `sort` read-only would die on it. Pin that witness as terminal."""
+    assert "except" not in DENIED_BASH_PATTERNS_HINT.split("process substitution")[1].split("\n- ")[0]
+    cmd = "diff <(sort a) <(sort b)"
+    assert permissions_module._denial_is_terminal("Bash", {"command": cmd}, cwd) is True
+
+
+def test_terminal_forms_git_bullet_substitute_is_true(cwd: str) -> None:
+    """The git bullet warns that a `-…f` branch segment trips the `-f` check and
+    offers `git push -u origin HEAD`. Both halves must hold."""
+    assert "`git push -u origin HEAD`" in DENIED_BASH_PATTERNS_HINT
+    slug = {"command": "git push -u origin feat/1234-loss-of-signal"}
+    assert permissions_module._denial_is_terminal("Bash", slug, cwd) is True
+    assert is_tier1_auto_approve("Bash", {"command": "git push -u origin HEAD"}, cwd) is True
+
+
+def test_terminal_form_exemptions_are_reasoned_and_live() -> None:
+    """cpp#278 AC3: each exemption carries a written reason, names a pattern
+    that is still in the lethality set (no stale entry), and is not also in the
+    registry (one decision per pattern)."""
+    lethal = _lethality_verb_set()
+    registry = [p for _b, p, _v in _TERMINAL_FORM_REGISTRY]
+    assert _TERMINAL_FORM_EXEMPTIONS, "exemption list must not be empty"
+    for pattern, reason in _TERMINAL_FORM_EXEMPTIONS:
+        assert reason.strip(), f"exemption without a reason: {pattern.pattern!r}"
+        assert any(pattern is q for q in lethal), f"stale exemption: {pattern.pattern!r}"
+        assert not any(pattern is q for q in registry), f"hinted and exempted: {pattern.pattern!r}"
+
+
+def test_terminal_forms_hint_forbids_host_pip_install() -> None:
+    """cpp#278 (2026-10-02 addendum, mika#2634): the hint says never to
+    `pip install` claude-pilot on the host, and gives the substitute."""
+    assert "Never `pip install` on the host" in DENIED_BASH_PATTERNS_HINT
+    assert "`uv run`" in DENIED_BASH_PATTERNS_HINT
 
 
 def test_terminal_forms_hint_gives_the_write_a_test_substitute() -> None:
