@@ -17,6 +17,7 @@ from typing import ClassVar
 import pytest
 
 from claude_pilot import permissions as permissions_module
+from claude_pilot import tier1 as tier1_module
 from claude_pilot.tier1 import (
     _EVAL_COMMAND_POSITION_RE,
     _PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
@@ -2691,6 +2692,32 @@ def test_terminal_forms_hint_derived_from_tier1() -> None:
             # NOT the verb set — it is the one TIER3 entry excluded from it.
             assert pattern is TIER3_PATTERNS[-1]
             assert pattern not in verb_set
+
+
+def test_every_lethal_pattern_is_hinted_or_exempted() -> None:
+    """cpp#278 AC3, the other direction. The test above proves every registry
+    entry is named in the hint; this one proves every pattern in the lethality
+    verb set is DECIDED: either a verb-lethal registry entry (so the hint names
+    it) or an entry of `_TERMINAL_FORM_EXEMPTIONS`, which carries a written
+    reason. A lethal pattern added without that decision fails here, and the
+    message names it. Before this test a `perl -e` pattern added to
+    `_TIER3_VERB_PATTERNS_FOR_LETHALITY` left every drift guard green."""
+    # getattr, not an import: on a tree without the exemption list, the red
+    # must name the undecided patterns rather than stop at an ImportError.
+    exemptions = getattr(tier1_module, "_TERMINAL_FORM_EXEMPTIONS", ())
+    hinted = [p for _bullet, p, is_verb_lethal in _TERMINAL_FORM_REGISTRY if is_verb_lethal]
+    exempted = [p for p, _reason in exemptions]
+    lethal = [
+        *_TIER3_VERB_PATTERNS_FOR_LETHALITY,
+        *_PROVEN_DANGEROUS_VERB_PATTERNS_CPP205,
+        *_SED_INPLACE_LONG_FORM_FOR_LETHALITY,
+    ]
+    undecided = [p.pattern for p in lethal if p not in hinted and p not in exempted]
+    assert not undecided, (
+        f"{len(undecided)} lethal pattern(s) neither named in the hint "
+        "(_TERMINAL_FORM_REGISTRY) nor exempted with a reason "
+        "(_TERMINAL_FORM_EXEMPTIONS):\n" + "\n".join(f"  {u!r}" for u in undecided)
+    )
 
 
 def test_terminal_forms_registry_names_the_ac1_forms() -> None:
