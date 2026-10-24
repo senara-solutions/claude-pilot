@@ -2773,6 +2773,70 @@ def test_terminal_forms_git_bullet_substitute_is_true(cwd: str) -> None:
     assert is_tier1_auto_approve("Bash", {"command": "git push -u origin HEAD"}, cwd) is True
 
 
+# ── cpp#300: `git push -…f` / `git branch -…D` read option tokens only ───────
+
+# The five commands that killed real pilot sessions for these two patterns
+# (~/.mika/data/pilot-transcripts, measured 2026-10-24). Three pushes died on a
+# `-…f` segment inside the BRANCH NAME (`-of`, `-rif`); two probes died on an
+# `echo "---AHEAD…---"` marker placed after `git branch --show-current`.
+_CPP300_KILLED_VERBATIMS = (
+    "git push --dry-run origin chore/195/login-privacy-policy-terms-of-service-is 2>&1 | tail -10",
+    "git push -u origin ci/2566/publish-ui-la-v-rif-post-publish-5-15-s 2>&1 | tail -5",
+    "git push -u origin test/2677/flaky-mika2532-the-stderr-of-a-crash-on 2>&1 | tail -8",
+    'git status --short --untracked-files=all; echo "---BRANCH---"; git branch --show-current; '
+    'echo "---AHEAD/BEHIND---"; git rev-list --count --left-right origin/main...HEAD',
+    'ls -1 packages/ui/src/components/ && echo "---BRANCH---" && git branch --show-current && '
+    'echo "---STATUS---" && git status --short --untracked-files=all && echo "---AHEAD---" && '
+    "git log --oneline origin/main..HEAD",
+)
+
+
+@pytest.mark.parametrize("cmd", _CPP300_KILLED_VERBATIMS)
+def test_cpp300_branch_name_or_neighbour_echo_is_not_terminal(cmd: str, cwd: str) -> None:
+    """cpp#300 AC1: a `-…f` inside a branch name, or a `-…D` in another
+    command's text, is not a force or delete flag. None of these five pushes
+    anything by force or deletes a branch, so none may end the session."""
+    assert permissions_module._denial_is_terminal("Bash", {"command": cmd}, cwd) is False
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push -f",
+        "git push --force",
+        "git push -uf origin x",
+        "git branch -D x",
+        "git branch -dD x",
+        # the flag after the refspec, and a quoted flag, are still flags
+        "git push origin feat/x -f",
+        'git push origin "-f"',
+    ],
+)
+def test_cpp300_force_and_delete_flags_stay_terminal(cmd: str, cwd: str) -> None:
+    """cpp#300 AC2: a real force-push or branch-delete flag stays lethal."""
+    assert permissions_module._denial_is_terminal("Bash", {"command": cmd}, cwd) is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="cpp#300: a `+` refspec force-push was already non-terminal on main; "
+    "making it terminal is a separate lethality change, out of this ticket",
+)
+def test_cpp300_plus_refspec_force_push_is_terminal(cwd: str) -> None:
+    assert permissions_module._denial_is_terminal(
+        "Bash", {"command": "git push origin +main"}, cwd
+    ) is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="cpp#300: `-fu` (f not last in the cluster) was already admitted on "
+    "main; refusing it changes admission, out of this ticket",
+)
+def test_cpp300_force_flag_first_in_cluster_is_refused(cwd: str) -> None:
+    assert is_tier1_auto_approve("Bash", {"command": "git push -fu origin x"}, cwd) is False
+
+
 def test_terminal_form_exemptions_are_reasoned_and_live() -> None:
     """cpp#278 AC3: each exemption carries a written reason, names a pattern
     that is still in the lethality set (no stale entry), and is not also in the
