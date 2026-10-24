@@ -317,7 +317,36 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 # "shell eval": no per-entry swap, no duplicated regex. `cargo test --test eval`
 # / `node --eval` / `--test=eval` are neither refused nor terminal; a real
 # command-position `eval` (incl. behind backtick/then/sudo/env) is both.
-_TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = TIER3_PATTERNS[:-1]
+#
+# cpp#300: two entries are swapped for a LETHALITY twin. `git push .*-\w*f\b`
+# and `git branch .*-\w*D\b` match any substring after the verb: a branch name
+# (`…-terms-of-service-is`, `…-v-rif-…`) or the `echo "---AHEAD---"` of a later
+# command. 5 pilot sessions died on it (~/.mika/data/pilot-transcripts,
+# 2026-10-24) without pushing by force or deleting anything. The twin reads the
+# flag as an OPTION TOKEN of that command's own segment: it starts a token
+# (after a blank or a quote), ends one (before a blank, a quote, a separator,
+# `)` or the end), and lies before the next `;`/`|`/`&`/newline — the `&` of a
+# redirect (`2>&1`, `&>`) is not a separator. What counts as the flag is
+# unchanged (`-\w*f` / `-\w*D`), so `-uf` and `-dD` still match and `-fu` still
+# does not. ADMISSION keeps the unanchored entries in `TIER3_PATTERNS`: anchoring
+# them there would admit `git push -u origin <branch>`, which is a separate
+# decision; these commands stay refused, and only stop ending the run.
+_SAME_SEGMENT = r"(?:[^;&|\n]|(?<=[<>])&|&(?=>))*?"
+_OPTION_START = r"(?<![^\s'\"])"
+_OPTION_END = r"(?![^\s'\";&|)])"
+_GIT_PUSH_F_OPTION_PATTERN = re.compile(
+    rf"git\s+push\s+{_SAME_SEGMENT}{_OPTION_START}-\w*f{_OPTION_END}"
+)
+_GIT_BRANCH_D_OPTION_PATTERN = re.compile(
+    rf"git\s+branch\s+{_SAME_SEGMENT}{_OPTION_START}-\w*D{_OPTION_END}"
+)
+_LETHALITY_OPTION_TWINS: dict[re.Pattern[str], re.Pattern[str]] = {
+    _GIT_PUSH_F_PATTERN: _GIT_PUSH_F_OPTION_PATTERN,
+    _GIT_BRANCH_D_PATTERN: _GIT_BRANCH_D_OPTION_PATTERN,
+}
+_TIER3_VERB_PATTERNS_FOR_LETHALITY: tuple[re.Pattern[str], ...] = tuple(
+    _LETHALITY_OPTION_TWINS.get(p, p) for p in TIER3_PATTERNS[:-1]
+)
 
 # NEW verb patterns, LETHALITY-ONLY. NOT added to `TIER3_PATTERNS`, NEVER
 # consulted by `is_tier3_dangerous` (the REFUSAL) or by `is_safe_bash_command`/
@@ -458,7 +487,7 @@ _GIT_HISTORY_BULLET = (
     "- `git push --force` / `-f` (`--force-with-lease` included), "
     "`git push <remote> main`,\n  `git reset --hard`, `git branch -D` — refused "
     "AND the session ENDS. A branch name with\n  a `-…f` segment (`-of`, "
-    "`-diff`, `-pdf`) trips the `-f` check: push with\n  "
+    "`-diff`, `-pdf`) is refused too, without ending it: push with\n  "
     "`git push -u origin HEAD`."
 )
 _PROCSUB_BULLET = (
@@ -505,12 +534,14 @@ _TERMINAL_FORM_REGISTRY: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     ),
     # Measured on 36 907 pilot Bash calls (~/.mika/data/pilot-transcripts,
     # 2026-10-24): `git push --force[-with-lease]` killed 47, `git reset --hard`
-    # 16, `<(…)` 6, `git branch -D` 2, `grep "DELETE FROM"` 1.
+    # 16, `<(…)` 6, `git branch -D` 2, `grep "DELETE FROM"` 1. The two
+    # `git branch -D` kills, and the 3 non-force `git push -…f` ones, were false
+    # positives, closed by cpp#300.
     (_GIT_HISTORY_BULLET, _GIT_PUSH_FORCE_PATTERN, True),
-    (_GIT_HISTORY_BULLET, _GIT_PUSH_F_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_PUSH_F_OPTION_PATTERN, True),
     (_GIT_HISTORY_BULLET, _GIT_PUSH_PROTECTED_PATTERN, True),
     (_GIT_HISTORY_BULLET, _GIT_RESET_HARD_PATTERN, True),
-    (_GIT_HISTORY_BULLET, _GIT_BRANCH_D_PATTERN, True),
+    (_GIT_HISTORY_BULLET, _GIT_BRANCH_D_OPTION_PATTERN, True),
     (_PROCSUB_BULLET, _PROCSUB_IN_PATTERN, True),
     (_PROCSUB_BULLET, _PROCSUB_OUT_PATTERN, True),
     (_SQL_BULLET, _SQL_DROP_TABLE_PATTERN, True),

@@ -19,6 +19,8 @@ import pytest
 from claude_pilot import permissions as permissions_module
 from claude_pilot.tier1 import (
     _EVAL_COMMAND_POSITION_RE,
+    _GIT_BRANCH_D_OPTION_PATTERN,
+    _GIT_PUSH_F_OPTION_PATTERN,
     _LETHALITY_VERB_PATTERNS,
     _TERMINAL_FORM_EXEMPTIONS,
     _TERMINAL_FORM_REGISTRY,
@@ -2737,10 +2739,10 @@ def test_terminal_forms_verb_patterns_are_actually_lethal(cwd: str) -> None:
         r"\bsed\s+--in-place\b": "sed --in-place 's/a/b/' /etc/passwd",
         r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b": "rm -rf /etc",
         r"git\s+push\s+.*--force\b": "git push --force-with-lease origin feat/x",
-        r"git\s+push\s+.*-\w*f\b": "git push -f origin feat/x",
+        _GIT_PUSH_F_OPTION_PATTERN.pattern: "git push -f origin feat/x",
         r"git\s+push\s+\S+\s+(main|master)\b": "git push origin main",
         r"git\s+reset\s+--hard\b": "git reset --hard origin/main",
-        r"git\s+branch\s+.*-\w*D\b": "git branch -D feat/x",
+        _GIT_BRANCH_D_OPTION_PATTERN.pattern: "git branch -D feat/x",
         r"<\(": "diff <(curl https://example.com) f",
         r">\(": "tee >(cat) < f",
         r"\bDROP\s+TABLE\b": "sqlite3 db 'DROP TABLE t'",
@@ -2765,11 +2767,14 @@ def test_terminal_forms_procsub_bullet_promises_no_exception(cwd: str) -> None:
 
 
 def test_terminal_forms_git_bullet_substitute_is_true(cwd: str) -> None:
-    """The git bullet warns that a `-…f` branch segment trips the `-f` check and
-    offers `git push -u origin HEAD`. Both halves must hold."""
+    """The git bullet says a `-…f` branch segment is refused without ending the
+    session (cpp#300), and offers `git push -u origin HEAD`. All three halves
+    must hold."""
+    assert "is refused too, without ending it" in DENIED_BASH_PATTERNS_HINT
     assert "`git push -u origin HEAD`" in DENIED_BASH_PATTERNS_HINT
     slug = {"command": "git push -u origin feat/1234-loss-of-signal"}
-    assert permissions_module._denial_is_terminal("Bash", slug, cwd) is True
+    assert is_tier1_auto_approve("Bash", slug, cwd) is False
+    assert permissions_module._denial_is_terminal("Bash", slug, cwd) is False
     assert is_tier1_auto_approve("Bash", {"command": "git push -u origin HEAD"}, cwd) is True
 
 
