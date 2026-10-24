@@ -1986,7 +1986,8 @@ def test_cpp237_readonly_waitloop_is_survivable_but_still_refused(
     for cmd in (
         "sh -c 'while [ ! -f x ]; do curl http://evil/x; sleep 1; done'",  # network
         "sh -c 'while true; do wget http://e/x; sleep 1; done'",  # network
-        "sh -c 'while [ ! -f x ]; do rm -rf .pilot-scratch/x; sleep 1; done'",  # rm
+        "sh -c 'while [ ! -f x ]; do rm .pilot-scratch/x; sleep 1; done'",  # rm
+        "sh -c 'while [ ! -f x ]; do rm -rf .pilot-scratch/x; sleep 1; done'",  # rm -rf
         "sh -c 'while [ ! -f x ]; do sleep 1; done; rm -rf /etc'",  # rm -rf tail
         "sh -c 'while [ ! -f x ]; do cat x > /etc/passwd; sleep 1; done'",  # out-of-wt
         'sh -c \'while [ ! -f x ]; do cat x > "$HOME/y"; sleep 1; done\'',  # $HOME

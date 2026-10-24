@@ -999,6 +999,30 @@ _REDOS_VERBATIM_SED = (
 # anchored, still microseconds.
 _REDOS_LONG_PATH_SED = "sed -n '1,2p' " + ("a" * 200) + " > g"
 
+# The WHOLE command the pilot sent (mika#2601), `; wc -l …` tail included, and
+# its 200-char-path variant. The first segment alone is not what reached
+# `_denial_is_terminal`.
+_REDOS_VERBATIM_FULL = _REDOS_VERBATIM_SED + "; wc -l .pilot-scratch/probe-block.txt"
+_REDOS_LONG_PATH_FULL = (
+    "sed -n '1139,1216p' crates/mika-agent/src/task_engine/"
+    + ("a" * 200)
+    + "/mod.rs > .pilot-scratch/probe-block.txt; wc -l .pilot-scratch/probe-block.txt"
+)
+# `_bash_allow_is_chain_safe` never reaches the regex on the two shapes above:
+# `is_tier3_dangerous` is True on any `>` and `is_tier1_auto_approve` returns
+# before `_is_safe_sub_command`. On that axis the regex is reached by a path
+# followed by an out-of-class char that is not a redirect — `:LINE` here. The
+# short path comes first so the pre-216033d regex fails it in about a second
+# instead of hanging on the longer ones.
+_REDOS_CHAIN_SAFE_REACH = (
+    "sed -n '1139,1216p' src/task_engine/mod.rs:1139; wc -l .pilot-scratch/probe-block.txt",
+    "sed -n '1139,1216p' crates/mika-agent/src/task_engine/mod.rs:1139; "
+    "wc -l .pilot-scratch/probe-block.txt",
+    "sed -n '1139,1216p' crates/mika-agent/src/task_engine/"
+    + ("a" * 200)
+    + "/mod.rs:1139; wc -l .pilot-scratch/probe-block.txt",
+)
+
 _REDOS_BUDGET_S = 0.050  # 50 ms — generous vs. the microsecond anchored cost
 
 
@@ -1023,7 +1047,13 @@ def test_sed_print_only_redos_axes_are_bounded_time() -> None:
     """cpp#250: the same inputs stay bounded through every axis that reaches
     the regex — the lethality axis, the general tier3 axis, and the terminal-
     denial classifier that hung the pilot (`_denial_is_terminal`)."""
-    for command in (_REDOS_VERBATIM_SED, _REDOS_LONG_PATH_SED):
+    for command in (
+        _REDOS_VERBATIM_SED,
+        _REDOS_LONG_PATH_SED,
+        _REDOS_VERBATIM_FULL,
+        _REDOS_LONG_PATH_FULL,
+        *_REDOS_CHAIN_SAFE_REACH,
+    ):
         _, elapsed = _elapsed(is_tier3_dangerous, command)
         assert elapsed < _REDOS_BUDGET_S, f"is_tier3_dangerous {command!r}: {elapsed * 1000:.1f} ms"
         _, elapsed = _elapsed(is_tier3_dangerous_for_lethality, command)
@@ -1037,6 +1067,29 @@ def test_sed_print_only_redos_axes_are_bounded_time() -> None:
             "/tmp",
         )
         assert elapsed < _REDOS_BUDGET_S, f"_denial_is_terminal {command!r}: {elapsed * 1000:.1f} ms"
+
+
+def test_sed_print_only_redos_chain_safe_is_bounded_time() -> None:
+    """cpp#250 AC2: `_bash_allow_is_chain_safe` stays bounded too, on the
+    whole pilot command and on the shapes that reach the regex through it
+    (see `_REDOS_CHAIN_SAFE_REACH`). None of them is honorable, so the
+    decision is `False`."""
+    from claude_pilot.policy import load_policy
+
+    policy = load_policy(
+        Path(__file__).parent.parent / "src" / "claude_pilot" / "policies" / "permissions.yaml"
+    )
+    for command in (_REDOS_VERBATIM_FULL, _REDOS_LONG_PATH_FULL, *_REDOS_CHAIN_SAFE_REACH):
+        result, elapsed = _elapsed(
+            permissions_module._bash_allow_is_chain_safe,
+            policy,
+            "Bash",
+            {"command": command},
+        )
+        assert result is False, command
+        assert elapsed < _REDOS_BUDGET_S, (
+            f"_bash_allow_is_chain_safe {command!r}: {elapsed * 1000:.1f} ms"
+        )
 
 
 def test_sed_print_only_redos_fix_preserves_decision_parity() -> None:
