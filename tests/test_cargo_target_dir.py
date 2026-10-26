@@ -136,6 +136,36 @@ class TestRefused:
         (tmp_path / "esc").symlink_to(outside)
         assert isinstance(decide(_SPELLINGS[name].format(v="esc/t")), PermissionResultDeny)
 
+    @pytest.mark.parametrize("name", list(_SPELLINGS))
+    @pytest.mark.parametrize("sub", [".git", ".claude/x"])
+    def test_symlink_onto_the_control_plane(
+        self, decide, tmp_path: Path, name: str, sub: str
+    ) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / "lnk").symlink_to(tmp_path / sub.split("/")[0])
+        assert isinstance(decide(_SPELLINGS[name].format(v="lnk/t")), PermissionResultDeny)
+
+    @pytest.mark.parametrize("name", list(_SPELLINGS))
+    @pytest.mark.parametrize("sub", [".git/x", ".claude/x", ""])
+    def test_absolute_path_onto_the_control_plane(
+        self, decide, tmp_path: Path, name: str, sub: str
+    ) -> None:
+        # `""` is the worktree root itself, which holds `.git` and `.claude`.
+        value = tmp_path / sub if sub else tmp_path
+        assert isinstance(decide(_SPELLINGS[name].format(v=value)), PermissionResultDeny)
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "CARGO_TARGET_DIR=target-alt cargo build --target-dir /etc/x",
+            "cargo build --target-dir target-alt --target-dir=/etc/x",
+            "cargo build --target-dir=target-a && cargo test --target-dir /etc/x",
+        ],
+    )
+    def test_one_escaping_value_among_several(self, decide, cmd: str) -> None:
+        assert isinstance(decide(cmd), PermissionResultDeny)
+
     @pytest.mark.parametrize("cmd", ["CARGO_TARGET_DIR=/tmp/t cargo build",
                                      "cargo build --target-dir /home/samidarko/.ssh"])
     def test_refusal_is_survivable(self, decide, tmp_path: Path, cmd: str) -> None:
@@ -145,6 +175,58 @@ class TestRefused:
         assert isinstance(r, PermissionResultDeny)
         assert r.interrupt is False
         assert _denial_is_terminal("Bash", {"command": cmd}, str(tmp_path)) is False
+
+
+_CLEAN = {
+    "flag": "cargo clean --target-dir {v}",
+    "flag=": "cargo clean --target-dir={v}",
+    "env": "CARGO_TARGET_DIR={v} cargo clean",
+}
+
+
+class TestDirectoryHoldingTheControlPlane:
+    # cargo owns its build directory whole: `cargo clean --target-dir .`
+    # removes the worktree, `.git` and `.claude` included.
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            pytest.param(form.format(v=v), id=f"{name}:{v}")
+            for v in [".", "./", ".github", "skills", "crates", "crates/mika-agent/src"]
+            for name, form in _CLEAN.items()
+        ],
+    )
+    def test_refused(self, decide, cmd: str) -> None:
+        assert isinstance(decide(cmd), PermissionResultDeny)
+
+    @pytest.mark.parametrize("name", list(_CLEAN))
+    def test_sibling_of_the_control_plane_is_admitted(self, decide, name: str) -> None:
+        assert isinstance(decide(_CLEAN[name].format(v="skills/other")), PermissionResultAllow)
+
+    def test_every_root_is_its_patterns_path(self) -> None:
+        patterns = permissions_module._CONTROL_PLANE_PATTERNS
+        roots = permissions_module._CONTROL_PLANE_ROOTS
+        assert len(roots) == len(patterns)
+        for pattern, root in zip(patterns, roots, strict=True):
+            assert pattern.match(root), (pattern.pattern, root)
+
+
+class TestWithoutWorktreeRoot:
+    # The policy guard called on its own judges a value by its spelling.
+    @pytest.mark.parametrize(
+        ("value", "escapes"),
+        [
+            ("target-alt", False),
+            (".pilot-scratch/t", False),
+            ("/abs/target", True),
+            ("a/../target", True),
+            (".", True),
+            (".git/x", True),
+            (".github", True),
+        ],
+    )
+    def test_spelling(self, value: str, escapes: bool) -> None:
+        cmd = f"cargo build --target-dir {value}"
+        assert permissions_module._cargo_target_dir_escapes(cmd, None) is escapes
 
 
 class TestAdmitted:

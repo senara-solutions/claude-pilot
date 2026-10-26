@@ -516,10 +516,12 @@ def _cargo_target_dir_escapes(command: str, cwd: str | None) -> bool:
     worktree or on the control plane (cpp#248).
 
     Each value must be literal (`cargo_target_dir_value_is_literal`). With a
-    worktree root it must then resolve inside it, symlinks followed, and off
-    the control plane; an absolute path that resolves inside stays admitted
-    (cpp#176). Without one, an absolute path is refused and a relative one is
-    judged on its spelling.
+    worktree root it must then resolve inside it, symlinks followed; an
+    absolute path that resolves inside stays admitted (cpp#176). Without one,
+    an absolute path is refused and a relative one is judged on its spelling.
+    Either way the directory must not contain the control plane
+    (`_contains_control_plane`): cargo owns everything under it, and `cargo
+    clean` removes it.
     """
     values = cargo_target_dir_values(command)
     if values is None:
@@ -529,9 +531,19 @@ def _cargo_target_dir_escapes(command: str, cwd: str | None) -> bool:
             return True
         if cwd is None:
             rel = os.path.normpath(v.text)
-            if os.path.isabs(rel) or any(p.match(rel) for p in _CONTROL_PLANE_PATTERNS):
+            if os.path.isabs(rel):
                 return True
-        elif not is_within_project(v.text, cwd) or _is_control_plane_path(v.text, cwd):
+        else:
+            try:
+                root = Path(cwd).resolve(strict=True)
+            except OSError:
+                return True
+            p = Path(v.text)
+            try:
+                rel = (p if p.is_absolute() else root / p).resolve().relative_to(root).as_posix()
+            except ValueError:
+                return True
+        if _contains_control_plane(rel):
             return True
     return False
 
@@ -1104,6 +1116,30 @@ _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^crates/mika-agent/src/well_known_agents\.rs$"),  # mika agent identities
     re.compile(r"^\.mika(/|$)"),                  # ~/.mika runtime config
 )
+
+# The literal path each pattern above protects, one per pattern, for the
+# question the patterns cannot answer: whether a DIRECTORY contains control
+# plane. A cargo build directory is such a directory — `cargo clean` removes it
+# whole — so `--target-dir .` or `--target-dir .github` reaches the control
+# plane without matching any pattern (cpp#248). A test pins the pairing.
+_CONTROL_PLANE_ROOTS: tuple[str, ...] = (
+    ".git",
+    ".github/workflows",
+    ".claude",
+    "skills/bundled",
+    "crates/mika-agent/src/well_known_agents.rs",
+    ".mika",
+)
+
+
+def _contains_control_plane(rel: str) -> bool:
+    """Whether the worktree-relative directory *rel* is, contains, or lies on
+    the control plane. ``.`` is the worktree root, which contains all of it."""
+    if rel == ".":
+        return True
+    if any(p.match(rel) for p in _CONTROL_PLANE_PATTERNS):
+        return True
+    return any(root.startswith(rel + "/") for root in _CONTROL_PLANE_ROOTS)
 
 
 def _segment_redirect_targets(seg: str) -> list[str] | None:
