@@ -24,6 +24,10 @@ The decision whether a tool call may run at all. Distinct from **lethality**: wi
 
 Whether a refused call also ends the pilot's session (terminal) or comes back to the model as a refusal it can adapt to (non-terminal). Decided separately from **admission**: changing lethality never makes a refused call run.
 
+### Destination veto
+
+The check that judges where a shell command's writes land (a copy or move target, a created directory, a redirect, a file an editor such as sed opens for writing) and objects when one escapes the pilot's worktree or touches the agent's own control plane. On the **lethality** side, a destination that escapes is one of the few reasons a refusal ends the session.
+
 ### Containment attestation
 
 The signal, set by the dispatch environment, that the pilot runs inside filesystem, network and kernel isolation; some **tier1** shapes are admitted only when it is present.
