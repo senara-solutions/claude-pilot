@@ -490,9 +490,13 @@ def _matches_proven_dangerous_lethality_verb(stripped_command: str) -> bool:
 # as fatal costs nothing and the reverse kills the run. `False` → the generic
 # `>`/`>>` redirect, fatal ONLY when its target is proven out-of-worktree by the
 # cwd-aware destination veto (hence it is excluded from the lethality verb set).
+# cpp#230: a sed `w FILE` write is judged by the destination veto, not by a verb
+# pattern, so it has no registry entry of its own; it shares the `sed -i`
+# bullet, whose fate it now shares.
 _SED_INPLACE_BULLET = (
     "- `sed -i` / `sed --in-place` whose in-place target is outside this "
-    "worktree — refused AND the session ENDS."
+    "worktree, or a sed\n  `w FILE` write (`w`, `W`, `s/…/…/w`) whose FILE is "
+    "outside it — refused AND the session ENDS."
 )
 _GIT_HISTORY_BULLET = (
     "- `git push --force` / `-f` (`--force-with-lease` included), "
@@ -6193,6 +6197,365 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
     if not carved:
         return False
     return not is_tier3_dangerous_for_lethality("\n".join(survivors))
+
+
+# ── cpp#230: the write destinations of a sed script ───────────────────────────
+#
+# `sed -i` is not the only way sed writes a file. The `w FILE` and `W FILE`
+# commands and the `w FILE` flag of `s///` open FILE for writing, anywhere on
+# disk. Before cpp#230 such a command was refused (sed is not admitted outside
+# the two closed shapes `_is_safe_sed_print_only` / `_is_safe_sed_pure_
+# substitution`, neither of which can carry a `w`) but NON-terminal, while
+# `sed -i` on the same out-of-worktree path ended the session.
+# `sed_write_destinations` reads those destinations so `permissions.
+# _destination_veto_reason` can judge them like every other write destination,
+# on the LETHALITY question only (admission byte-identical).
+#
+# The reader follows GNU sed 4.x, measured on 4.10:
+#   * a `w`/`W` file name runs to the end of the line, `;` and `}` included
+#     (`s/a/b/w out; p` creates `out; p`), and the blanks before it are optional
+#     (`s/a/b/w1` creates `1`);
+#   * the label of `:`, `b`, `t`, `T` ends at `;` (`:a;w F` and `b e;w F` both
+#     create F);
+#   * the text of `a`, `i`, `c` runs to the end of the line, so `a w /etc/x`
+#     appends text and writes nothing;
+#   * sed opens every `w` file when it COMPILES the script, before running it and
+#     even when compilation fails later (`b end;w br;:end` aborts on the label
+#     and still creates `br;:end`), so a destination counts as soon as it is
+#     written, whatever its address;
+#   * several `-e` expressions are joined by newlines; long options accept an
+#     unambiguous prefix (`--expr=`); `-i` takes the rest of its option cluster
+#     as its backup suffix (`-ie` is `-i` with suffix `e`, not `-i -e`).
+#
+# An empty result means "no proven destination". That covers a read-only
+# script, an option GNU rejects (sed does not start), `--sandbox` (GNU refuses
+# `w`), a `-f` script file (unknowable), and a script this reader cannot parse
+# — a denial the classifier cannot prove stays survivable (`_denial_is_terminal`
+# doctrine, cpp#205). So does a script whose shell word hides its text from
+# shlex (`$'\x77 /etc/x'`, `"$C /etc/x"`): a declared residual, never a write
+# the reader saw and dropped.
+#
+# The reader is one forward pass with no backtracking regex (cpp#250).
+
+_SED_SHORT_FLAGS = frozenset("nrEsuzb")
+_SED_LONG_OPTIONS: dict[str, str] = {
+    # option name -> "required" | "optional" | "none" argument
+    "expression": "required",
+    "file": "required",
+    "line-length": "required",
+    "in-place": "optional",
+    "quiet": "none",
+    "silent": "none",
+    "regexp-extended": "none",
+    "separate": "none",
+    "unbuffered": "none",
+    "null-data": "none",
+    "zero-terminated": "none",
+    "binary": "none",
+    "posix": "none",
+    "debug": "none",
+    "sandbox": "none",
+    "follow-symlinks": "none",
+    "help": "none",
+    "version": "none",
+}
+# A shlex token that is a shell redirect rather than a sed operand: `2>/dev/null`
+# (operator and target in one token) or a bare operator (`2>`, `>>`, `&>`) whose
+# target is the NEXT token.
+_SED_W_REDIRECT_RE = re.compile(r"^(?:\d*|&)(?:>>|>&|<&|>\||>|<)")
+_SED_SIMPLE_COMMANDS = frozenset("=dDgGhHnNpPxzF")
+
+
+def _sed_long_option(name: str) -> str | None:
+    """The GNU long option *name* resolves to: exact, else the one option it is
+    an unambiguous prefix of. ``None`` for an unknown or ambiguous name."""
+    if name in _SED_LONG_OPTIONS:
+        return name
+    matches = [opt for opt in _SED_LONG_OPTIONS if opt.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _sed_regex_end(s: str, i: int, delim: str) -> int:
+    """Index just past the *delim* closing the regex that starts at *i*, or -1
+    when it is unterminated. A backslash escapes the next character."""
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == delim:
+            return i + 1
+        if ch == "\n":
+            return -1
+        i += 1
+    return -1
+
+
+def _sed_address_end(s: str, i: int, *, second: bool) -> int:
+    """Index past the address at *i* (``i`` itself when there is none), or -1
+    on a malformed address. A *second* address also takes ``+N`` / ``~N``."""
+    n = len(s)
+    if i >= n:
+        return i
+    ch = s[i]
+    if second and ch in "+~":
+        j = i + 1
+        while j < n and s[j].isdigit():
+            j += 1
+        return j if j > i + 1 else -1
+    if ch.isdigit():
+        while i < n and s[i].isdigit():
+            i += 1
+        if i < n and s[i] == "~":
+            i += 1
+            while i < n and s[i].isdigit():
+                i += 1
+        return i
+    if ch == "$":
+        return i + 1
+    if ch == "/" or ch == "\\":
+        if ch == "\\":
+            if i + 1 >= n or s[i + 1] == "\n":
+                return -1
+            delim, start = s[i + 1], i + 2
+        else:
+            delim, start = "/", i + 1
+        end = _sed_regex_end(s, start, delim)
+        if end < 0:
+            return -1
+        while end < n and s[end] in "IM":
+            end += 1
+        return end
+    return i
+
+
+def _sed_delimited_end(s: str, i: int, parts: int) -> int:
+    """Index past the *parts* delimiter-separated fields of an `s`/`y` command
+    whose delimiter is ``s[i]``, or -1 when they are not all closed."""
+    n = len(s)
+    if i >= n or s[i] in "\n\\":
+        return -1
+    delim = s[i]
+    i += 1
+    closed = 0
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            i += 2
+            continue
+        i += 1
+        if ch == delim:
+            closed += 1
+            if closed == parts:
+                return i
+    return -1
+
+
+def _sed_line_end(s: str, i: int) -> int:
+    end = s.find("\n", i)
+    return len(s) if end < 0 else end
+
+
+def _sed_skip_blanks(s: str, i: int) -> int:
+    while i < len(s) and s[i] in " \t":
+        i += 1
+    return i
+
+
+def _sed_label_end(s: str, i: int) -> int:
+    """GNU ends a label (`:`, `b`, `t`, `T`, and `v`'s version) at `;` too."""
+    while i < len(s) and s[i] not in ";\n":
+        i += 1
+    return i
+
+
+def _sed_script_write_targets(script: str) -> list[str] | None:
+    """Every file the sed *script* opens for writing (`w`/`W` commands and the
+    `w` flag of `s`), in order, or ``None`` when the script does not parse."""
+    s = script
+    n = len(s)
+    out: list[str] = []
+    i = 0
+    while True:
+        while i < n and s[i] in " \t\n;":
+            i += 1
+        if i >= n:
+            return out
+        start = i
+        i = _sed_address_end(s, i, second=False)
+        if i < 0:
+            return None
+        if i > start:
+            i = _sed_skip_blanks(s, i)
+            if i < n and s[i] == ",":
+                after = _sed_skip_blanks(s, i + 1)
+                i = _sed_address_end(s, after, second=True)
+                if i <= after:
+                    return None
+        i = _sed_skip_blanks(s, i)
+        while i < n and s[i] == "!":
+            i = _sed_skip_blanks(s, i + 1)
+        if i >= n:
+            return None
+        cmd = s[i]
+        i += 1
+        if cmd in "{}":
+            continue
+        if cmd == "#":
+            i = _sed_line_end(s, i)
+            continue
+        if cmd in ":btTv":
+            i = _sed_skip_blanks(s, i)
+            end = _sed_label_end(s, i)
+            if cmd == ":" and end == i:
+                return None
+            i = end
+            continue
+        if cmd in "aic":
+            i = _sed_skip_blanks(s, i)
+            if i < n and s[i] == "\\":
+                i += 1
+                if i < n and s[i] == "\n":
+                    i += 1
+            while i < n and s[i] != "\n":
+                i += 2 if s[i] == "\\" else 1
+            continue
+        if cmd in "rRe":
+            i = _sed_line_end(s, i)
+            continue
+        if cmd in "wW":
+            i = _sed_skip_blanks(s, i)
+            end = _sed_line_end(s, i)
+            if end > i:
+                out.append(s[i:end])
+            i = end
+            continue
+        if cmd in "sy":
+            i = _sed_delimited_end(s, i, 2)
+            if i < 0:
+                return None
+            if cmd == "s":
+                while i < n and (s[i] in "gpeiImM" or s[i].isdigit()):
+                    i += 1
+                if i < n and s[i] == "w":
+                    i = _sed_skip_blanks(s, i + 1)
+                    end = _sed_line_end(s, i)
+                    if end > i:
+                        out.append(s[i:end])
+                    i = end
+                    continue
+        elif cmd in "lLqQ":
+            i = _sed_skip_blanks(s, i)
+            while i < n and s[i].isdigit():
+                i += 1
+        elif cmd not in _SED_SIMPLE_COMMANDS:
+            return None
+        i = _sed_skip_blanks(s, i)
+        if i < n and s[i] not in ";\n}#":
+            return None
+
+
+def sed_write_destinations(segment: str) -> list[str]:
+    """The files a ``sed`` *segment* opens for writing through a `w`/`W` command
+    or an `s///w` flag (cpp#230), as the literal names in the script. Empty when
+    none is proven — see the block comment above for every case that maps there.
+
+    The leading word must be ``sed`` or a path whose base name is ``sed``. A
+    prefix (`env`, `VAR=`, `xargs`, a subshell) is not read: a declared residual
+    that keeps HEAD's verdict.
+    """
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return []
+    if not tokens or os.path.basename(tokens[0]) != "sed":
+        return []
+    scripts: list[str] = []
+    positionals: list[str] = []
+    has_script_file = False
+    end_of_opts = False
+    i, n = 1, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        i += 1
+        if _SED_W_REDIRECT_RE.match(tok):
+            if _SED_W_REDIRECT_RE.fullmatch(tok):
+                i += 1  # a bare operator: its target is the next token
+            continue
+        if end_of_opts or tok == "-" or not tok.startswith("-"):
+            positionals.append(tok)
+            continue
+        if tok == "--":
+            end_of_opts = True
+            continue
+        if tok.startswith("--"):
+            name, eq, value = tok[2:].partition("=")
+            opt = _sed_long_option(name)
+            if opt is None or opt in ("help", "version", "sandbox"):
+                return []  # GNU does not start, or refuses every `w`
+            kind = _SED_LONG_OPTIONS[opt]
+            if kind == "none" and eq:
+                return []
+            if kind == "required" and not eq:
+                if i >= n:
+                    return []
+                value = tokens[i]
+                i += 1
+            if opt == "expression":
+                scripts.append(value)
+            elif opt == "file":
+                has_script_file = True
+            continue
+        for k in range(1, len(tok)):
+            ch = tok[k]
+            if ch in _SED_SHORT_FLAGS:
+                continue
+            if ch == "i":
+                break  # the rest of the cluster is the backup suffix
+            if ch in "efl":
+                value = tok[k + 1 :]
+                if not value:
+                    if i >= n:
+                        return []
+                    value = tokens[i]
+                    i += 1
+                if ch == "e":
+                    scripts.append(value)
+                elif ch == "f":
+                    has_script_file = True
+                break
+            return []  # an option GNU rejects: sed does not start
+    if not scripts and not has_script_file:
+        if not positionals:
+            return []
+        scripts = [positionals[0]]
+    if not scripts:
+        return []
+    return _sed_script_write_targets("\n".join(scripts)) or []
+
+
+def _blank_heredoc_bodies(command: str) -> str:
+    """*command* with every heredoc BODY line emptied (cpp#230). Bash feeds a body
+    to the reading process as data and never runs a body line as a command,
+    quoted delimiter or not, so a body line such as ``sed 'w /etc/x' f`` (a
+    commit message quoting a repro) must not be read as a sed segment. Command
+    lines, openers and terminators are kept; an unterminated heredoc is body to
+    the end, as bash reads it. Line count is preserved. Openers are read by the
+    cpp#241 scanner (`_scan_command_line_for_heredocs`)."""
+    lines = command.split("\n")
+    out = list(lines)
+    pending: list[tuple[str, bool, bool]] = []
+    for idx, line in enumerate(lines):
+        if not pending:
+            pending.extend(_scan_command_line_for_heredocs(line))
+            continue
+        delim, _no_expansion, dash = pending[0]
+        if (line.lstrip("\t") if dash else line) == delim:
+            pending.pop(0)
+            continue
+        out[idx] = ""
+    return "\n".join(out)
 
 
 # ── cpp#237: a read-only WAIT-LOOP script is not on its own session-fatal ──────
