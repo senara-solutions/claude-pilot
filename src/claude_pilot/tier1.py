@@ -4302,6 +4302,69 @@ def cargo_carries_config(command: str) -> bool:
     return False
 
 
+# ── cargo's build directory is a write destination (cpp#248) ─────────────────
+#
+# `--target-dir V`, `--target-dir=V` and `CARGO_TARGET_DIR=V` name the directory
+# cargo writes its whole build into. `cargo_target_dir_values` collects every
+# such value, quote-removed; containment is judged by
+# `permissions._cargo_target_dir_escapes`, which has the worktree root. tier1
+# has no worktree root, so `is_safe_build_command` admits no cargo that carries
+# one and leaves the decision to the policy path.
+#
+# `CARGO_TARGET_DIR=` is read on any word of the command (prefix, `env`,
+# `export`); `--target-dir` only after a `cargo` word, and after `--` too (an
+# over-refusal, as for `--config`). A flag that only an expansion would spell is
+# already `cargo_carries_config`'s.
+
+_CARGO_TARGET_DIR_FLAG = "--target-dir"
+_CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR="
+
+
+def cargo_target_dir_values(command: str) -> list[_ShellWord] | None:
+    """Every cargo build-directory value in *command*; ``None`` if a segment
+    that mentions one cannot be lexed. Each value keeps the word's expansion,
+    glob and brace flags; its ``text`` is the value alone."""
+    command = command.replace("\\\n", "")
+    values: list[_ShellWord] = []
+
+    def value_of(w: _ShellWord, prefix: str) -> _ShellWord:
+        v = _ShellWord()
+        v.text = w.text[len(prefix):]
+        v.expansions, v.glob, v.brace, v.quoted = w.expansions, w.glob, w.brace, w.quoted
+        return v
+
+    for seg in _split_compound_command(command) or [command]:
+        words = _lex_shell_words(seg)
+        if words is None:
+            if "cargo" in seg or _CARGO_TARGET_DIR_ENV in seg:
+                return None
+            continue
+        after_cargo = False
+        for idx, w in enumerate(words):
+            if w.text.startswith(_CARGO_TARGET_DIR_ENV):
+                values.append(value_of(w, _CARGO_TARGET_DIR_ENV))
+            if w.text.rsplit("/", 1)[-1] == "cargo":
+                after_cargo = True
+                continue
+            if not after_cargo:
+                continue
+            if w.text == _CARGO_TARGET_DIR_FLAG:
+                if idx + 1 < len(words):
+                    values.append(value_of(words[idx + 1], ""))
+            elif w.text.startswith(_CARGO_TARGET_DIR_FLAG + "="):
+                values.append(value_of(w, _CARGO_TARGET_DIR_FLAG + "="))
+    return values
+
+
+def cargo_target_dir_value_is_literal(v: _ShellWord) -> bool:
+    """A value bash leaves as written: no expansion, glob, brace or `~`, not
+    empty, and no `..` component."""
+    t = v.text
+    if not t or v.expansions or v.glob or v.brace or "~" in t:
+        return False
+    return ".." not in t.split("/")
+
+
 # ── A `.cargo` directory is cargo configuration ──────────────────────────────
 #
 # Cargo reads `.cargo/config.toml` from its working directory and every
@@ -4988,7 +5051,9 @@ _NPX_RE = re.compile(r"^\s*npx\s+(tsc|vitest|prettier|eslint)\b")
 def is_safe_build_command(sub: str) -> bool:
     m = _CARGO_RE.match(sub)
     if m and m.group(1) in SAFE_CARGO_SUBCOMMANDS:
-        return not cargo_carries_config(sub)
+        # A build directory is judged with the worktree root, on the policy
+        # path (cpp#248).
+        return not cargo_carries_config(sub) and cargo_target_dir_values(sub) == []
 
     m = _NPM_RUN_RE.match(sub)
     if m and m.group(1) in SAFE_NPM_RUN_SCRIPTS:

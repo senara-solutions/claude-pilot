@@ -980,8 +980,9 @@ def test_bundled_allows_dev_pilot_footprint(cmd: str) -> None:
 @pytest.mark.parametrize(
     "cmd",
     [
-        # (a) closed-list env-assignment prefix (chainable) before `cargo`
-        "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/x cargo test --no-run",
+        # (a) closed-list env-assignment prefix (chainable) before `cargo`.
+        # The build directory stays in the worktree (cpp#248): `/x` is refused.
+        "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target-alt cargo test --no-run",
         "RUST_LOG=debug cargo build",
         "RUST_BACKTRACE=1 cargo test",
         "CARGO_TERM_COLOR=always cargo clippy",
@@ -1008,6 +1009,8 @@ def test_cpp242_cargo_env_prefix_and_subcommands_admitted(cmd: str) -> None:
         # the closed prefix is ONLY valid immediately before literal `cargo`:
         # a prefixed non-cargo binary stays refused (MPC-ratified negative).
         "CARGO_INCREMENTAL=0 bash -c 'cargo build'",
+        # an on-list name whose value leaves the worktree (cpp#248)
+        "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/x cargo test --no-run",
     ],
 )
 def test_cpp242_off_list_prefix_and_non_cargo_stay_denied(cmd: str) -> None:
