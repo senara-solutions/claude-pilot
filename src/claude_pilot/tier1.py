@@ -6215,25 +6215,35 @@ def sed_i_confined_to_worktree(command: str, cwd: str) -> bool:
 #   * a `w`/`W` file name runs to the end of the line, `;` and `}` included
 #     (`s/a/b/w out; p` creates `out; p`), and the blanks before it are optional
 #     (`s/a/b/w1` creates `1`);
-#   * the label of `:`, `b`, `t`, `T` ends at `;` (`:a;w F` and `b e;w F` both
-#     create F);
+#   * the label of `:`, `b`, `t`, `T` ends at `;` or a blank (`:a;w F`,
+#     `b e;w F` and `b x w F` all create F);
 #   * the text of `a`, `i`, `c` runs to the end of the line, so `a w /etc/x`
 #     appends text and writes nothing;
+#   * blanks may sit before and between the flags of `s` (`s/a/b/ g w F`);
+#   * in a regex (an address, the pattern of `s`) a bracket expression is one
+#     unit, so the delimiter inside it does not close the regex: `s/[/]/w/`
+#     replaces `/` with `w` and writes nothing. A leading `^` and then `]` are
+#     literal, `\` is literal inside, and `[:`, `[.`, `[=` run to their `:]`,
+#     `.]`, `=]`. The replacement and both fields of `y` have no brackets;
 #   * sed opens every `w` file when it COMPILES the script, before running it and
 #     even when compilation fails later (`b end;w br;:end` aborts on the label
 #     and still creates `br;:end`), so a destination counts as soon as it is
-#     written, whatever its address;
+#     written, whatever its address. The same holds across options: each `-e`
+#     is compiled when getopt reads it, so `sed -e 'w F' --bogus` creates F
+#     before rejecting the option;
 #   * several `-e` expressions are joined by newlines; long options accept an
 #     unambiguous prefix (`--expr=`); `-i` takes the rest of its option cluster
 #     as its backup suffix (`-ie` is `-i` with suffix `e`, not `-i -e`).
 #
-# An empty result means "no proven destination". That covers a read-only
-# script, an option GNU rejects (sed does not start), `--sandbox` (GNU refuses
-# `w`), a `-f` script file (unknowable), and a script this reader cannot parse
-# — a denial the classifier cannot prove stays survivable (`_denial_is_terminal`
-# doctrine, cpp#205). So does a script whose shell word hides its text from
-# shlex (`$'\x77 /etc/x'`, `"$C /etc/x"`): a declared residual, never a write
-# the reader saw and dropped.
+# So the reader returns every destination compiled before the point where sed
+# stops — a parse error in the script, a rejected option, `--help`/`--version`,
+# or `--sandbox` (which refuses every LATER `w`). An empty result means "no
+# proven destination": a read-only script, a script that fails before its first
+# `w`, a `-f` script file (unknowable). A script this reader cannot parse
+# proves only what came before the failure; a denial the classifier cannot
+# prove stays survivable (`_denial_is_terminal` doctrine, cpp#205). So does a
+# script whose shell word hides its text from shlex (`$'\x77 /etc/x'`,
+# `"$C /etc/x"`): a declared residual, never a write the reader saw and dropped.
 #
 # The reader is one forward pass with no backtracking regex (cpp#250).
 
@@ -6275,9 +6285,35 @@ def _sed_long_option(name: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _sed_bracket_end(s: str, i: int) -> int:
+    """Index just past the bracket expression opened by ``s[i] == '['``, or -1
+    when it is unterminated (GNU then reports an unterminated command)."""
+    n = len(s)
+    j = i + 1
+    if j < n and s[j] == "^":
+        j += 1
+    if j < n and s[j] == "]":
+        j += 1
+    while j < n:
+        ch = s[j]
+        if ch == "[" and j + 1 < n and s[j + 1] in ":.=":
+            close = s.find(s[j + 1] + "]", j + 2)
+            if close < 0:
+                return -1
+            j = close + 2
+            continue
+        if ch == "]":
+            return j + 1
+        if ch == "\n":
+            return -1
+        j += 1
+    return -1
+
+
 def _sed_regex_end(s: str, i: int, delim: str) -> int:
     """Index just past the *delim* closing the regex that starts at *i*, or -1
-    when it is unterminated. A backslash escapes the next character."""
+    when it is unterminated. A backslash escapes the next character; a bracket
+    expression is skipped whole."""
     n = len(s)
     while i < n:
         ch = s[i]
@@ -6288,6 +6324,11 @@ def _sed_regex_end(s: str, i: int, delim: str) -> int:
             return i + 1
         if ch == "\n":
             return -1
+        if ch == "[":
+            i = _sed_bracket_end(s, i)
+            if i < 0:
+                return -1
+            continue
         i += 1
     return -1
 
@@ -6330,15 +6371,26 @@ def _sed_address_end(s: str, i: int, *, second: bool) -> int:
     return i
 
 
-def _sed_delimited_end(s: str, i: int, parts: int) -> int:
-    """Index past the *parts* delimiter-separated fields of an `s`/`y` command
-    whose delimiter is ``s[i]``, or -1 when they are not all closed."""
+def _sed_delimited_end(s: str, i: int, *, regex_first: bool) -> int:
+    """Index past the two delimiter-separated fields of an `s`/`y` command whose
+    delimiter is ``s[i]``, or -1 when they are not both closed. With
+    *regex_first* (`s`), the first field is a regex, read by `_sed_regex_end`."""
     n = len(s)
     if i >= n or s[i] in "\n\\":
         return -1
     delim = s[i]
-    i += 1
-    closed = 0
+    if regex_first:
+        i = _sed_regex_end(s, i + 1, delim)
+    else:
+        i = _sed_plain_field_end(s, i + 1, delim)
+    return -1 if i < 0 else _sed_plain_field_end(s, i, delim)
+
+
+def _sed_plain_field_end(s: str, i: int, delim: str) -> int:
+    """Index just past the *delim* closing a field with no bracket expressions
+    (a replacement, a field of `y`), or -1. A backslash escapes the next
+    character, a newline included."""
+    n = len(s)
     while i < n:
         ch = s[i]
         if ch == "\\":
@@ -6346,9 +6398,7 @@ def _sed_delimited_end(s: str, i: int, parts: int) -> int:
             continue
         i += 1
         if ch == delim:
-            closed += 1
-            if closed == parts:
-                return i
+            return i
     return -1
 
 
@@ -6364,15 +6414,17 @@ def _sed_skip_blanks(s: str, i: int) -> int:
 
 
 def _sed_label_end(s: str, i: int) -> int:
-    """GNU ends a label (`:`, `b`, `t`, `T`, and `v`'s version) at `;` too."""
-    while i < len(s) and s[i] not in ";\n":
+    """GNU ends a label (`:`, `b`, `t`, `T`, and `v`'s version) at `;` or a
+    blank too, not only at the end of the line."""
+    while i < len(s) and s[i] not in "; \t\n":
         i += 1
     return i
 
 
-def _sed_script_write_targets(script: str) -> list[str] | None:
+def _sed_script_write_targets(script: str) -> list[str]:
     """Every file the sed *script* opens for writing (`w`/`W` commands and the
-    `w` flag of `s`), in order, or ``None`` when the script does not parse."""
+    `w` flag of `s`), in order. Where the script stops parsing, the files opened
+    before that point are returned: GNU has already opened them."""
     s = script
     n = len(s)
     out: list[str] = []
@@ -6385,19 +6437,19 @@ def _sed_script_write_targets(script: str) -> list[str] | None:
         start = i
         i = _sed_address_end(s, i, second=False)
         if i < 0:
-            return None
+            return out
         if i > start:
             i = _sed_skip_blanks(s, i)
             if i < n and s[i] == ",":
                 after = _sed_skip_blanks(s, i + 1)
                 i = _sed_address_end(s, after, second=True)
                 if i <= after:
-                    return None
+                    return out
         i = _sed_skip_blanks(s, i)
         while i < n and s[i] == "!":
             i = _sed_skip_blanks(s, i + 1)
         if i >= n:
-            return None
+            return out
         cmd = s[i]
         i += 1
         if cmd in "{}":
@@ -6409,7 +6461,7 @@ def _sed_script_write_targets(script: str) -> list[str] | None:
             i = _sed_skip_blanks(s, i)
             end = _sed_label_end(s, i)
             if cmd == ":" and end == i:
-                return None
+                return out
             i = end
             continue
         if cmd in "aic":
@@ -6432,12 +6484,13 @@ def _sed_script_write_targets(script: str) -> list[str] | None:
             i = end
             continue
         if cmd in "sy":
-            i = _sed_delimited_end(s, i, 2)
+            i = _sed_delimited_end(s, i, regex_first=cmd == "s")
             if i < 0:
-                return None
+                return out
             if cmd == "s":
+                i = _sed_skip_blanks(s, i)
                 while i < n and (s[i] in "gpeiImM" or s[i].isdigit()):
-                    i += 1
+                    i = _sed_skip_blanks(s, i + 1)
                 if i < n and s[i] == "w":
                     i = _sed_skip_blanks(s, i + 1)
                     end = _sed_line_end(s, i)
@@ -6450,10 +6503,10 @@ def _sed_script_write_targets(script: str) -> list[str] | None:
             while i < n and s[i].isdigit():
                 i += 1
         elif cmd not in _SED_SIMPLE_COMMANDS:
-            return None
+            return out
         i = _sed_skip_blanks(s, i)
         if i < n and s[i] not in ";\n}#":
-            return None
+            return out
 
 
 def sed_write_destinations(segment: str) -> list[str]:
@@ -6475,6 +6528,11 @@ def sed_write_destinations(segment: str) -> list[str]:
     positionals: list[str] = []
     has_script_file = False
     end_of_opts = False
+
+    def compiled() -> list[str]:
+        # sed stops here; the `-e` scripts read so far are already compiled.
+        return _sed_script_write_targets("\n".join(scripts)) if scripts else []
+
     i, n = 1, len(tokens)
     while i < n:
         tok = tokens[i]
@@ -6493,13 +6551,14 @@ def sed_write_destinations(segment: str) -> list[str]:
             name, eq, value = tok[2:].partition("=")
             opt = _sed_long_option(name)
             if opt is None or opt in ("help", "version", "sandbox"):
-                return []  # GNU does not start, or refuses every `w`
+                # rejected or exiting, or every later `w` refused
+                return compiled()
             kind = _SED_LONG_OPTIONS[opt]
             if kind == "none" and eq:
-                return []
+                return compiled()
             if kind == "required" and not eq:
                 if i >= n:
-                    return []
+                    return compiled()
                 value = tokens[i]
                 i += 1
             if opt == "expression":
@@ -6517,7 +6576,7 @@ def sed_write_destinations(segment: str) -> list[str]:
                 value = tok[k + 1 :]
                 if not value:
                     if i >= n:
-                        return []
+                        return compiled()
                     value = tokens[i]
                     i += 1
                 if ch == "e":
@@ -6525,14 +6584,10 @@ def sed_write_destinations(segment: str) -> list[str]:
                 elif ch == "f":
                     has_script_file = True
                 break
-            return []  # an option GNU rejects: sed does not start
-    if not scripts and not has_script_file:
-        if not positionals:
-            return []
+            return compiled()  # an option GNU rejects
+    if not scripts and not has_script_file and positionals:
         scripts = [positionals[0]]
-    if not scripts:
-        return []
-    return _sed_script_write_targets("\n".join(scripts)) or []
+    return compiled()
 
 
 def _blank_heredoc_bodies(command: str) -> str:

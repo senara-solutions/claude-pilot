@@ -5806,6 +5806,34 @@ def test_scope_probe_is_bounded_time(monkeypatch: pytest.MonkeyPatch) -> None:
         ("sed ':a;w /etc/x' f", ["/etc/x"]),
         ("sed 'b e;w /etc/x' f", ["/etc/x"]),
         ("sed 't;w /etc/x' f", ["/etc/x"]),
+        # ... and at a blank too
+        ("sed -n 'b x w /etc/x' f", ["/etc/x"]),
+        ("sed -n ':x w /etc/x' f", ["/etc/x"]),
+        # blanks before and between the flags of `s`
+        ("sed 's/a/b/ w /etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/g w /etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/ g p w /etc/x' f", ["/etc/x"]),
+        # a bracket expression is one unit in a regex, not in a replacement
+        ("sed -n '/[/]/w /etc/x' f", ["/etc/x"]),
+        ("sed 's/[/]/x/w /etc/x' f", ["/etc/x"]),
+        ("sed 's/[/]/w /etc/x/' f", []),
+        ("sed 's/[/]/w/' f", []),
+        ("sed 's/[]/]/x/w a' f", ["a"]),
+        ("sed 's/[^]/]/x/w a' f", ["a"]),
+        ("sed 's/[[:alpha:]/]/x/w a' f", ["a"]),
+        ("sed 's/[[.a.]/]/x/w a' f", ["a"]),
+        ("sed 's/[\\]/x/w a' f", ["a"]),
+        ("sed 's/\\[/x/w a' f", ["a"]),
+        ("sed 's/x/[/w a' f", ["a"]),
+        ("sed 'y/[/]/;w a' f", ["a"]),
+        ("sed 's/[[:x/]/X/w a' f", []),  # unterminated class: GNU rejects `s`
+        # what sed compiled before it stopped is already open
+        ("sed -e 'w /etc/x' -e Z f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --sandbox f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --bogus f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' -X f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --help f", ["/etc/x"]),
+        ("sed --sandbox -e 'w /etc/x' f", []),
         # addresses, negation, blocks
         ("sed '1p;w /etc/x' f", ["/etc/x"]),
         ("sed '/re/I,+2!w /etc/x' f", ["/etc/x"]),

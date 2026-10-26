@@ -5789,6 +5789,15 @@ _CPP230_TERMINAL = [
     "sed 'w ~/x' f",
     "sed 'w .git/hooks/pre-commit' f",
     "echo a && sed 'w /etc/x' f",
+    # forms the code review measured on GNU sed 4.10
+    "sed -n 'b x w /etc/x' f",
+    "sed 's/a/b/ w /etc/x' f",
+    "sed -n '/[/]/w /etc/x' f",
+    "sed -e 'w /etc/x' -e Z f",
+    "sed -e 'w /etc/x' --bogus f",
+    # the `sed -i` carve never launders a `w` write
+    "sed -i 's/a/b/w /etc/x' src/x.rs",
+    "sed -i 's/a/b/' src/x.rs; sed 'w /etc/x' f",
 ]
 
 _CPP230_SURVIVABLE = [
@@ -5797,6 +5806,9 @@ _CPP230_SURVIVABLE = [
     "sed 's/a/b/w out.txt' f",
     # GNU special files and read-only scripts
     "sed -n 'w /dev/stdout' f",
+    "sed -n 'w /dev/stderr' f",
+    "sed -n 'w /dev/null' f",
+    "sed 's/[/]/w/' f",  # `[/]` is a bracket: this replaces `/`, writes nothing
     "sed -n '/warning/p' f",
     "sed -n '/\\w/p' f",
     "sed 's/w/W/g' f",
