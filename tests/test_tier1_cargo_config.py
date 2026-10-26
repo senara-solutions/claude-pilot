@@ -66,7 +66,7 @@ _QUOTED_FORMS = [
 
 # The cpp#242 admission corpus and ordinary cargo commands: decision unchanged.
 _ADMITTED = [
-    "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/x cargo test --no-run",
+    "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target-alt cargo test --no-run",
     "RUST_LOG=debug cargo build",
     "RUST_BACKTRACE=1 cargo test",
     "CARGO_TERM_COLOR=always cargo clippy",
@@ -95,6 +95,8 @@ _REFUSED_242 = [
     "HTTP_PROXY= cargo build",
     "FOO=1 cargo build",
     "CARGO_INCREMENTAL=0 bash -c 'cargo build'",
+    # cpp#248: an on-list name whose value leaves the worktree.
+    "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/x cargo test --no-run",
 ]
 
 

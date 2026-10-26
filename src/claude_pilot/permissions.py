@@ -53,6 +53,8 @@ from .tier1 import (
     _split_compound_command,
     bash_names_cargo_dir,
     cargo_carries_config,
+    cargo_target_dir_value_is_literal,
+    cargo_target_dir_values,
     git_argument_value_hidden,
     git_option_names_a_program,
     git_option_writes_a_file,
@@ -511,14 +513,53 @@ def _is_sanctioned_readonly_for_loop(command: str) -> bool:
     return bool(_SANCTIONED_READONLY_FOR_LOOP_RE.match(command))
 
 
+def _cargo_target_dir_escapes(command: str, cwd: str | None) -> bool:
+    """Whether a cargo build directory in *command* may land outside the
+    worktree or on the control plane (cpp#248).
+
+    Each value must be literal (`cargo_target_dir_value_is_literal`). With a
+    worktree root it must then resolve inside it, symlinks followed; an
+    absolute path that resolves inside stays admitted (cpp#176). Without one,
+    an absolute path is refused and a relative one is judged on its spelling.
+    Either way the directory must not contain the control plane
+    (`_contains_control_plane`): cargo owns everything under it, and `cargo
+    clean` removes it.
+    """
+    values = cargo_target_dir_values(command)
+    if values is None:
+        return True
+    for v in values:
+        if not cargo_target_dir_value_is_literal(v):
+            return True
+        if cwd is None:
+            rel = os.path.normpath(v.text)
+            if os.path.isabs(rel):
+                return True
+        else:
+            try:
+                root = Path(cwd).resolve(strict=True)
+            except OSError:
+                return True
+            p = Path(v.text)
+            try:
+                rel = (p if p.is_absolute() else root / p).resolve().relative_to(root).as_posix()
+            except ValueError:
+                return True
+        if _contains_control_plane(rel):
+            return True
+    return False
+
+
 def _bash_allow_is_chain_safe(
-    policy: Policy, tool_name: str, tool_input: dict[str, Any]
+    policy: Policy, tool_name: str, tool_input: dict[str, Any], cwd: str | None = None
 ) -> bool:
     """Whether a policy ``allow`` decision is safe to honor.
 
     ``True`` for every non-Bash tool. For Bash, ``True`` only when every
     compound segment is independently tier1-safe or a clean (non-tier3) policy
     allow — so a dangerous command chained onto an allowed prefix is vetoed.
+    ``cwd`` is the worktree root a cargo build directory is confined to
+    (`_cargo_target_dir_escapes`); without it, only a relative one passes.
     """
     if tool_name != "Bash":
         return True
@@ -589,6 +630,11 @@ def _bash_allow_is_chain_safe(
     # Nor one that may write into a `.cargo` directory: cargo reads its
     # config from there. See `bash_names_cargo_dir`.
     if bash_names_cargo_dir(command):
+        return False
+    # Nor one whose build directory leaves the worktree: cargo writes its
+    # whole build there, and `bash-cargo` reads neither `--target-dir` nor the
+    # value of `CARGO_TARGET_DIR=` (cpp#248).
+    if _cargo_target_dir_escapes(command, cwd):
         return False
 
     # Sanctioned `git show <rev>:<path> > <relative-path>` (cpp#35, ref shape
@@ -1075,6 +1121,30 @@ _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^crates/mika-agent/src/well_known_agents\.rs$"),  # mika agent identities
     re.compile(r"^\.mika(/|$)"),                  # ~/.mika runtime config
 )
+
+# The literal path each pattern above protects, one per pattern, for the
+# question the patterns cannot answer: whether a DIRECTORY contains control
+# plane. A cargo build directory is such a directory — `cargo clean` removes it
+# whole — so `--target-dir .` or `--target-dir .github` reaches the control
+# plane without matching any pattern (cpp#248). A test pins the pairing.
+_CONTROL_PLANE_ROOTS: tuple[str, ...] = (
+    ".git",
+    ".github/workflows",
+    ".claude",
+    "skills/bundled",
+    "crates/mika-agent/src/well_known_agents.rs",
+    ".mika",
+)
+
+
+def _contains_control_plane(rel: str) -> bool:
+    """Whether the worktree-relative directory *rel* is, contains, or lies on
+    the control plane. ``.`` is the worktree root, which contains all of it."""
+    if rel == ".":
+        return True
+    if any(p.match(rel) for p in _CONTROL_PLANE_PATTERNS):
+        return True
+    return any(root.startswith(rel + "/") for root in _CONTROL_PLANE_ROOTS)
 
 
 def _segment_redirect_targets(seg: str) -> list[str] | None:
@@ -2647,7 +2717,7 @@ def create_permission_handler(
                 # tier3 search and halts; a merely un-allowlisted segment
                 # (`echo "label"; cmd`, `for … do … done`) is refused and the run
                 # continues.
-                if not _bash_allow_is_chain_safe(policy, tool_name, tool_input):
+                if not _bash_allow_is_chain_safe(policy, tool_name, tool_input, cwd):
                     veto_reason = (
                         f"policy allow ({pd.rule_id}) vetoed — command chains a "
                         "tier3-dangerous or command-substitution tail onto the "
