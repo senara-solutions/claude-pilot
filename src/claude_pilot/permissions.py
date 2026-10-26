@@ -35,6 +35,7 @@ from .heartbeat import emit_heartbeat
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
     _GIT_MERGE_BASE_SUBSTITUTIONS,
+    _blank_heredoc_bodies,
     _is_ce_scratch_variable_ref,
     _is_contained_redirect_target,
     _is_lexically_disqualified_redirect_target,
@@ -66,6 +67,7 @@ from .tier1 import (
     rm_confined_to_pilot_scratch,
     rm_targets_mktemp_scratch,
     sed_i_confined_to_worktree,
+    sed_write_destinations,
     split_is_ambiguous,
 )
 from .transport import invoke_command
@@ -861,6 +863,9 @@ def _bash_allow_is_chain_safe(
 #      the control plane (cpp#42) — including the `~`/`$HOME`/`${HOME}`/
 #      `$OLDPWD` respelling class (cpp#154 D3) and any other disqualified or
 #      unparseable operand, all fail-closed via `_destination_veto_reason`.
+#      cpp#230: a sed `w FILE` / `W FILE` / `s///w FILE` destination is judged
+#      the same way (`_sed_write_veto_reason`); a sed script the reader cannot
+#      parse proves no destination and stays survivable.
 #   3. No parseable `command` at all (missing key or non-string value).
 # Everything else — including an absolute redirect target that actually
 # resolves INSIDE the worktree, and the new `_PROVEN_DANGEROUS_VERB_PATTERNS_
@@ -1553,6 +1558,45 @@ def _is_sanctioned_tmp_scratch(
     return False
 
 
+# GNU sed special files (`/dev/stdout`, `/dev/stderr`) and the inert sink
+# (cpp#130): a `w` to one of them writes no file on disk.
+_SED_W_INERT_DESTINATIONS = frozenset({"/dev/stdout", "/dev/stderr", "/dev/null"})
+
+
+def _sed_write_veto_reason(command: str, cwd: str) -> str | None:
+    """Veto reason for the first sed `w`/`W`/`s///w` destination (cpp#230) that
+    is rooted at an unresolved `$`/`~`, resolves outside the worktree, or lands
+    on the control plane; else ``None``. Same checks, same order, as the
+    cp/mv/mkdir destinations in `_destination_veto_reason`. `/tmp` has no carve:
+    a sed write there is outside the worktree, as for `sed -i`.
+
+    Heredoc bodies are blanked first: `_split_compound_command` cuts on a bare
+    newline, so a body line quoting ``sed 'w /etc/x' f`` would otherwise read as
+    a sed command bash never runs."""
+    text = _blank_heredoc_bodies(command) if "<<" in command else command
+    for seg in _split_compound_command(text):
+        for dest in sed_write_destinations(seg):
+            if dest in _SED_W_INERT_DESTINATIONS:
+                continue
+            if dest.startswith("$") or dest.startswith("~"):
+                return (
+                    f"sed write destination {dest!r} is rooted at an unresolved "
+                    "variable/tilde ($/~) — treated as not contained "
+                    "(cpp#230 / cpp#154 D3 anti-respelling)"
+                )
+            if not is_within_project(dest, cwd):
+                return (
+                    f"sed write destination {dest!r} resolves outside the "
+                    "worktree (cpp#230)"
+                )
+            if _is_control_plane_path(dest, cwd):
+                return (
+                    f"sed write destination {dest!r} is on the agent control "
+                    "plane (cpp#230 / cpp#42 denylist)"
+                )
+    return None
+
+
 def _destination_veto_reason(
     command: str, cwd: str, *, for_lethality: bool = False
 ) -> str | None:
@@ -1611,6 +1655,16 @@ def _destination_veto_reason(
         return None
     if _is_sanctioned_pure_heredoc(command):
         return None
+    # cpp#230 — LETHALITY ONLY. A sed `w FILE` / `W FILE` / `s///w FILE`
+    # destination is a write destination like `sed -i`'s file: proven outside the
+    # worktree or on the control plane, the deny is terminal. Gated on
+    # ``for_lethality`` so every REFUSAL caller is byte-identical to HEAD: the two
+    # admitted sed shapes cannot carry a `w`, and a veto on the allow path would
+    # carry `interrupt=True`.
+    if for_lethality:
+        sed_reason = _sed_write_veto_reason(command, cwd)
+        if sed_reason is not None:
+            return sed_reason
     for seg in _split_compound_command(command):
         kind = _segment_write_kind(seg)
         if kind is None:

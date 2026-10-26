@@ -5774,3 +5774,168 @@ def test_scope_probe_is_bounded_time(monkeypatch: pytest.MonkeyPatch) -> None:
         start = time.perf_counter()
         is_ce_review_scope_probe(cmd)
         assert time.perf_counter() - start < 0.5, cmd[:40]
+
+
+# ── cpp#230: the write destinations of a sed script ───────────────────────────
+#
+# `sed_write_destinations` reads a sed segment the way GNU sed 4.x does and
+# returns every file a `w`/`W` command or an `s///w` flag would open. GNU opens
+# those files when it compiles the script, so a destination counts as soon as it
+# is written, whether or not its address ever matches. An empty list means "no
+# proven destination": a read-only script, an unknown option, `--sandbox`, a
+# `-f` script file, or a script this reader cannot parse.
+
+
+@pytest.mark.parametrize(
+    ("segment", "expected"),
+    [
+        # the command, the `s` flag, and `W`
+        ("sed -n 'w /etc/evil' crates/guards.rs", ["/etc/evil"]),
+        ("sed 's/a/b/w /etc/x' f", ["/etc/x"]),
+        ("sed 'W /etc/x' f", ["/etc/x"]),
+        # the name runs to the end of the line, `;` and `}` included
+        ("sed 's/a/b/w out; p' f", ["out; p"]),
+        ("sed 'w x}' f", ["x}"]),
+        ("sed 'w x\np' f", ["x"]),
+        # whitespace before the name is optional
+        ("sed 'w/etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/gw/etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/gw  /etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/3pIw /etc/x' f", ["/etc/x"]),
+        # labels end at `;`, so the next command is read
+        ("sed ':a;w /etc/x' f", ["/etc/x"]),
+        ("sed 'b e;w /etc/x' f", ["/etc/x"]),
+        ("sed 't;w /etc/x' f", ["/etc/x"]),
+        # ... and at a blank too
+        ("sed -n 'b x w /etc/x' f", ["/etc/x"]),
+        ("sed -n ':x w /etc/x' f", ["/etc/x"]),
+        # blanks before and between the flags of `s`
+        ("sed 's/a/b/ w /etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/g w /etc/x' f", ["/etc/x"]),
+        ("sed 's/a/b/ g p w /etc/x' f", ["/etc/x"]),
+        # a bracket expression is one unit in a regex, not in a replacement
+        ("sed -n '/[/]/w /etc/x' f", ["/etc/x"]),
+        ("sed 's/[/]/x/w /etc/x' f", ["/etc/x"]),
+        ("sed 's/[/]/w /etc/x/' f", []),
+        ("sed 's/[/]/w/' f", []),
+        ("sed 's/[]/]/x/w a' f", ["a"]),
+        ("sed 's/[^]/]/x/w a' f", ["a"]),
+        ("sed 's/[[:alpha:]/]/x/w a' f", ["a"]),
+        ("sed 's/[[.a.]/]/x/w a' f", ["a"]),
+        ("sed 's/[\\]/x/w a' f", ["a"]),
+        ("sed 's/\\[/x/w a' f", ["a"]),
+        ("sed 's/x/[/w a' f", ["a"]),
+        ("sed 'y/[/]/;w a' f", ["a"]),
+        ("sed 's/[[:x/]/X/w a' f", []),  # unterminated class: GNU rejects `s`
+        # what sed compiled before it stopped is already open
+        ("sed -e 'w /etc/x' -e Z f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --sandbox f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --bogus f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' -X f", ["/etc/x"]),
+        ("sed -e 'w /etc/x' --help f", ["/etc/x"]),
+        ("sed --sandbox -e 'w /etc/x' f", []),
+        # addresses, negation, blocks
+        ("sed '1p;w /etc/x' f", ["/etc/x"]),
+        ("sed '/re/I,+2!w /etc/x' f", ["/etc/x"]),
+        ("sed '0,/re/w /etc/x' f", ["/etc/x"]),
+        ("sed '1~2w /etc/x' f", ["/etc/x"]),
+        ("sed '\\%re%Mw /etc/x' f", ["/etc/x"]),
+        ("sed '$ { w /etc/x\n}' f", ["/etc/x"]),
+        ("sed 'y/ab/cd/;w /etc/x' f", ["/etc/x"]),
+        ("sed '1q;w /etc/x' f", ["/etc/x"]),
+        ("sed 'l 5;w /etc/x' f", ["/etc/x"]),
+        ("sed 'v;w /etc/x' f", ["/etc/x"]),
+        ("sed '# c\nw /etc/x' f", ["/etc/x"]),
+        # several destinations, several expressions
+        ("sed -e 'w a' -e 's/x/y/w b' f", ["a", "b"]),
+        ("sed -e '/re/{w /etc/x' -e '}' f", ["/etc/x"]),
+        # every option shape that carries the script
+        ("sed --expression='w /etc/x' f", ["/etc/x"]),
+        ("sed --expression 'w /etc/x' f", ["/etc/x"]),
+        ("sed --expr='w /etc/x' f", ["/etc/x"]),
+        ("sed -e'w /etc/x' f", ["/etc/x"]),
+        ("sed -ne 'w /etc/x' f", ["/etc/x"]),
+        ("sed -nE 'w /etc/x' f", ["/etc/x"]),
+        ("sed -z -s -u -r 'w /etc/x' f", ["/etc/x"]),
+        ("sed -l 5 'w /etc/x' f", ["/etc/x"]),
+        ("sed -l5 'w /etc/x' f", ["/etc/x"]),
+        ("sed --line-length=5 --posix --debug 'w /etc/x' f", ["/etc/x"]),
+        ("sed --in-place=.bak 'w /etc/x' f", ["/etc/x"]),
+        ("sed -ie 's/a/b/w /etc/x' f", ["/etc/x"]),  # `-i` takes `e` as suffix
+        ("sed -- 'w /etc/x' f", ["/etc/x"]),
+        ("sed 2>/dev/null 'w /etc/x' f", ["/etc/x"]),
+        ("sed 2> err 'w /etc/x' f", ["/etc/x"]),
+        ("/usr/bin/sed 'w /etc/x' f", ["/etc/x"]),
+        # no destination
+        ("sed -n '/warning/p' f", []),
+        ("sed -n '/\\w/p' f", []),
+        ("sed 's/w/W/g' f", []),
+        ("sed 's/a/w \\/etc\\/x/' f", []),
+        ("sed 'a w /etc/x' f", []),
+        ("sed 'i\\\nw /etc/x' f", []),
+        ("sed 'r /etc/x' f", []),
+        ("sed 'e w /etc/x' f", []),
+        ("sed 'w' f", []),  # GNU refuses an empty name
+        ("sed -f script.sed f", []),
+        ("sed --file=script.sed f", []),
+        ("sed --sandbox 'w /etc/x' f", []),
+        ("sed --sand 'w /etc/x' f", []),
+        ("sed -X 'w /etc/x' f", []),  # unknown option: GNU does not start
+        ("sed --bogus 'w /etc/x' f", []),
+        ("sed --s 'w /etc/x' f", []),  # ambiguous prefix: GNU does not start
+        ("sed 'k;w /etc/x' f", []),  # unparseable: not proven
+        ("sed 's/a/b' f", []),  # unterminated `s`: not proven
+        ("sed", []),
+        ("sed 'w /etc/x", []),  # unbalanced quote: shlex fails
+        ("grep 'w /etc/x' f", []),
+        ("seds 'w /etc/x' f", []),
+    ],
+)
+def test_cpp230_sed_write_destinations(segment: str, expected: list[str]) -> None:
+    from claude_pilot import tier1
+
+    assert tier1.sed_write_destinations(segment) == expected
+
+
+def test_cpp230_sed_script_reader_is_linear() -> None:
+    """The script reader is a single forward pass (cpp#250 ReDoS lesson): a
+    pathological 20 000-character script of escapes and delimiters is read in
+    well under the bound."""
+    from claude_pilot import tier1
+
+    for script in (
+        "s/" + "\\/" * 10000 + "/x/w /etc/x",
+        "/" + "\\" * 20000,
+        "y/" + "a" * 20000,
+        ";" * 20000 + "w /etc/x",
+    ):
+        start = time.perf_counter()
+        tier1.sed_write_destinations("sed '" + script + "' f")
+        assert time.perf_counter() - start < 0.5, script[:20]
+
+
+def test_cpp230_heredoc_bodies_are_blanked_for_the_sed_reader() -> None:
+    """A line inside a heredoc body is data: bash never runs it as a command.
+    The blanking keeps the line count and leaves every command line intact;
+    an unterminated heredoc runs to the end, as bash reads it."""
+    from claude_pilot import tier1
+
+    blank = tier1._blank_heredoc_bodies
+    assert blank("cat > x <<'EOF'\nsed 'w /etc/x' f\nEOF\nls") == (
+        "cat > x <<'EOF'\n\nEOF\nls"
+    )
+    assert blank("cat <<EOF\nsed 'w /etc/x' f\nEOF") == "cat <<EOF\n\nEOF"
+    assert blank("cat <<-EOF\n\tsed 'w /etc/x' f\n\tEOF\nsed 'w a' f") == (
+        "cat <<-EOF\n\n\tEOF\nsed 'w a' f"
+    )
+    assert blank("cat <<'EOF'\nsed 'w /etc/x' f") == "cat <<'EOF'\n"
+    assert blank("sed 'w /etc/x' f") == "sed 'w /etc/x' f"
+
+
+def test_cpp230_hint_names_the_sed_write_destination() -> None:
+    """The model-facing hint says a sed `w FILE` outside the worktree ends the
+    session, in the same bullet as `sed -i`."""
+    from claude_pilot import tier1
+
+    assert "`w FILE`" in tier1._SED_INPLACE_BULLET
+    assert tier1._SED_INPLACE_BULLET in DENIED_BASH_PATTERNS_HINT

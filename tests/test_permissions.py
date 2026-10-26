@@ -5736,3 +5736,172 @@ def test_handler_refuses_base_outside_the_probe_shape(
     handler = _bundled_policy_handler(monkeypatch, tmp_path)
     result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
     assert isinstance(result, PermissionResultDeny), result
+
+
+# ── cpp#230: a sed `w FILE` write outside the worktree is a terminal deny ─────
+#
+# `w FILE` / `W FILE` commands and the `w FILE` flag of `s///` write an
+# arbitrary file, exactly like `sed -i` on that file. Before cpp#230 every such
+# form was refused (sed is not admitted) but NON-terminal, while `sed -i` on the
+# same out-of-worktree path ended the session. The destination now goes through
+# `_destination_veto_reason` (lethality question only), so an escaping or
+# control-plane destination is terminal and a contained one stays survivable.
+
+
+def _sed_w_worktree(tmp_path: Path) -> str:
+    worktree = tmp_path / "wt"
+    (worktree / ".git" / "hooks").mkdir(parents=True)
+    (worktree / ".pilot-scratch").mkdir()
+    (worktree / "crates").mkdir()
+    return str(worktree)
+
+
+_CPP230_TERMINAL = [
+    # the ticket's constat and the brief's variants
+    "sed -n 'w /etc/evil' crates/guards.rs",
+    "sed 'w /tmp/x' f",
+    "sed -e 's/a/b/w /etc/x' f",
+    "sed --expression='s/a/b/w /etc/x' f",
+    "sed 'W /etc/x' f",
+    "sed 's/a/b/w /etc/x' f",
+    # every way GNU sed receives a script
+    "sed --expression 'w /etc/x' f",
+    "sed --expr='w /etc/x' f",
+    "sed -ne 'w /etc/x' f",
+    "sed -nE 'w /etc/x' f",
+    "sed -E 's/a/b/w /etc/x' f",
+    "sed -z 'w /etc/x' f",
+    "sed -l 5 'w /etc/x' f",
+    "sed -ie 's/a/b/w /etc/x' f",
+    "sed 2>/dev/null 'w /etc/x' f",
+    "/usr/bin/sed 'w /etc/x' f",
+    # script grammar: no space before the name, `;`-ended labels, blocks
+    "sed 'w/etc/x' f",
+    "sed 's/a/b/gw/etc/x' f",
+    "sed 's|a|b|gw /etc/x' f",
+    "sed '1p;w /etc/x' f",
+    "sed ':a;w /etc/x' f",
+    "sed 'b e;w /etc/x' f",
+    "sed -e '/re/{w /etc/x' -e '}' f",
+    # destinations: traversal, respelling, control plane, chained segment
+    "sed 'w ../../x' f",
+    'sed "w $HOME/x" f',
+    "sed 'w ~/x' f",
+    "sed 'w .git/hooks/pre-commit' f",
+    "echo a && sed 'w /etc/x' f",
+    # forms the code review measured on GNU sed 4.10
+    "sed -n 'b x w /etc/x' f",
+    "sed 's/a/b/ w /etc/x' f",
+    "sed -n '/[/]/w /etc/x' f",
+    "sed -e 'w /etc/x' -e Z f",
+    "sed -e 'w /etc/x' --bogus f",
+    # the `sed -i` carve never launders a `w` write
+    "sed -i 's/a/b/w /etc/x' src/x.rs",
+    "sed -i 's/a/b/' src/x.rs; sed 'w /etc/x' f",
+]
+
+_CPP230_SURVIVABLE = [
+    # destination under the worktree (the ticket's negative control)
+    "sed -n 'w .pilot-scratch/x' f",
+    "sed 's/a/b/w out.txt' f",
+    # GNU special files and read-only scripts
+    "sed -n 'w /dev/stdout' f",
+    "sed -n 'w /dev/stderr' f",
+    "sed -n 'w /dev/null' f",
+    "sed 's/[/]/w/' f",  # `[/]` is a bracket: this replaces `/`, writes nothing
+    "sed -n '/warning/p' f",
+    "sed -n '/\\w/p' f",
+    "sed 's/w/W/g' f",
+    "sed -n '1,5p' f",
+    # a `w` that is text, not a command
+    "sed 'a w /etc/x' f",
+    "sed 's/a/w \\/etc\\/x/' f",
+    # scripts sed cannot write from, or that cannot be read lexically
+    "sed -f script.sed f",
+    "sed --sandbox 'w /etc/x' f",
+    "sed $'\\x77 /etc/x' f",  # declared residual: ANSI-C quoting hides the `w`
+    # a sed line in a heredoc body is data, never a command
+    "cat > docs/x.md <<'EOF'\nsed 'w /etc/x' f\nEOF",
+    "git commit -F - <<'EOF'\nfix\n\nsed 'w /etc/x' f\nEOF",
+    # existing `sed -i` witnesses keep their verdicts
+    "sed -i 's/a/b/' src/x.rs",
+]
+
+
+@pytest.mark.parametrize("command", _CPP230_TERMINAL)
+def test_cpp230_sed_write_outside_worktree_is_terminal(
+    tmp_path: Path, command: str
+) -> None:
+    wt = _sed_w_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": command}, wt)
+        is True
+    )
+
+
+@pytest.mark.parametrize("command", _CPP230_SURVIVABLE)
+def test_cpp230_sed_write_inside_worktree_stays_survivable(
+    tmp_path: Path, command: str
+) -> None:
+    wt = _sed_w_worktree(tmp_path)
+    assert (
+        permissions_module._denial_is_terminal("Bash", {"command": command}, wt)
+        is False
+    )
+
+
+def test_cpp230_contained_and_escaping_destination_in_one_test(
+    tmp_path: Path,
+) -> None:
+    """The ticket's test, as written: the same `w` command is terminal when its
+    file escapes the worktree and survivable when it lands under it, and
+    `sed -i` out of the worktree stays terminal beside them."""
+    wt = _sed_w_worktree(tmp_path)
+    f = permissions_module._denial_is_terminal
+    assert f("Bash", {"command": "sed 's/a/b/w /etc/x' f"}, wt) is True
+    assert f("Bash", {"command": "sed 'w /etc/x' f"}, wt) is True
+    assert f("Bash", {"command": "sed 'w .pilot-scratch/x' f"}, wt) is False
+    assert f("Bash", {"command": "sed -i 's/a/b/' /etc/x"}, wt) is True
+
+
+def test_cpp230_sed_write_symlink_escape_is_terminal(tmp_path: Path) -> None:
+    """A relative `w` destination routed through an outbound symlink resolves
+    outside the worktree: `is_within_project` follows it."""
+    wt = _sed_w_worktree(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (Path(wt) / "esc").symlink_to(outside, target_is_directory=True)
+    assert (
+        permissions_module._denial_is_terminal(
+            "Bash", {"command": "sed 'w esc/x' f"}, wt
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed 'w /etc/x' f",
+        "sed -n '/warn/p' f",
+        "grep -n x f; sed -n '/warn/p' f",
+    ],
+)
+def test_cpp230_refusal_question_is_unchanged(tmp_path: Path, command: str) -> None:
+    """The sed destination check answers the LETHALITY question only: on the
+    refusal question (`for_lethality=False`, every admission caller) the
+    verdict is the one HEAD returns, so no admission decision moves."""
+    wt = _sed_w_worktree(tmp_path)
+    assert permissions_module._destination_veto_reason(command, wt) is None
+
+
+def test_cpp230_admitted_print_only_sed_is_still_admitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`sed -n '<addr>p'` is admitted (`_is_safe_sed_print_only`); a `w` inside
+    its regex is a letter, not a write, and the command stays allowed."""
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(
+        handler("Bash", {"command": "sed -n '/warn/p' f"}, _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultAllow), result
