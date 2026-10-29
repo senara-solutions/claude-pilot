@@ -1321,12 +1321,13 @@ def _sdk_guardrail_kwargs(config: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if config.maxTurns > 0:
         kwargs["max_turns"] = config.maxTurns
-    # maxBudgetUsd is TS-SDK-specific; the Python SDK accepts it via
-    # permission_mode/options extras if exposed. Include defensively.
+    # cpp#197: the dollar cap is enforced by the CLI (`--max-budget-usd`), which
+    # stops the run with a real `error_max_budget_usd` result once its cost
+    # ledger reaches the cap. There is no application-level cost guard behind
+    # it: leaving this kwarg out means no dollar cap at all. The ledger is an
+    # API-equivalent estimate, computed under subscription auth too.
     if config.maxBudgetUsd > 0:
-        # Attribute name varies by SDK version; set if the option exists.
-        # Leaving it out is safe — application-level guardrails still apply.
-        pass
+        kwargs["max_budget_usd"] = config.maxBudgetUsd
     return kwargs
 
 
