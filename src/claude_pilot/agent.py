@@ -24,6 +24,11 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import (
     AssistantMessage,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    PostToolUseFailureHookSpecificOutput,
+    PostToolUseHookSpecificOutput,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
@@ -497,6 +502,9 @@ async def _run_agent_inner(
     config = guardrails.config
 
     log_guardrail_config(config)
+    # Built once per session: a deny-resume reuses these options, so the
+    # one-shot notice is not re-armed by a resume.
+    turns_notice_hook = _create_turns_remaining_notice_hook(guardrails)
 
     options = ClaudeAgentOptions(
         permission_mode="default",
@@ -542,7 +550,11 @@ async def _run_agent_inner(
                         )
                     ],
                 )
-            ]
+            ],
+            # cpp#289: tell the model, once, that the turn cap is near. Both
+            # post-tool events, so a turn whose tool failed still crosses it.
+            "PostToolUse": [HookMatcher(hooks=[turns_notice_hook])],
+            "PostToolUseFailure": [HookMatcher(hooks=[turns_notice_hook])],
         },
         # cpp#187: raise the SDK reader's per-message buffer guard from its
         # 1MB default to a named ceiling. The guard (subprocess_cli.py
@@ -1329,6 +1341,65 @@ def _sdk_guardrail_kwargs(config: Any) -> dict[str, Any]:
     if config.maxBudgetUsd > 0:
         kwargs["max_budget_usd"] = config.maxBudgetUsd
     return kwargs
+
+
+# cpp#289: turns left before `maxTurns` at which the model is told, once, to
+# land its work. Three implementation pilots died on `error_max_turns` on
+# 2026-10-14 with their work committed and no PR (mika#2693): the session never
+# saw its own turn count.
+TURNS_REMAINING_NOTICE = 50
+
+
+def turns_remaining_notice_text(turns_left: int) -> str:
+    """Kept short on purpose: the cache re-reads it on every later turn."""
+    return (
+        f"[claude-pilot] {turns_left} turns left before maxTurns. "
+        "Commit, push, skip to the end of the pipeline (verify, compound, PR)."
+    )
+
+
+def _create_turns_remaining_notice_hook(guardrails: SessionGuardrails) -> Any:
+    """Post-tool hook that injects the notice once the main loop reaches
+    `maxTurns - TURNS_REMAINING_NOTICE`.
+
+    `guardrails.turns` counts the main loop only (cpp#259), the unit of the
+    SDK's `maxTurns`. A call from inside a subagent (`agent_id` set) is
+    ignored: the notice would reach the subagent, not the pilot, and would
+    spend the single injection. A cap at or under the notice distance is
+    disarmed: the notice would fire on the first tool, which is not a warning
+    about the end.
+    """
+    injected = False
+
+    async def hook(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> HookJSONOutput:
+        nonlocal injected
+        max_turns = guardrails.config.maxTurns
+        if injected or max_turns <= TURNS_REMAINING_NOTICE:
+            return {}
+        if input_data.get("agent_id"):
+            return {}
+        turns = guardrails.turns
+        if turns < max_turns - TURNS_REMAINING_NOTICE:
+            return {}
+        injected = True
+        turns_left = max_turns - turns
+        log_guardrail(
+            "turns_remaining_notice",
+            f"injected at turn {turns}/{max_turns} ({turns_left} left)",
+        )
+        text = turns_remaining_notice_text(turns_left)
+        output: PostToolUseHookSpecificOutput | PostToolUseFailureHookSpecificOutput
+        if input_data.get("hook_event_name") == "PostToolUseFailure":
+            output = {"hookEventName": "PostToolUseFailure", "additionalContext": text}
+        else:
+            output = {"hookEventName": "PostToolUse", "additionalContext": text}
+        return {"hookSpecificOutput": output}
+
+    return hook
 
 
 def _on_boundary(event: TurnBoundaryEvent) -> None:
