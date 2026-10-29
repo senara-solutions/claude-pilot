@@ -48,6 +48,20 @@ class GuardrailConfig(BaseModel):
     # generous budget and its own abort reason, but it still gets a bound — an
     # exemption would make a session that never resumes immortal, which is the
     # zombie cpp#133 exists to prevent. 0 = no ceiling (wait indefinitely).
+    #
+    # cpp#146 — the values are derived and measured, not borrowed. Both only
+    # act during a SILENCE longer than `idleTimeoutMs`: a busy subagent keeps
+    # rearming the deadline (one ran 2066 s without tripping anything).
+    # Measured 2026-10-29 over the timestamped logs since 2026-09-10:
+    #   - tool: 294 silent waits >= 300 s, the longest 1680 s — a
+    #     `gh pr checks --watch` run to the Bash cap. The ceiling (1800 s) is set
+    #     ABOVE `BASH_MAX_TIMEOUT_MS` (1680 s, agent.py) so a command allowed to
+    #     run to that cap is never killed by the pilot first; a "2x p95" value
+    #     would kill every long build, the p95 of tool durations being seconds.
+    #     `test_wait_ceilings_derivation.py` holds the two constants together.
+    #   - model: 143 silent waits >= 300 s, the longest 512 s; 900 s is 1.76x.
+    # Neither has fired once in that window. `scripts/measure-wait-silences.py`
+    # re-measures both.
     toolWaitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
     modelWaitCeilingMs: int | None = Field(default=None, ge=0, le=21_600_000)
 
