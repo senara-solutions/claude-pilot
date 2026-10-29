@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from .agent import run_agent
 from .guardrails import SessionGuardrails, resolve_guardrail_defaults
-from .logger import close_file_log, init_file_log
+from .logger import close_file_log, flush_log, init_file_log, start_background_writer
 from .permissions import create_permission_handler
 from .shell import run_shell
 from .types import GuardrailConfig, PilotConfig, ResultJson
@@ -201,6 +201,8 @@ def main() -> None:
     ns = parser.parse_args()
     _validate_args(ns, parser)
     prompt = _collect_prompt(parser, ns, required=not ns.interactive)
+    # cpp#171: log I/O leaves the event-loop thread for the whole run.
+    start_background_writer()
 
     if ns.verbose:
         log_env(str(env_path), loaded, count)
@@ -258,10 +260,12 @@ def main() -> None:
             )
         )
     except KeyboardInterrupt:
+        flush_log()
         sys.stderr.write("\nShutting down...\n")
         close_file_log()
         sys.exit(130)
     except Exception as err:
+        flush_log()
         _emit_fatal(str(err))
         traceback.print_exc(file=sys.stderr)
         close_file_log()
@@ -305,10 +309,12 @@ def _run_interactive(
             )
         )
     except KeyboardInterrupt:
+        flush_log()
         sys.stderr.write("\nShutting down...\n")
         close_file_log()
         sys.exit(130)
     except Exception as err:
+        flush_log()
         sys.stderr.write(f"Fatal: {err}\n")
         traceback.print_exc(file=sys.stderr)
         close_file_log()
