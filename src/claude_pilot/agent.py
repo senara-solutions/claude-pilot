@@ -40,7 +40,7 @@ from claude_agent_sdk.types import (
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
 from .heartbeat import emit_heartbeat, emit_heartbeat_throttled
 from .inbox_writer import post_handoff
-from .permissions import CanUseTool, create_subagent_model_inherit_hook
+from .permissions import CanUseTool, _summarize_input, create_subagent_model_inherit_hook
 from .tier1 import DENIED_BASH_PATTERNS_HINT
 from .transcript_writer import record_sdk_message
 from .types import PilotConfig, ResultJson
@@ -56,6 +56,7 @@ from .ui import (
     log_prompt,
     log_reconnect,
     log_text,
+    log_tool_use,
     log_turn_summary,
     log_unhandled_message,
     log_verbose,
@@ -499,6 +500,8 @@ async def _run_agent_inner(
     start_time = time.monotonic()
     session_id: str | None = None
     seen_init: bool = False
+    # cpp#184: tool_use ids already logged, so a block is logged once.
+    logged_tool_use_ids: set[str] = set()
     config = guardrails.config
 
     log_guardrail_config(config)
@@ -794,10 +797,12 @@ async def _run_agent_inner(
                                     min_interval_secs=_HEARTBEAT_TURN_THROTTLE_SECS,
                                     meta={"task_id": task_id} if task_id else None,
                                 )
+                            is_subagent = getattr(message, "parent_tool_use_id", None) is not None
                             for block in _content_blocks(message):
                                 text = _text_of(block)
                                 if text:
                                     log_text(text)
+                                _log_tool_use_once(block, logged_tool_use_ids, is_subagent)
                             continue
 
                         if isinstance(message, ResultMessage):
@@ -1423,6 +1428,42 @@ def _content_blocks(message: AssistantMessage) -> list[Any]:
     msg = getattr(message, "message", message)
     content = getattr(msg, "content", None) or getattr(message, "content", None)
     return content if isinstance(content, list) else []
+
+
+def _tool_use_of(block: Any) -> tuple[str, str, dict[str, Any]] | None:
+    """(id, name, input) of a tool_use block, either shape (see `_text_of`)."""
+    if isinstance(block, dict):
+        if block.get("type") != "tool_use":
+            return None
+        bid, name, inp = block.get("id"), block.get("name"), block.get("input")
+    else:
+        t = getattr(block, "type", None)
+        if t != "tool_use" and type(block).__name__ != "ToolUseBlock":
+            return None
+        bid = getattr(block, "id", None)
+        name = getattr(block, "name", None)
+        inp = getattr(block, "input", None)
+    if not isinstance(name, str):
+        return None
+    return (str(bid or ""), name, inp if isinstance(inp, dict) else {})
+
+
+def _log_tool_use_once(block: Any, logged_ids: set[str], subagent: bool) -> None:
+    """cpp#184: log every tool call from the stream, the only place that sees
+    them all. A tool admitted upstream of `can_use_tool` (settings allow rules,
+    Read/Glob/Grep) left no line at all: pilot 67156183 made 15 calls and its
+    log showed one. Newlines are folded so a multi-line command stays on one
+    grep-able line (cpp#262)."""
+    tool_use = _tool_use_of(block)
+    if tool_use is None:
+        return
+    bid, name, inp = tool_use
+    if bid and bid in logged_ids:
+        return
+    if bid:
+        logged_ids.add(bid)
+    detail = " ".join(_summarize_input(name, inp).split())
+    log_tool_use(name, detail, subagent=subagent)
 
 
 def _text_of(block: Any) -> str | None:
