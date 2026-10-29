@@ -79,6 +79,12 @@ def log_config(cwd: str, config_path: str, found: bool, relay: bool) -> None:
     _log(f"{DIM}[config]{RESET} cwd={cwd} config={config_path} [{status}] relay={relay_str}")
 
 
+def log_tool_use(tool_name: str, detail: str, *, subagent: bool) -> None:
+    """cpp#184: one line per tool call the model makes, whatever admitted it."""
+    who = " (subagent)" if subagent else ""
+    _log(f"{DIM}[tool:use]{RESET}{who} {BOLD}{tool_name}{RESET}: {detail}")
+
+
 def log_tool_request(tool_name: str, detail: str) -> None:
     _log(f"{DIM}[tool:request]{RESET} {BOLD}{tool_name}{RESET}: {detail}")
 
