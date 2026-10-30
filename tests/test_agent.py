@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
     SystemMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
@@ -1317,9 +1318,11 @@ async def test_user_message_branch_rearms_idle_and_logs_debug(
         lambda n=1: calls.append(f"note_activity({n})"),
     )
 
+    # cpp#184: a real tool-result block. A plain string is not a tool result
+    # and is now logged as `[user:message]`, not with the line asserted below.
     messages: list[Any] = [
         _init(),
-        UserMessage(content="tool result"),
+        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="ok")]),
         _result(),
     ]
     _install_fake_client(monkeypatch, messages)

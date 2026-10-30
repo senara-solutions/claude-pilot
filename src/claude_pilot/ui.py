@@ -85,6 +85,13 @@ def log_tool_use(tool_name: str, detail: str, *, subagent: bool) -> None:
     _log(f"{DIM}[tool:use]{RESET}{who} {BOLD}{tool_name}{RESET}: {detail}")
 
 
+def log_user_message_without_tool_result(origin: str, content: str) -> None:
+    """cpp#184: a user message that carries no tool result is named, not
+    logged as one. Its text is never written: only where it came from and its
+    shape."""
+    _log(f"{DIM}[user:message]{RESET} no tool result: origin={origin}, content={content}")
+
+
 def log_tool_request(tool_name: str, detail: str) -> None:
     _log(f"{DIM}[tool:request]{RESET} {BOLD}{tool_name}{RESET}: {detail}")
 

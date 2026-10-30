@@ -13,7 +13,13 @@ import re
 from typing import Any
 
 import pytest
-from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 
 from claude_pilot.agent import run_agent
 from claude_pilot.guardrails import SessionGuardrails
@@ -128,3 +134,111 @@ async def test_a_secret_in_a_command_is_scrubbed(
 
     assert len(lines) == 1
     assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in lines[0]
+
+
+# cpp#184, residue of defect 1: every `UserMessage` was logged as a tool result.
+# Over the first 22 pilots after cpp#311, 40 such lines had no tool waiting:
+# they arrived ~2 min after the previous result and the log could not say what
+# they were. A message without a tool result now has its own line.
+
+_HISTORIC = "[debug] user message (tool result) received"
+
+
+async def _full_log_of(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], messages: list[Any]
+) -> list[str]:
+    _install_fake_client(monkeypatch, [_init(), *messages, _result()])
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=True,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+    return _ANSI.sub("", capsys.readouterr().err).splitlines()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_keeps_the_historic_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = await _full_log_of(
+        monkeypatch,
+        capsys,
+        [
+            _tool_use("t1", "Read", {"file_path": "a"}, "m1"),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="ok")]),
+        ],
+    )
+
+    assert sum(line.endswith(_HISTORIC) for line in log) == 1
+    assert not any("[user:message]" in line for line in log)
+
+
+@pytest.mark.asyncio
+async def test_a_message_without_tool_result_is_named_not_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = await _full_log_of(
+        monkeypatch,
+        capsys,
+        [
+            UserMessage(
+                content=[TextBlock(text="continue"), TextBlock(text="now")],
+                origin={"kind": "auto-continuation"},
+            )
+        ],
+    )
+
+    assert not any(line.endswith(_HISTORIC) for line in log)
+    named = [line for line in log if "[user:message]" in line]
+    assert len(named) == 1
+    assert named[0].endswith(
+        "[user:message] no tool result: origin=auto-continuation, content=2 text (11 chars)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_string_message_without_origin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = await _full_log_of(monkeypatch, capsys, [UserMessage(content="hello")])
+
+    named = [line for line in log if "[user:message]" in line]
+    assert len(named) == 1
+    assert named[0].endswith("no tool result: origin=none, content=str (5 chars)")
+
+
+@pytest.mark.asyncio
+async def test_the_message_text_never_reaches_the_log(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    log = await _full_log_of(
+        monkeypatch,
+        capsys,
+        [
+            UserMessage(content=f"token {secret}", origin={"kind": "peer", "body": secret}),
+            UserMessage(content=[TextBlock(text=secret)]),
+        ],
+    )
+
+    assert sum("[user:message]" in line for line in log) == 2
+    assert not any(secret in line for line in log)
+
+
+@pytest.mark.asyncio
+async def test_a_hostile_origin_kind_is_reduced_to_safe_characters(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = await _full_log_of(
+        monkeypatch,
+        capsys,
+        [UserMessage(content="x", origin={"kind": "peer\n\x1b[31m[done] Success"})],
+    )
+
+    named = [line for line in log if "[user:message]" in line]
+    assert len(named) == 1
+    assert "origin=peer31mdoneSuccess," in named[0]
+    assert not any(line.startswith("[done] Success") for line in log)
