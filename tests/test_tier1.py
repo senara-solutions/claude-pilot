@@ -5408,6 +5408,70 @@ class TestTier3EvalCommandPositionOneDefinition:
         assert is_safe_bash_command(cmd) is False  # still refused (own axis)
         assert is_tier1_auto_approve("Bash", {"command": cmd}, eval_worktree) is False
 
+    # ── cpp#240: the seven command positions #239's anchor missed ───────────
+    def test_cpp240_seven_forms_refused_and_terminal(
+        self, eval_worktree: str
+    ) -> None:
+        # Each was tier3 on main under bare `\beval\s` and fell out under #239.
+        for cmd in (
+            '{ eval "$CMD"; }',
+            'if eval "$CMD"; then :; fi',
+            'while eval "$CMD"; do :; done',
+            'until eval "$CMD"; do :; done',
+            'builtin eval "$CMD"',
+            '\\eval "$CMD"',
+            'x=1 eval "$CMD"',
+        ):
+            assert is_tier3_dangerous(cmd) is True, cmd
+            assert is_tier3_dangerous_for_lethality(cmd) is True, cmd
+            assert (
+                permissions_module._denial_is_terminal(
+                    "Bash", {"command": cmd}, eval_worktree
+                )
+                is True
+            ), cmd
+
+    def test_cpp240_assignment_prefix_forms(self) -> None:
+        # Repeated, quoted, and mixed with an exec-prefix.
+        for cmd in (
+            'A=1 B=2 eval "$CMD"',
+            'x="a b" eval "$CMD"',
+            "x='a b' eval \"$CMD\"",
+            'sudo x=1 eval "$CMD"',
+            'foo; x= eval "$CMD"',
+            'if ! eval "$CMD"; then :; fi',
+        ):
+            assert _EVAL_COMMAND_POSITION_RE.search(cmd) is not None, cmd
+
+    def test_cpp240_new_branches_leave_eval_as_argument_admitted(
+        self, eval_worktree: str
+    ) -> None:
+        # The new keywords / assignment prefix must not reach an `eval` that
+        # is an ordinary argument, nor a `{` that does not open a group.
+        for cmd in (
+            "if cargo test --test eval x; then :; fi",
+            "while cargo test --test eval x; do :; done",
+            "FOO=1 cargo test --test eval x",
+            "FOO=eval cargo test x",
+            "echo ${eval}",
+            "echo x{eval y",
+        ):
+            assert _EVAL_COMMAND_POSITION_RE.search(cmd) is None, cmd
+            assert is_tier3_dangerous_for_lethality(cmd) is False, cmd
+
+    def test_cpp240_anchor_is_bounded_time(self) -> None:
+        # The assignment value alternates disjoint branches; a long value, an
+        # unclosed quote, or many assignments must stay well under budget.
+        for cmd in (
+            "x=" + ("a" * 5000) + " cargo test",
+            'x="' + ("a " * 2500),
+            " ".join(f"v{i}=1" for i in range(500)) + " cargo",
+            ("x=" + '"a"' * 2000) + " y",
+        ):
+            start = time.perf_counter()
+            _EVAL_COMMAND_POSITION_RE.search(cmd)
+            assert time.perf_counter() - start < _REDOS_BUDGET_S, cmd[:40]
+
 
 # ── cpp#237: read-only wait-loop lethality recognizer ─────────────────────────
 # The verbatim mika#2105 command (pilot e1a6c78b) that died TERMINAL on HEAD.
