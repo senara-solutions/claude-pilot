@@ -181,11 +181,17 @@ _FD_DEVNULL_RE = re.compile(r"\b\d+>/dev/null(?![/\w.])")
 # xargs`). cpp#234 WIDENED anchor (backtick / keywords / exec-prefixes) so a real
 # `eval` behind `sudo`/`env`/`` ` ``/`then` stays flagged. The `env` prefix only
 # matches `env … eval`, never `env VAR= cargo` (a different rule refuses that).
+# cpp#240 adds the positions #239 still missed: `if|while|until`, a group-opening
+# `{` (only when followed by a blank and not glued to a word or `$`, so `${eval}`
+# stays out), the `builtin` prefix, a repeatable `NAME=val` assignment prefix
+# (quoted values included), and `\eval`. The value's three branches are disjoint,
+# so a long or unclosed value backtracks linearly.
 _EVAL_COMMAND_POSITION_RE: re.Pattern[str] = re.compile(
-    r"(?:^|[|&;\n(`]|(?:\b(?:then|do|else|elif)|!)\s+)"
+    r"(?:^|[|&;\n(`]|(?:\b(?:then|do|else|elif|if|while|until)|!|(?<![\w$])\{)\s+)"
     r"\s*"
-    r"(?:(?:sudo|env|exec|command|nohup|time|xargs)(?:\s+-\S+)*\s+)*"
-    r"eval\s"
+    r"(?:(?:(?:sudo|env|exec|command|nohup|time|xargs|builtin)(?:\s+-\S+)*"
+    r"|[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s\"'])*)\s+)*"
+    r"\\?eval\s"
 )
 
 
