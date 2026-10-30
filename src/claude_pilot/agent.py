@@ -9,9 +9,11 @@ to stdout when the session ends (success, error, or guardrail abort).
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Literal
@@ -59,6 +61,7 @@ from .ui import (
     log_tool_use,
     log_turn_summary,
     log_unhandled_message,
+    log_user_message_without_tool_result,
     log_verbose,
 )
 
@@ -713,7 +716,13 @@ async def _run_agent_inner(
                             # one when several returned would leave phantom tools
                             # outstanding and hold the session to the tool ceiling.
                             guardrails.note_activity(_tool_result_count(message))
-                            if verbose:
+                            # cpp#184: only a message that carries a tool result is
+                            # logged as one. The others (40 over the first 22 pilots
+                            # after cpp#311, each ~2 min after the previous result)
+                            # were indistinguishable from a tool result in the log.
+                            if not _carries_tool_result(message):
+                                log_user_message_without_tool_result(*_user_message_shape(message))
+                            elif verbose:
                                 log_verbose("user message (tool result) received")
                             continue
 
@@ -1220,6 +1229,53 @@ def _tool_result_count(message: UserMessage) -> int:
         return 1
     count = sum(1 for block in content if _tool_result_block(block))
     return count if count > 0 else 1
+
+
+def _carries_tool_result(message: UserMessage) -> bool:
+    """cpp#184: whether a `UserMessage` carries at least one tool_result block.
+    Unlike `_tool_result_count`, no conservative floor: this decides what the
+    log says, not how many tool waits are retired."""
+    content = getattr(message, "content", None)
+    return isinstance(content, list) and any(_tool_result_block(b) for b in content)
+
+
+_ORIGIN_KIND_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _user_message_shape(message: UserMessage) -> tuple[str, str]:
+    """cpp#184: (origin, content shape) of a user message, never its text.
+
+    `origin.kind` is whatever the CLI sent, including kinds this SDK does not
+    model, so it is reduced to `[A-Za-z0-9_-]` and capped before it reaches a
+    log line. The content is described by type and total text length: a peer
+    message carries a body, and an injected turn can quote anything."""
+    origin = getattr(message, "origin", None)
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    origin_str = _ORIGIN_KIND_UNSAFE.sub("", kind)[:32] if isinstance(kind, str) else ""
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        shape = f"str ({len(content)} chars)"
+    elif isinstance(content, list):
+        kinds = collections.Counter(_block_kind(b) for b in content)
+        chars = sum(len(t) for t in (_text_of(b) for b in content) if t is not None)
+        shape = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) or "empty"
+        shape = f"{shape} ({chars} chars)"
+    else:
+        shape = type(content).__name__
+    return origin_str or "none", shape
+
+
+def _block_kind(block: Any) -> str:
+    """Wire type of a content block, dict-shaped or dataclass (cpp#145 idiom)."""
+    block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+    if isinstance(block_type, str):
+        return _ORIGIN_KIND_UNSAFE.sub("", block_type)[:32] or "unknown"
+    return {
+        "TextBlock": "text",
+        "ToolUseBlock": "tool_use",
+        "ToolResultBlock": "tool_result",
+        "ThinkingBlock": "thinking",
+    }.get(type(block).__name__, "unknown")
 
 
 def _tool_result_block(block: Any) -> bool:
