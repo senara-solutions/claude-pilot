@@ -6072,9 +6072,12 @@ def test_mika3030_pr_edit_rule_runs_in_bounded_time(command: str) -> None:
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
 
 
-# `gh pr create` left Tier 1 so that its --body-file gets the same path filter.
-# Positive witnesses: the pipeline's measured forms (196 segments across the
+# `gh pr create` stays in Tier 1, but only in the closed form
+# `tier1._GH_PR_CREATE_RE`, which confines its --body-file the same way.
+# Positive witnesses: the pipeline's measured forms (190 segments across the
 # pilot transcripts, every --body-file `pr-body.md`), plus /tmp/pr-body-<N>.md.
+# Replayed against those 190 segments, the gate admits all of them, as main
+# does; through the whole callback it admits the same 188 of 189 commands.
 
 
 @pytest.mark.parametrize(
@@ -6085,6 +6088,12 @@ def test_mika3030_pr_edit_rule_runs_in_bounded_time(command: str) -> None:
         'gh pr create --base main --head feat/x --title "t" --body-file pr-body.md',
         'gh pr create --title "t" --body-file /tmp/pr-body-3030.md --base main --head feat/x --draft',
         'gh pr create --help 2>&1 | grep -A2 -i "reviewer"',
+        # The measured regression of 251292d: 17 of the 190 real calls carry
+        # an escaped backtick in a double-quoted title, 7 of them with the
+        # pipeline's --repo form. Titles built here, not copied.
+        'gh pr create --repo senara-solutions/mika --base main --head fix/a --title "fix(x): the \\`y\\` step" --body-file pr-body.md 2>&1 | tail -5',
+        'gh pr create --title "fix(x): the \\`y\\` step" --body-file pr-body.md --base main --head fix/a',
+        'gh pr create --title "chore: cost \\$5 \\"quoted\\"" --body-file pr-body.md --base main',
     ],
 )
 def test_mika3030_pr_create_pipeline_forms_are_admitted(
@@ -6106,6 +6115,10 @@ def test_mika3030_pr_create_pipeline_forms_are_admitted(
         'gh pr create --title "$(id)" --body-file pr-body.md',
         "gh pr create --web",
         "gh pr create --title t --body-file pr-body.md extra",
+        # a bare backtick or `$(` is a substitution, escaped pairs aside:
+        # `\\\\` is a literal backslash, so the `$(` after it runs
+        'gh pr create --title "fix `id`" --body-file pr-body.md',
+        'gh pr create --title "fix \\\\$(id)" --body-file pr-body.md',
     ],
 )
 def test_mika3030_pr_create_beyond_its_filter_is_refused(
@@ -6127,5 +6140,11 @@ def test_mika3030_pr_create_beyond_its_filter_is_refused(
     ],
 )
 def test_mika3030_pr_create_rule_runs_in_bounded_time(command: str) -> None:
-    elapsed = _mika3030_rule_search_seconds("bash-gh-pr-create", command)
+    import time
+
+    from claude_pilot.tier1 import _GH_PR_CREATE_RE
+
+    start = time.perf_counter()
+    _GH_PR_CREATE_RE.fullmatch(command)
+    elapsed = time.perf_counter() - start
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"

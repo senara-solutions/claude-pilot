@@ -5505,10 +5505,9 @@ def is_safe_shell_command(sub: str) -> bool:
 # ── Safe GitHub CLI commands ─────────────────────────────────────────────────
 
 SAFE_GH_SUBCOMMANDS: dict[str, frozenset[str]] = {
-    # `create` left this set with mika#3030: its --body-file is published in
-    # the PR, so it goes through the policy rule `bash-gh-pr-create`, which
-    # filters that path like `gh pr edit`'s.
-    "pr":       frozenset({"view", "list", "checkout", "diff", "checks"}),
+    # `create` is admitted only in the closed form `_GH_PR_CREATE_RE` reads
+    # (mika#3030): its --body-file is published in the PR.
+    "pr":       frozenset({"create", "view", "list", "checkout", "diff", "checks"}),
     # `edit` and `comment` left this set with mika#3030: a pilot works on its
     # branch and its PR, never on the ticket. A ticket label can start an
     # engine flight, and a ticket comment is a public write. Both are now
@@ -5531,10 +5530,35 @@ _GH_DOMAIN_RE = re.compile(r"^\s*gh\s+(\S+)\s+(\S+)")
 _GH_API_RE = re.compile(r"^\s*gh\s+api\b")
 _GH_API_MUTATION_RE = re.compile(r"-(X|method)\b|-(f|F|field|raw-field)\b|--input\b")
 
+# `gh pr create` (mika#3030). Its --body-file is published in the PR body, so
+# that path is confined like `gh pr edit`'s policy rule confines it: `-` or a
+# bare relative or `/tmp/` path, with no `..` and no `~`. The other flags are a
+# closed set, --repo stays in the senara-solutions organization, and every
+# value-taking flag consumes exactly one value, so a stray argument has no
+# slot. A double-quoted value may hold a backslash pair (`\``, `\$`), consumed
+# whole as bash reads it, but no bare `$` or backtick. The only redirect is a
+# trailing `2>&1`, which the compound splitter leaves on the segment.
+#
+# It stays a Tier 1 check, not a policy allow: `_bash_allow_is_chain_safe`
+# refuses any backtick in the raw text, escaped or not, and 17 of the 190
+# pipeline calls carry an escaped backtick in their title.
+_GH_VALUE = r"""(?:"(?:[^"\\$`]|\\.)*"|'[^']*'|[^\s"'\\$`;&|<>()~][^\s"'\\$`;&|<>()]*)"""
+_GH_BODY_FILE = r"(?:-|(?!\S*\.\.)(?:/tmp/)?\.?\w[\w./-]*)"
+_GH_PR_CREATE_RE = re.compile(
+    r"\s*gh\s+pr\s+create"
+    r"(?:\s+(?:--draft|-d|--help"
+    r"|(?:--title|-t|--body|-b|--base|-B|--head|-H|--label|-l|--reviewer|-r)(?:=|\s+)" + _GH_VALUE
+    + r"|(?:--repo|-R)(?:=|\s+)senara-solutions/[\w.-]+"
+    r"|(?:--body-file|-F)(?:=|\s+)" + _GH_BODY_FILE
+    + r"))+(?:\s+2>&1)?\s*"
+)
+
 
 def is_safe_gh_command(sub: str) -> bool:
     match = _GH_DOMAIN_RE.match(sub)
     if match:
+        if match.group(1, 2) == ("pr", "create"):
+            return _GH_PR_CREATE_RE.fullmatch(sub) is not None
         allowed = SAFE_GH_SUBCOMMANDS.get(match.group(1))
         if allowed is not None:
             return match.group(2) in allowed

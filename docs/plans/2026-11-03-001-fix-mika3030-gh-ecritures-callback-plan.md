@@ -118,21 +118,32 @@ règle, `gh-issue-create-deny`, comme le demande le ticket.
 
 ### D5. `gh pr create` : même filtre de chemin (samidarko, 2026-11-03 20:40Z)
 
-`create` sort de `SAFE_GH_SUBCOMMANDS["pr"]`. La règle `bash-gh-pr-create`
-admet une liste fermée de drapeaux : `--draft`/`-d` et `--help` sans valeur,
-`--title`, `--body`, `--base`, `--head`, `--label`, `--reviewer` avec une
-valeur, `--repo` limité à l'organisation `senara-solutions`, et `--body-file`
-avec le même filtre que `gh pr edit`.
+`gh pr create` reste en Tier 1, mais seulement sous la forme fermée
+`_GH_PR_CREATE_RE` (`tier1.py`) :
+- `--draft`/`-d` et `--help` sans valeur ;
+- `--title`, `--body`, `--base`, `--head`, `--label`, `--reviewer` avec une
+  valeur ;
+- `--repo` limité à l'organisation `senara-solutions` ;
+- `--body-file` avec le même filtre que `gh pr edit`.
 
-Forme mesurée du pipeline (196 segments dans les transcripts de pilotes, tous
-avec `--body-file pr-body.md`) : `gh pr create --repo senara-solutions/<dépôt>
---base main --head <branche> --title "…" --body-file pr-body.md 2>&1 | tail -5`.
-Elle passe, comme `/tmp/pr-body-<N>.md`.
+Toute autre forme tombe sur le refus par défaut de la politique.
 
-Les deux règles `gh pr` finissent sur un lookahead d'opérateur, et non sur `$` :
-la commande entière doit matcher avant que `_bash_allow_is_chain_safe` juge
-chaque segment, et le pipeline envoie gh dans `tail`. Seul `2>&1` est admis
-comme redirection.
+Pourquoi la Tier 1 et pas une règle de politique : une première version
+(6a5a320) passait par une règle allow. `_bash_allow_is_chain_safe` refuse tout
+backtick dans le texte brut, échappé ou non. MPC a rejoué les 190 segments
+`gh pr create` des transcripts de pilotes : 17 refusés, tous avec un backtick
+échappé dans un titre entre guillemets doubles, dont 7 sous la forme `--repo`
+du pipeline. Assouplir ce garde, partagé par toutes les règles allow, n'est pas
+dans ce ticket. La Tier 1 lit déjà ces titres comme bash. Une valeur entre
+guillemets doubles y admet une paire `\x` consommée d'un bloc, mais aucun `$`
+ni backtick nu.
+
+Rejeu sur la tête finale : 190 segments sur 190 admis, comme sur main. À
+travers le callback entier, 188 commandes sur 189 sont admises, comme sur main.
+Le refus restant est le même sur les deux : une chaîne `grep` sans rapport.
+
+La règle `gh pr edit` finit sur un lookahead d'opérateur, et non sur `$`, pour
+admettre la forme `… 2>&1 | tail -5`.
 
 ## Hors périmètre
 
