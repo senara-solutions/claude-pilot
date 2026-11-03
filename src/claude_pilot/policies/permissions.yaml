@@ -397,6 +397,61 @@ rules:
     decision: deny
     reason: "gh issue create is handled by mika-issue skill -- direct CLI use denied"
 
+  # ---- GitHub CLI writes a pilot may and may not make (mika#3030) ----
+  # Until mika#3030 the worktree carried the operator's settings allowlist
+  # (`gh pr:*`, `gh issue:*`, `gh repo:*`), which Claude Code applies BEFORE
+  # can_use_tool, so none of these rules was ever consulted for gh. With that
+  # allowlist gone they decide. A pilot touches its own PR only, and only
+  # through the PR of the current branch: no positional selector (number,
+  # URL, branch), no --repo. The two allows come first because the denies are
+  # unanchored, like gh-issue-create-deny. Command substitution and chained
+  # tails stay refused by `_bash_allow_is_chain_safe`, as for every allow.
+  #
+  # `gh pr edit`: a closed set of flags, each consuming exactly ONE value, so a
+  # stray selector has no slot and the rule does not match. Values are a
+  # double-quoted string with no `$`, backtick or backslash, a single-quoted
+  # string, or a bare word with no shell metacharacter and no leading `~`.
+  # --body-file/-F is narrower: its file is published in the PR body, so it
+  # is `-` (stdin) or a bare relative path or `/tmp/` path, with no `..` and
+  # no `~`. Left out on purpose: --repo/-R (another repository),
+  # --base/-B (retargets the PR), assignees, projects and milestones (not
+  # development work).
+
+  - id: bash-gh-pr-edit-own-branch
+    tool: Bash
+    pattern: '^gh\s+pr\s+edit(?:\s+(?:(?:--title|-t|--body|-b|--add-label|--remove-label|--add-reviewer)(?:=|\s+)(?:"[^"\\$`]*"|''[^'']*''|[^\s"''\\$`;&|<>()~][^\s"''\\$`;&|<>()]*)|(?:--body-file|-F)(?:=|\s+)(?:-|(?!\S*\.\.)(?:/tmp/)?\.?\w[\w./-]*)))+\s*$'
+    decision: allow
+    reason: "gh pr edit on the current branch's PR only: no selector, no --repo/--base, closed flag set (mika#3030)"
+
+  # `gh pr ready`: only `--undo`, which puts the branch's own PR back in draft.
+  # Taking a PR OUT of draft is never a pilot's decision: a draft may be a hold
+  # placed on purpose before merge, and the engine can merge a green PR within
+  # ~90 s of it leaving draft (mika draft contract, mika#1613/#1682/#2624).
+
+  - id: bash-gh-pr-ready-undo-own-branch
+    tool: Bash
+    pattern: "^gh\\s+pr\\s+ready\\s+--undo\\s*$"
+    decision: allow
+    reason: "gh pr ready --undo on the current branch's PR: back to draft, the safe direction (mika#3030)"
+
+  - id: gh-pr-ready-deny
+    tool: Bash
+    pattern: "gh\\s+pr\\s+ready\\b"
+    decision: deny
+    reason: "taking a PR out of draft lifts a possible hold -- operator-only (mika draft contract, mika#3030)"
+
+  - id: gh-issue-edit-deny
+    tool: Bash
+    pattern: "gh\\s+issue\\s+edit\\b"
+    decision: deny
+    reason: "a pilot works on its branch and PR, never edits the ticket; a label can start an engine flight (mika#3030)"
+
+  - id: gh-issue-comment-deny
+    tool: Bash
+    pattern: "gh\\s+issue\\s+comment\\b"
+    decision: deny
+    reason: "a ticket comment is a public write that wakes the engine -- operator-only (mika#3030)"
+
   # ---- Skill tool -- non-platform agent escalation ----
 
   - id: mika-ask-non-platform-agent

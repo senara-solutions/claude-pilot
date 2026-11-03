@@ -582,7 +582,7 @@ _BARE_WORD = (
 )
 _TERMINAL_FORM_EXEMPTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_CARGO_PUBLISH_PATTERN, f"release to crates.io: {_NOT_DEV_WORK}"),
-    (_GH_LABEL_MUTATE_PATTERN, f"repo label admin (adding a label is `gh issue edit`): {_NOT_DEV_WORK}"),
+    (_GH_LABEL_MUTATE_PATTERN, f"repo label admin: {_NOT_DEV_WORK}"),
     (_CHMOD_R_PATTERN, f"recursive permission change, system administration: {_NOT_DEV_WORK}"),
     (_CHOWN_R_PATTERN, f"recursive ownership change, system administration: {_NOT_DEV_WORK}"),
     (_DD_PATTERN, f"raw block-device copy; {_BARE_WORD}"),
@@ -5506,7 +5506,12 @@ def is_safe_shell_command(sub: str) -> bool:
 
 SAFE_GH_SUBCOMMANDS: dict[str, frozenset[str]] = {
     "pr":       frozenset({"create", "view", "list", "checkout", "diff", "checks"}),
-    "issue":    frozenset({"view", "list", "edit", "comment"}),
+    # `edit` and `comment` left this set with mika#3030: a pilot works on its
+    # branch and its PR, never on the ticket. A ticket label can start an
+    # engine flight, and a ticket comment is a public write. Both are now
+    # refused by explicit policy rules (`gh-issue-edit-deny`,
+    # `gh-issue-comment-deny`).
+    "issue":    frozenset({"view", "list"}),
     "run":      frozenset({"view", "list"}),
     "repo":     frozenset({"view"}),
     "release":  frozenset({"view", "list"}),
