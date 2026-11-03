@@ -419,9 +419,28 @@ rules:
 
   - id: bash-gh-pr-edit-own-branch
     tool: Bash
-    pattern: '^gh\s+pr\s+edit(?:\s+(?:(?:--title|-t|--body|-b|--add-label|--remove-label|--add-reviewer)(?:=|\s+)(?:"[^"\\$`]*"|''[^'']*''|[^\s"''\\$`;&|<>()~][^\s"''\\$`;&|<>()]*)|(?:--body-file|-F)(?:=|\s+)(?:-|(?!\S*\.\.)(?:/tmp/)?\.?\w[\w./-]*)))+\s*$'
+    pattern: '^gh\s+pr\s+edit(?:\s+(?:(?:--title|-t|--body|-b|--add-label|--remove-label|--add-reviewer)(?:=|\s+)(?:"[^"\\$`]*"|''[^'']*''|[^\s"''\\$`;&|<>()~][^\s"''\\$`;&|<>()]*)|(?:--body-file|-F)(?:=|\s+)(?:-|(?!\S*\.\.)(?:/tmp/)?\.?\w[\w./-]*)))+(?:\s+2>&1)?(?=\s*(?:$|[|;&]))'
     decision: allow
     reason: "gh pr edit on the current branch's PR only: no selector, no --repo/--base, closed flag set (mika#3030)"
+
+  # `gh pr create`: left Tier 1 with mika#3030 so that its --body-file gets the
+  # same path filter as `gh pr edit`. Flags are a closed set: --draft/-d and
+  # --help take no value; --repo/-R is limited to the senara-solutions
+  # organization; --body-file/-F takes the same filtered path as above. The
+  # pipeline's measured form (`--repo senara-solutions/<repo> --base main
+  # --head <branch> --title "…" --body-file pr-body.md 2>&1 | tail -5`) passes.
+  #
+  # Both gh rules end on an operator lookahead rather than `$`: the whole
+  # command must match before `_bash_allow_is_chain_safe` checks each segment,
+  # and the pipeline pipes gh into `tail`. Every flag is consumed up to that
+  # operator, so a stray argument still has no slot; an optional `2>&1` (fd
+  # duplication, not a write) is the only redirect admitted.
+
+  - id: bash-gh-pr-create
+    tool: Bash
+    pattern: '^gh\s+pr\s+create(?:\s+(?:--draft|-d|--help|(?:--title|-t|--body|-b|--base|-B|--head|-H|--label|-l|--reviewer|-r)(?:=|\s+)(?:"[^"\\$`]*"|''[^'']*''|[^\s"''\\$`;&|<>()~][^\s"''\\$`;&|<>()]*)|(?:--repo|-R)(?:=|\s+)senara-solutions/[\w.-]+|(?:--body-file|-F)(?:=|\s+)(?:-|(?!\S*\.\.)(?:/tmp/)?\.?\w[\w./-]*)))+(?:\s+2>&1)?(?=\s*(?:$|[|;&]))'
+    decision: allow
+    reason: "gh pr create: closed flag set, --repo in senara-solutions, --body-file in the worktree or /tmp/ (mika#3030)"
 
   # `gh pr ready`: only `--undo`, which puts the branch's own PR back in draft.
   # Taking a PR OUT of draft is never a pilot's decision: a draft may be a hold

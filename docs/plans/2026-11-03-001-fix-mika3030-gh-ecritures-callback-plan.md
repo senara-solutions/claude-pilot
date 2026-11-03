@@ -116,10 +116,23 @@ règle, `gh-issue-create-deny`, comme le demande le ticket.
 5. Temps borné de la nouvelle regex sur une entrée hostile, sous
    `_REDOS_BUDGET_S`.
 
-## Restes (pas de ticket, gel jusqu'au 01/12)
+### D5. `gh pr create` : même filtre de chemin (samidarko, 2026-11-03 20:40Z)
 
-- Filtre de chemin de `--body-file` limité à `gh pr edit` ; extension à
-  `gh pr create` hors ticket.
+`create` sort de `SAFE_GH_SUBCOMMANDS["pr"]`. La règle `bash-gh-pr-create`
+admet une liste fermée de drapeaux : `--draft`/`-d` et `--help` sans valeur,
+`--title`, `--body`, `--base`, `--head`, `--label`, `--reviewer` avec une
+valeur, `--repo` limité à l'organisation `senara-solutions`, et `--body-file`
+avec le même filtre que `gh pr edit`.
+
+Forme mesurée du pipeline (196 segments dans les transcripts de pilotes, tous
+avec `--body-file pr-body.md`) : `gh pr create --repo senara-solutions/<dépôt>
+--base main --head <branche> --title "…" --body-file pr-body.md 2>&1 | tail -5`.
+Elle passe, comme `/tmp/pr-body-<N>.md`.
+
+Les deux règles `gh pr` finissent sur un lookahead d'opérateur, et non sur `$` :
+la commande entière doit matcher avant que `_bash_allow_is_chain_safe` juge
+chaque segment, et le pipeline envoie gh dans `tail`. Seul `2>&1` est admis
+comme redirection.
 
 ## Hors périmètre
 

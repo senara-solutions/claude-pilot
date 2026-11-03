@@ -6058,3 +6058,65 @@ def test_mika3030_pr_edit_rule_runs_in_bounded_time(command: str) -> None:
     _mika3030_evaluate(command)
     elapsed = time.perf_counter() - start
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
+
+
+# `gh pr create` left Tier 1 so that its --body-file gets the same path filter.
+# Positive witnesses: the pipeline's measured forms (196 segments across the
+# pilot transcripts, every --body-file `pr-body.md`), plus /tmp/pr-body-<N>.md.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'gh pr create --repo senara-solutions/mika --base main --head feat/x-1 --title "fix(x): y" --body-file pr-body.md 2>&1 | tail -5',
+        'gh pr create --title "fix(x): y" --body-file pr-body.md --base main 2>&1 | tail -5',
+        'gh pr create --base main --head feat/x --title "t" --body-file pr-body.md',
+        'gh pr create --title "t" --body-file /tmp/pr-body-3030.md --base main --head feat/x --draft',
+        'gh pr create --help 2>&1 | grep -A2 -i "reviewer"',
+    ],
+)
+def test_mika3030_pr_create_pipeline_forms_are_admitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow), (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --title t --body-file ~/body.md",
+        "gh pr create --title t --body-file /var/data/body.md --base main",
+        "gh pr create --title t -F ../body.md",
+        "gh pr create --repo someone/else --title t --body-file pr-body.md",
+        "gh pr create --title t --body-file pr-body.md > /tmp/out",
+        'gh pr create --title "$(id)" --body-file pr-body.md',
+        "gh pr create --web",
+        "gh pr create --title t --body-file pr-body.md extra",
+    ],
+)
+def test_mika3030_pr_create_beyond_its_filter_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.interrupt is False, (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create" + " --title x" * 5000 + " >",
+        "gh pr create -F " + "a/" * 20000 + "..",
+        "gh pr create" + " -d" * 20000 + " x",
+    ],
+)
+def test_mika3030_pr_create_rule_runs_in_bounded_time(command: str) -> None:
+    import time
+
+    start = time.perf_counter()
+    _mika3030_evaluate(command)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"

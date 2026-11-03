@@ -5505,7 +5505,10 @@ def is_safe_shell_command(sub: str) -> bool:
 # ── Safe GitHub CLI commands ─────────────────────────────────────────────────
 
 SAFE_GH_SUBCOMMANDS: dict[str, frozenset[str]] = {
-    "pr":       frozenset({"create", "view", "list", "checkout", "diff", "checks"}),
+    # `create` left this set with mika#3030: its --body-file is published in
+    # the PR, so it goes through the policy rule `bash-gh-pr-create`, which
+    # filters that path like `gh pr edit`'s.
+    "pr":       frozenset({"view", "list", "checkout", "diff", "checks"}),
     # `edit` and `comment` left this set with mika#3030: a pilot works on its
     # branch and its PR, never on the ticket. A ticket label can start an
     # engine flight, and a ticket comment is a public write. Both are now
