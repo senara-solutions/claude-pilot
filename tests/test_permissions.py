@@ -5938,6 +5938,22 @@ def _mika3030_evaluate(command: str) -> PolicyDecision:
     return evaluate(load_policy(None), "Bash", {"command": command})
 
 
+def _mika3030_rule_search_seconds(rule_id: str, command: str) -> float:
+    """Time ONE rule's regex, not the whole policy: a CI runner is ~20x slower
+    than a desktop, and the other rules' linear cost is not this test's
+    subject. 5 000 characters is enough for quadratic backtracking to blow far
+    past the budget, and small enough for the linear cost to stay well under
+    it on any runner."""
+    import time
+
+    from claude_pilot.policy import load_policy
+
+    (pattern,) = [r.pattern for r in load_policy(None).rules if r.id == rule_id]
+    start = time.perf_counter()
+    re.search(pattern, command)
+    return time.perf_counter() - start
+
+
 @pytest.mark.parametrize("command", _MIKA3030_LIST_L)
 def test_mika3030_callback_refuses_every_write_of_list_l(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
@@ -6046,17 +6062,13 @@ def test_mika3030_pr_ready_out_of_draft_or_on_another_pr_is_refused(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr edit" + " --title x" * 5000 + " ;",
-        "gh pr edit -F " + "a/" * 20000 + "..",
-        "gh pr edit --title " + "-" * 50000 + " 1",
+        "gh pr edit" + " --title x" * 500 + " ;",
+        "gh pr edit -F " + "a/" * 2500 + "..",
+        "gh pr edit --title " + "-" * 5000 + " 1",
     ],
 )
 def test_mika3030_pr_edit_rule_runs_in_bounded_time(command: str) -> None:
-    import time
-
-    start = time.perf_counter()
-    _mika3030_evaluate(command)
-    elapsed = time.perf_counter() - start
+    elapsed = _mika3030_rule_search_seconds("bash-gh-pr-edit-own-branch", command)
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
 
 
@@ -6108,15 +6120,12 @@ def test_mika3030_pr_create_beyond_its_filter_is_refused(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr create" + " --title x" * 5000 + " >",
-        "gh pr create -F " + "a/" * 20000 + "..",
-        "gh pr create" + " -d" * 20000 + " x",
+        "gh pr create" + " --title x" * 500 + " >",
+        "gh pr create -F " + "a/" * 2500 + "..",
+        "gh pr create --title " + "-" * 5000 + " 1",
+        "gh pr create" + " -d" * 1700 + " x",
     ],
 )
 def test_mika3030_pr_create_rule_runs_in_bounded_time(command: str) -> None:
-    import time
-
-    start = time.perf_counter()
-    _mika3030_evaluate(command)
-    elapsed = time.perf_counter() - start
+    elapsed = _mika3030_rule_search_seconds("bash-gh-pr-create", command)
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
