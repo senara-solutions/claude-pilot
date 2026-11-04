@@ -27,6 +27,7 @@ from claude_pilot.permissions import (
     create_permission_handler,
     try_tier_1_5_auto_answer,
 )
+from claude_pilot.policy import PolicyDecision
 from claude_pilot.types import (
     GUARDRAIL_DEFAULTS,
     PilotConfig,
@@ -5905,3 +5906,245 @@ def test_cpp230_admitted_print_only_sed_is_still_admitted(
         handler("Bash", {"command": "sed -n '/warn/p' f"}, _mock_ctx())
     )
     assert isinstance(result, PermissionResultAllow), result
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# mika#3030: GitHub writes through the real can_use_tool callback
+#
+# Until mika#3030 every pilot worktree carried the operator's settings
+# allowlist (`gh pr:*`, `gh issue:*`, `gh repo:*`), which Claude Code applies
+# BEFORE `can_use_tool`, so the pilot's policy was never consulted for gh and a
+# pilot opened mika#3024 past `gh-issue-create-deny`. With that allowlist gone
+# the callback decides; these tests pin what it decides, end to end.
+# ────────────────────────────────────────────────────────────────────────────
+
+# The ticket's list L: a pilot makes none of these writes.
+_MIKA3030_LIST_L: tuple[str, ...] = (
+    'gh issue create --repo senara-solutions/mika --title "x" --body-file .pilot-scratch/f.md',
+    "gh issue close 1",
+    "gh issue edit 1 --add-label ready",
+    'gh issue comment 1 --body "groomed"',
+    "gh pr merge 1",
+    "gh pr review 1 --approve",
+    "gh pr close 1",
+    "gh repo delete senara-solutions/x",
+    "gh label create foo",
+)
+
+
+def _mika3030_evaluate(command: str) -> PolicyDecision:
+    from claude_pilot.policy import evaluate, load_policy
+
+    return evaluate(load_policy(None), "Bash", {"command": command})
+
+
+def _mika3030_rule_search_seconds(rule_id: str, command: str) -> float:
+    """Time ONE rule's regex, not the whole policy: a CI runner is ~20x slower
+    than a desktop, and the other rules' linear cost is not this test's
+    subject. 5 000 characters is enough for quadratic backtracking to blow far
+    past the budget, and small enough for the linear cost to stay well under
+    it on any runner."""
+    import time
+
+    from claude_pilot.policy import load_policy
+
+    (pattern,) = [r.pattern for r in load_policy(None).rules if r.id == rule_id]
+    start = time.perf_counter()
+    re.search(pattern, command)
+    return time.perf_counter() - start
+
+
+@pytest.mark.parametrize("command", _MIKA3030_LIST_L)
+def test_mika3030_callback_refuses_every_write_of_list_l(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    """Each write of L is refused by the callback, and survivably: the pilot
+    gets the refusal back as a tool_result and carries on."""
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.interrupt is False, (command, result)
+
+
+@pytest.mark.parametrize(
+    ("command", "rule_id"),
+    [
+        (_MIKA3030_LIST_L[0], "gh-issue-create-deny"),
+        ("gh issue edit 1 --add-label ready", "gh-issue-edit-deny"),
+        ('gh issue comment 1 --body "groomed"', "gh-issue-comment-deny"),
+    ],
+)
+def test_mika3030_ticket_writes_cite_their_rule(command: str, rule_id: str) -> None:
+    """The three ticket writes are refused by a named rule, not by the
+    default: the decision is written down where a reader looks for it."""
+    pd = _mika3030_evaluate(command)
+    assert (pd.decision, pd.rule_id) == ("deny", rule_id), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr edit --body-file pr.md",
+        "gh pr edit --body-file=.pilot-scratch/x/pr.md",
+        "gh pr edit -F /tmp/pr.md",
+        'gh pr edit --title "fix(x): y" --add-label ready',
+        "gh pr edit --add-reviewer someone --remove-label wip",
+    ],
+)
+def test_mika3030_pr_edit_on_the_branch_pr_is_admitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    """Positive witness: with no selector, gh edits the current branch's PR."""
+    assert _mika3030_evaluate(command).rule_id == "bash-gh-pr-edit-own-branch", command
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow), (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # another PR: a selector before the flags, after them, or as a URL
+        "gh pr edit 12 --body-file pr.md",
+        "gh pr edit --title x 12",
+        "gh pr edit https://github.com/senara-solutions/mika/pull/12 --title x",
+        # another repository, another base
+        "gh pr edit --repo senara-solutions/mika --title x",
+        "gh pr edit --base main",
+        # a body file outside the worktree and /tmp/
+        "gh pr edit --body-file ~/body.md",
+        "gh pr edit --body-file /var/data/body.md",
+        "gh pr edit --body-file ../body.md",
+        "gh pr edit -F /tmp/../outside/body.md",
+        # expansion, chaining, and the bare interactive form
+        'gh pr edit --title "$(id)"',
+        "gh pr edit --title x && gh issue comment 1 --body y",
+        "gh pr edit",
+    ],
+)
+def test_mika3030_pr_edit_beyond_the_branch_pr_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    """Negative witness: any other PR, repository, or body source is refused."""
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.interrupt is False, (command, result)
+
+
+def test_mika3030_pr_ready_undo_on_the_branch_pr_is_admitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Positive witness: putting its own PR back in draft is the safe direction."""
+    command = "gh pr ready --undo"
+    assert _mika3030_evaluate(command).rule_id == "bash-gh-pr-ready-undo-own-branch"
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow), result
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["gh pr ready", "gh pr ready 12", "gh pr ready 12 --undo", "gh pr ready --repo senara-solutions/mika"],
+)
+def test_mika3030_pr_ready_out_of_draft_or_on_another_pr_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    """Negative witness: leaving draft lifts a possible hold (mika draft
+    contract), and `--undo` on another PR is not the pilot's PR."""
+    assert _mika3030_evaluate(command).rule_id == "gh-pr-ready-deny", command
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.interrupt is False, (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr edit" + " --title x" * 500 + " ;",
+        "gh pr edit -F " + "a/" * 2500 + "..",
+        "gh pr edit --title " + "-" * 5000 + " 1",
+    ],
+)
+def test_mika3030_pr_edit_rule_runs_in_bounded_time(command: str) -> None:
+    elapsed = _mika3030_rule_search_seconds("bash-gh-pr-edit-own-branch", command)
+    assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
+
+
+# `gh pr create` stays in Tier 1, but only in the closed form
+# `tier1._GH_PR_CREATE_RE`, which confines its --body-file the same way.
+# Positive witnesses: the pipeline's measured forms (190 segments across the
+# pilot transcripts, every --body-file `pr-body.md`), plus /tmp/pr-body-<N>.md.
+# Replayed against those 190 segments, the gate admits all of them, as main
+# does; through the whole callback it admits the same 188 of 189 commands.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'gh pr create --repo senara-solutions/mika --base main --head feat/x-1 --title "fix(x): y" --body-file pr-body.md 2>&1 | tail -5',
+        'gh pr create --title "fix(x): y" --body-file pr-body.md --base main 2>&1 | tail -5',
+        'gh pr create --base main --head feat/x --title "t" --body-file pr-body.md',
+        'gh pr create --title "t" --body-file /tmp/pr-body-3030.md --base main --head feat/x --draft',
+        'gh pr create --help 2>&1 | grep -A2 -i "reviewer"',
+        # The measured regression of 251292d: 17 of the 190 real calls carry
+        # an escaped backtick in a double-quoted title, 7 of them with the
+        # pipeline's --repo form. Titles built here, not copied.
+        'gh pr create --repo senara-solutions/mika --base main --head fix/a --title "fix(x): the \\`y\\` step" --body-file pr-body.md 2>&1 | tail -5',
+        'gh pr create --title "fix(x): the \\`y\\` step" --body-file pr-body.md --base main --head fix/a',
+        'gh pr create --title "chore: cost \\$5 \\"quoted\\"" --body-file pr-body.md --base main',
+    ],
+)
+def test_mika3030_pr_create_pipeline_forms_are_admitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultAllow), (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --title t --body-file ~/body.md",
+        "gh pr create --title t --body-file /var/data/body.md --base main",
+        "gh pr create --title t -F ../body.md",
+        "gh pr create --repo someone/else --title t --body-file pr-body.md",
+        "gh pr create --title t --body-file pr-body.md > /tmp/out",
+        'gh pr create --title "$(id)" --body-file pr-body.md',
+        "gh pr create --web",
+        "gh pr create --title t --body-file pr-body.md extra",
+        # a bare backtick or `$(` is a substitution, escaped pairs aside:
+        # `\\\\` is a literal backslash, so the `$(` after it runs
+        'gh pr create --title "fix `id`" --body-file pr-body.md',
+        'gh pr create --title "fix \\\\$(id)" --body-file pr-body.md',
+    ],
+)
+def test_mika3030_pr_create_beyond_its_filter_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, tmp_path)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.interrupt is False, (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create" + " --title x" * 500 + " >",
+        "gh pr create -F " + "a/" * 2500 + "..",
+        "gh pr create --title " + "-" * 5000 + " 1",
+        "gh pr create" + " -d" * 1700 + " x",
+    ],
+)
+def test_mika3030_pr_create_rule_runs_in_bounded_time(command: str) -> None:
+    import time
+
+    from claude_pilot.tier1 import _GH_PR_CREATE_RE
+
+    start = time.perf_counter()
+    _GH_PR_CREATE_RE.fullmatch(command)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"

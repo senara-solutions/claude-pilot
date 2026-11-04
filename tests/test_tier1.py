@@ -1325,7 +1325,12 @@ def test_bare_mika_command_not_dispatch() -> None:
     assert is_safe_mika_dispatch("mika ask --help") is False
 
 
-# ── mika#1191 Phase A — GitHub authoring (issue edit/comment) ────────────────
+# ── GitHub authoring on the ticket (issue edit/comment) ──────────────────────
+# mika#1191 Phase A put `gh issue edit` and `gh issue comment` on the Tier 1
+# allow-list. mika#3030 took them off: a pilot works on its branch and PR, a
+# ticket label can start an engine flight, and a ticket comment is a public
+# write. The policy now refuses them by name (`gh-issue-edit-deny`,
+# `gh-issue-comment-deny`, pinned in test_permissions.py).
 
 
 @pytest.mark.parametrize(
@@ -1337,8 +1342,8 @@ def test_bare_mika_command_not_dispatch() -> None:
         'gh issue comment 1191 --body-file /tmp/closing.md',
     ],
 )
-def test_gh_issue_edit_comment_approved(command: str) -> None:
-    assert is_safe_bash_command(command) is True, command
+def test_gh_issue_edit_comment_not_in_tier1(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
 
 
 def test_gh_issue_create_not_in_tier1() -> None:
