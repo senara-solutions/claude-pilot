@@ -21,6 +21,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot import permissions as permissions_module
+from claude_pilot import tier1 as tier1_module
 from claude_pilot.guardrails import SessionGuardrails
 from claude_pilot.permissions import (
     CanUseTool,
@@ -6146,5 +6147,125 @@ def test_mika3030_pr_create_rule_runs_in_bounded_time(command: str) -> None:
 
     start = time.perf_counter()
     _GH_PR_CREATE_RE.fullmatch(command)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"
+
+
+# ── cpp#317: the two local gates, refused forms name the admitted form ──────
+
+
+@pytest.fixture
+def cpp317_worktree(tmp_path: Path) -> Path:
+    """A real git worktree where `scripts/verify-pipeline.sh` is tracked, so
+    the cpp#207 admission of `bash scripts/verify-pipeline.sh` is exercised
+    against real git state."""
+    import subprocess
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "cpp317-test@example.com")
+    git("config", "user.name", "cpp317 test")
+    script = tmp_path / "scripts" / "verify-pipeline.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\necho ok\n")
+    script.chmod(0o755)
+    git("add", "scripts/verify-pipeline.sh")
+    git("commit", "-q", "-m", "add gate")
+    return tmp_path
+
+
+_CPP317_REFUSED = {
+    "scripts/verify-pipeline.sh origin/main": tier1_module.VERIFY_PIPELINE_ADMITTED_FORM,
+    "PLAN_FILE=docs/plans/x.md bash scripts/verify-pipeline.sh origin/main": (
+        tier1_module.VERIFY_PIPELINE_ADMITTED_FORM
+    ),
+    "make verify-bundled-skills 2>&1 | tail -5": (
+        tier1_module.VERIFY_BUNDLED_SKILLS_ADMITTED_FORM
+    ),
+}
+
+_CPP317_ADMITTED = [
+    "bash scripts/verify-pipeline.sh origin/main",
+    "./scripts/verify-pipeline.sh origin/main",
+    "bash scripts/verify-pipeline.sh",
+    "make verify-bundled-skills",
+    "cargo run -q --bin verify-bundled-skills",
+]
+
+
+def test_cpp317_no_admission_change(
+    monkeypatch: pytest.MonkeyPatch, cpp317_worktree: Path
+) -> None:
+    """AC3: each refused form of the measure table stays refused, non-terminal,
+    and each admitted form stays admitted, through the real callback."""
+    handler = _bundled_policy_handler(monkeypatch, cpp317_worktree)
+    for command in _CPP317_REFUSED:
+        result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+        assert isinstance(result, PermissionResultDeny), (command, result)
+        assert result.interrupt is False, (command, result)
+    for command in _CPP317_ADMITTED:
+        result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+        assert isinstance(result, PermissionResultAllow), (command, result)
+
+
+@pytest.mark.parametrize("command", sorted(_CPP317_REFUSED))
+def test_cpp317_default_deny_names_the_admitted_form(
+    monkeypatch: pytest.MonkeyPatch, cpp317_worktree: Path, command: str
+) -> None:
+    """AC2: the default refusal keeps its reason and adds the admitted form."""
+    from claude_pilot.policy import load_policy
+
+    handler = _bundled_policy_handler(monkeypatch, cpp317_worktree)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert result.message.startswith(load_policy(None).default.reason), result
+    assert _CPP317_REFUSED[command] in result.message, result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "md5sum scripts/verify-pipeline.sh",
+        "make verify-other 2>&1",
+        "cat scripts/verify-pipeline.sh > /tmp/x",
+    ],
+)
+def test_cpp317_other_denies_keep_their_message(
+    monkeypatch: pytest.MonkeyPatch, cpp317_worktree: Path, command: str
+) -> None:
+    handler = _bundled_policy_handler(monkeypatch, cpp317_worktree)
+    result = asyncio.run(handler("Bash", {"command": command}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (command, result)
+    assert "local gate" not in result.message, result
+
+
+def test_cpp317_hint_names_the_same_admitted_forms() -> None:
+    """AC1: the system-prompt hint and the refusal message name the same
+    admitted forms, and the hint names the three refused forms."""
+    body = tier1_module._DENIED_BASH_PATTERNS_HINT_BODY
+    assert "`bash scripts/verify-pipeline.sh [base]`" in body
+    assert tier1_module.VERIFY_PIPELINE_ADMITTED_FORM in body
+    assert "`make verify-bundled-skills` with nothing after" in body
+    assert "`cargo run -q --bin verify-bundled-skills`" in body
+    assert "bare\n  `scripts/verify-pipeline.sh`" in body
+    assert "`NAME=value` environment prefix" in body
+    assert "suffix after the\n  make target" in body
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "A=b " * 1700 + "x",
+        "A=" + "=" * 5000 + " x",
+        "make verify-bundled-skills" + " " * 5000 + "\t",
+    ],
+)
+def test_cpp317_patterns_run_in_bounded_time(command: str) -> None:
+    import time
+
+    start = time.perf_counter()
+    tier1_module.local_gate_deny_hint(command)
     elapsed = time.perf_counter() - start
     assert elapsed < 0.050, f"{len(command)} chars took {elapsed * 1000:.1f} ms"

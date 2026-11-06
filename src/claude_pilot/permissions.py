@@ -65,6 +65,7 @@ from .tier1 import (
     is_tier3_dangerous,
     is_tier3_dangerous_for_lethality,
     is_within_project,
+    local_gate_deny_hint,
     readonly_procsub_survivable,
     rm_confined_to_pilot_scratch,
     rm_targets_mktemp_scratch,
@@ -2851,6 +2852,21 @@ def create_permission_handler(
                         _veto_reason = _destination_veto_reason(_cmd, cwd)
                         if _veto_reason is not None:
                             deny_message = _veto_reason
+                # cpp#317 AC2: a DEFAULT deny of a local gate written in a
+                # refused form names the admitted form. Text only — the
+                # decision and `deny_terminal` are already settled above, an
+                # explicit rule keeps its own message, and the cpp#201 message
+                # keeps precedence.
+                if (
+                    tool_name == "Bash"
+                    and pd.rule_id is None
+                    and deny_message == pd.reason
+                ):
+                    _cmd = tool_input.get("command")
+                    if isinstance(_cmd, str):
+                        _gate_hint = local_gate_deny_hint(_cmd)
+                        if _gate_hint is not None:
+                            deny_message = f"{pd.reason} — {_gate_hint}"
                 # cpp#262: name the refused segment + hash on the deny line.
                 _disp, _diag = _bash_deny_log_fields(
                     policy, tool_name, tool_input, cwd, detail

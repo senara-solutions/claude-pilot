@@ -2711,6 +2711,16 @@ auto-approved native tool, which accomplishes the same goal:
 Prefer Read, Write, Edit, Grep, and Glob over their shell equivalents: they are
 auto-approved and never halt the session.
 
+## Local gates — run them only in their admitted form
+
+- verify-pipeline: run `bash scripts/verify-pipeline.sh [base]`
+  (`./scripts/verify-pipeline.sh [base]` works too). The bare
+  `scripts/verify-pipeline.sh` and any `NAME=value` environment prefix
+  (e.g. `PLAN_FILE=…`) are DENIED; the script finds the plan in the diff itself.
+- verify-bundled-skills: run `make verify-bundled-skills` with nothing after
+  the target, or `cargo run -q --bin verify-bundled-skills`. A suffix after the
+  make target (e.g. `2>&1`) is DENIED.
+
 ## Tools that are no-ops in headless mode — never call them
 
 You are running headlessly via the Claude Agent SDK. There is NO interactive
@@ -5102,6 +5112,63 @@ _MAKE_RE = re.compile(r"^\s*make\s+(\S+)\s*$")
 def is_safe_make_command(sub: str) -> bool:
     m = _MAKE_RE.match(sub)
     return bool(m and m.group(1) in SAFE_MAKE_TARGETS)
+
+
+# ── Local gates: name the admitted form in the refusal (cpp#317) ─────────────
+#
+# Pilots launch the two local gates in forms the classifier refuses, while an
+# admitted form exists for each. This changes no admission: the patterns below
+# only pick the text appended to a DEFAULT deny's message (permissions.py), and
+# are never consulted on any allow path. The admitted forms are the ones
+# cpp#207 (tracked script), SAFE_MAKE_TARGETS (cpp#45) and `bash-cargo`
+# (cpp#242) already admit. The hint section "Local gates" names the same forms;
+# a test keeps both channels in step.
+
+VERIFY_PIPELINE_ADMITTED_FORM = "`bash scripts/verify-pipeline.sh [base]`"
+VERIFY_BUNDLED_SKILLS_ADMITTED_FORM = (
+    "`make verify-bundled-skills` with nothing after the target, or "
+    "`cargo run -q --bin verify-bundled-skills`"
+)
+
+# The bare path, or one or more `NAME=value` prefixes before it (with or without
+# an interpreter). `\S*\s+` cannot backtrack across a token boundary.
+_VERIFY_PIPELINE_REFUSED_RE = re.compile(
+    r"\s*(?:(?:[A-Za-z_]\w*=\S*\s+)+(?:(?:bash|sh)\s+|\./)?)?"
+    r"scripts/verify-pipeline\.sh(?:\s|$)"
+)
+# `make verify-bundled-skills` followed by any token (`_MAKE_RE` admits none).
+_VERIFY_BUNDLED_SKILLS_REFUSED_RE = re.compile(
+    r"\s*make\s+verify-bundled-skills\s+\S"
+)
+
+_LOCAL_GATE_DENY_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        _VERIFY_PIPELINE_REFUSED_RE,
+        f"the admitted form of this local gate is {VERIFY_PIPELINE_ADMITTED_FORM}; "
+        "the bare path and a NAME=value prefix are refused, and the script "
+        "finds the plan in the diff itself",
+    ),
+    (
+        _VERIFY_BUNDLED_SKILLS_REFUSED_RE,
+        "the admitted form of this local gate is "
+        f"{VERIFY_BUNDLED_SKILLS_ADMITTED_FORM}; a suffix after the make "
+        "target is refused",
+    ),
+)
+
+
+def local_gate_deny_hint(command: str) -> str | None:
+    """The admitted-form text for the first segment of ``command`` written in
+    one of the refused local-gate forms (cpp#317), else ``None``.
+
+    Message only: the caller has already decided the refusal and its
+    lethality, and nothing here feeds back into either.
+    """
+    for seg in _split_compound_command(command):
+        for pattern, hint in _LOCAL_GATE_DENY_HINTS:
+            if pattern.match(seg):
+                return hint
+    return None
 
 
 # ── Safe shell commands ──────────────────────────────────────────────────────
