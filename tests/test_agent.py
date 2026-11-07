@@ -783,8 +783,10 @@ def test_extract_non_string_nested_value_returns_none() -> None:
 
 
 def _result_with_api_error(status: int) -> ResultMessage:
+    # cpp#319: the shape the SDK really returns for a failed API call —
+    # `subtype="success"` with `is_error=True`, not `subtype="error"`.
     return ResultMessage(
-        subtype="error",
+        subtype="success",
         duration_ms=100,
         duration_api_ms=50,
         is_error=True,
@@ -792,6 +794,7 @@ def _result_with_api_error(status: int) -> ResultMessage:
         session_id="sess_test",
         total_cost_usd=0.0,
         api_error_status=status,
+        terminal_reason="api_error",
     )
 
 
@@ -846,6 +849,118 @@ async def test_api_error_status_absent_omits_field(
     json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
     payload = json.loads(json_lines[0])
     assert "api_error_status" not in payload, payload
+
+
+# ── cpp#319: a session the API killed does not exit as a success ─────────────
+
+
+def _result_with_error_subtype(subtype: str) -> ResultMessage:
+    return ResultMessage(
+        subtype=subtype,
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=True,
+        num_turns=1,
+        session_id="sess_test",
+        total_cost_usd=0.0,
+    )
+
+
+async def _run_and_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    result: ResultMessage,
+) -> tuple[int, dict[str, Any], str, list[Any]]:
+    """Run one session ending on ``result``; return the exit code, the
+    ResultJson payload, stderr and the post_handoff calls."""
+    import json
+
+    handoffs: list[Any] = []
+    monkeypatch.setattr(agent_module, "post_handoff", handoffs.append)
+    _install_fake_client(monkeypatch, [_init(), result])
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_cpp319",
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    return exit_code, json.loads(json_lines[0]), captured.err, handoffs
+
+
+@pytest.mark.asyncio
+async def test_cpp319_api_error_success_shape_exits_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1 + AC3: the SDK's real shape (`subtype="success"`, `is_error=True`,
+    401 then 502) exits as `status: error`, `subtype: api_error`, exit 1, no
+    handoff, no `[done] Success`; `is_error=False` stays a success."""
+    for status_code in (401, 502):
+        exit_code, payload, err, handoffs = await _run_and_capture(
+            monkeypatch, capsys, _result_with_api_error(status_code)
+        )
+        assert exit_code == 1, payload
+        assert payload["status"] == "error", payload
+        assert payload["subtype"] == "api_error", payload
+        assert payload["api_error_status"] == status_code, payload
+        assert f"api_error_status={status_code}" in payload["termination_reason"]
+        assert "terminal_reason=api_error" in payload["termination_reason"]
+        assert handoffs == [], payload
+        assert "[done]" not in err
+
+    exit_code, payload, err, handoffs = await _run_and_capture(
+        monkeypatch, capsys, _result()
+    )
+    assert exit_code == 0, payload
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+    assert len(handoffs) == 1
+    assert "[done]" in err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("subtype", "status"),
+    [("error_max_turns", "terminated"), ("error_during_execution", "error")],
+)
+async def test_cpp319_other_is_error_ends_keep_their_class(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    subtype: str,
+    status: str,
+) -> None:
+    """AC2: the other `is_error` ends keep their subtype and status."""
+    exit_code, payload, _err, handoffs = await _run_and_capture(
+        monkeypatch, capsys, _result_with_error_subtype(subtype)
+    )
+    assert exit_code == 1, payload
+    assert payload["status"] == status, payload
+    assert payload["subtype"] == subtype, payload
+    assert handoffs == []
+
+
+@pytest.mark.asyncio
+async def test_cpp319_require_pr_contract_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC4: under CLAUDE_PILOT_REQUIRE_PR=1 a healthy session without
+    `gh pr create` still exits `pipeline_incomplete`, and an API death keeps
+    `api_error`."""
+    monkeypatch.setenv("CLAUDE_PILOT_REQUIRE_PR", "1")
+    _code, payload, _err, _h = await _run_and_capture(monkeypatch, capsys, _result())
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == "pipeline_incomplete", payload
+
+    _code, payload, _err, _h = await _run_and_capture(
+        monkeypatch, capsys, _result_with_api_error(401)
+    )
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == "api_error", payload
 
 
 # ── cpp#144: absent-operator question reclassifies a hollow "success" ────────

@@ -67,6 +67,11 @@ from .ui import (
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
 
+#: cpp#319: emitted INSTEAD of `success` when the SDK reports a failed API call.
+#: The SDK documents that shape as `subtype: "success"` with `is_error: True`
+#: and `api_error_status` set, so `subtype` alone reads it as a success.
+API_ERROR_SUBTYPE = "api_error"
+
 # cpp#187: named ceiling for `ClaudeAgentOptions.max_buffer_size`, passed into
 # the SDK below. Default (unset) is the SDK's own 1MB
 # (`claude_agent_sdk._internal.transport.subprocess_cli._DEFAULT_MAX_BUFFER_SIZE`),
@@ -877,6 +882,23 @@ async def _run_agent_inner(
                             termination_reason: str | None = (
                                 f"SDK limit reached: {subtype}" if is_sdk_termination else None
                             )
+
+                            # cpp#319: a session the API killed (401, 502…) ends in
+                            # `subtype: "success"` with `is_error: True`. Decided
+                            # BEFORE cpp#144 and mika#940, which both gate on
+                            # `status == "success"`: an API death keeps its own
+                            # subtype and never becomes `pipeline_incomplete`. The
+                            # other `is_error` ends (`error_max_turns`,
+                            # `error_during_execution`) are not `success` and keep
+                            # their classification.
+                            if status == "success" and getattr(message, "is_error", False) is True:
+                                subtype = API_ERROR_SUBTYPE
+                                status = "error"
+                                termination_reason = (
+                                    "API call failed: "
+                                    f"api_error_status={getattr(message, 'api_error_status', None)}, "
+                                    f"terminal_reason={getattr(message, 'terminal_reason', None)}"
+                                )
 
                             # cpp#144: absent-operator question contract. A headless
                             # pilot has nobody to answer `AskUserQuestion`, so the
