@@ -51,6 +51,19 @@ def _config() -> ResolvedGuardrailConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_auth_resume_wait(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """cpp#321 AC5: the 401 resume waits 60 s before each attempt. The suite
+    never sleeps: every wait is recorded here instead."""
+    waits: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(agent_module, "_auth_resume_sleep", _record)
+    return waits
+
+
 def _assistant(blocks: list[Any], message_id: str) -> AssistantMessage:
     return AssistantMessage(content=blocks, model="claude-test", message_id=message_id)
 
@@ -961,6 +974,216 @@ async def test_cpp319_require_pr_contract_unchanged(
     )
     assert payload["status"] == "error", payload
     assert payload["subtype"] == "api_error", payload
+
+
+# ── cpp#321: a session ended on an expired OAuth token (401) is resumed ─────
+
+
+def _auth_failed(message_id: str = "msg_401") -> AssistantMessage:
+    """The synthetic message the CLI emits for a 401, before its result."""
+    return AssistantMessage(
+        content=[TextBlock(text="Failed to authenticate. API Error: 401 token has expired.")],
+        model="<synthetic>",
+        message_id=message_id,
+        error="authentication_failed",
+    )
+
+
+def _death_401(attempt: int = 0) -> list[Any]:
+    # A distinct message id per attempt, as the CLI emits one per session.
+    return [_auth_failed(f"msg_401_{attempt}"), _result_with_api_error(401)]
+
+
+def _healthy_resume() -> list[Any]:
+    return [
+        _assistant(
+            [ToolUseBlock(id="t321", name="Bash", input={"command": "gh pr create --fill"})],
+            message_id="msg_after_401",
+        ),
+        _result(),
+    ]
+
+
+async def _run_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scripts: list[list[Any]],
+    guardrails: SessionGuardrails | None = None,
+    fail_from: int | None = None,
+) -> tuple[int, dict[str, Any], str, _ClientSequence]:
+    seq = _install_client_sequence(monkeypatch, scripts, fail_from=fail_from)
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_cpp321",
+        permission_handler=_noop_permission,
+        guardrails=guardrails or SessionGuardrails(_config()),
+    )
+    captured = capsys.readouterr()
+    return exit_code, _terminal_payload(captured.out), captured.err, seq
+
+
+@pytest.mark.asyncio
+async def test_cpp321_resume_after_401(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _no_auth_resume_wait: list[float],
+) -> None:
+    """AC5, the four cases in one call, on the SDK's real shape."""
+    # 1. A 401 then a healthy resume: success, one logged resume after 60 s.
+    exit_code, payload, err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()], _healthy_resume()]
+    )
+    assert exit_code == 0, payload
+    assert payload["status"] == "success", payload
+    assert payload["subtype"] == "success", payload
+    assert len(seq.clients) == 2
+    assert seq.options[1].resume == "sess_test", seq.options[1]
+    assert seq.clients[1].queries == [agent_module.AUTH_RESUME_NUDGE]
+    assert _no_auth_resume_wait == [60.0]
+    assert "attempt 1/10" in err
+
+    # 2. A 401 at every attempt: api_error, exit 1, after 10 attempts.
+    _no_auth_resume_wait.clear()
+    exit_code, payload, err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()]] + [_death_401(n) for n in range(1, 11)]
+    )
+    assert exit_code == 1, payload
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == "api_error", payload
+    assert payload["api_error_status"] == 401, payload
+    assert "resume attempts after 401: 10/10" in payload["termination_reason"]
+    assert len(seq.clients) == 11
+    assert _no_auth_resume_wait == [60.0] * 10
+    assert "attempt 10/10" in err
+
+    # 3. A 502 is not resumed.
+    _no_auth_resume_wait.clear()
+    exit_code, payload, _err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), _result_with_api_error(502)], _healthy_resume()]
+    )
+    assert exit_code == 1, payload
+    assert payload["subtype"] == "api_error", payload
+    assert payload["api_error_status"] == 502, payload
+    assert "resume attempts" not in payload["termination_reason"]
+    assert len(seq.clients) == 1
+    assert _no_auth_resume_wait == []
+
+    # 4. A 401 after a terminal refusal is not resumed.
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: sed -i s/a/b/ f", terminal=True)
+    exit_code, payload, _err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()], _healthy_resume()], guardrails
+    )
+    assert exit_code == 1, payload
+    assert payload["subtype"] == "api_error", payload
+    assert len(seq.clients) == 1
+    assert _no_auth_resume_wait == []
+
+
+@pytest.mark.asyncio
+async def test_cpp321_interrupt_terminal_reason_is_not_resumed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC4: an interrupt `terminal_reason` excludes the resume, as in cpp#151."""
+    death = _result_with_api_error(401)
+    death.terminal_reason = "aborted_tools"
+    _code, payload, _err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), death], _healthy_resume()]
+    )
+    assert payload["subtype"] == "api_error", payload
+    assert len(seq.clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_cpp321_one_episode_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2: a 401 after the resumed session got a real model response is a
+    second episode, and is not resumed."""
+    second_life = [
+        _assistant([TextBlock(text="working again")], message_id="msg_alive"),
+        *_death_401(),
+    ]
+    exit_code, payload, _err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()], second_life, _healthy_resume()]
+    )
+    assert exit_code == 1, payload
+    assert payload["subtype"] == "api_error", payload
+    assert "resume attempts after 401: 1/10" in payload["termination_reason"]
+    assert len(seq.clients) == 2
+
+
+@pytest.mark.asyncio
+async def test_cpp321_budgets_are_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC4: with the cpp#151 budget at 0, a 401 is still resumed, and the
+    cpp#151 budget is left untouched by it."""
+    monkeypatch.setenv("CLAUDE_PILOT_MAX_DENY_RESUMES", "0")
+    guardrails = SessionGuardrails(_config())
+    guardrails.note_policy_deny("Bash: env | grep -c MIKA", terminal=False)
+    exit_code, payload, err, seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()], _healthy_resume()], guardrails
+    )
+    assert exit_code == 0, payload
+    assert payload["status"] == "success", payload
+    assert len(seq.clients) == 2
+    assert "followed a non-terminal policy denial" not in err
+
+
+@pytest.mark.asyncio
+async def test_cpp321_synthetic_401_turns_do_not_trip_stall(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The synthetic 401 message is not a model turn: with the default stall
+    threshold (5), ten failed attempts still reach the end of the budget."""
+    config = ResolvedGuardrailConfig(
+        maxTurns=200,
+        maxBudgetUsd=0.0,
+        stallThreshold=5,
+        emptyResponseThreshold=5,
+        idleTimeoutMs=0,
+        minTurnsBeforeDetection=0,
+    )
+    _code, payload, _err, seq = await _run_sequence(
+        monkeypatch,
+        capsys,
+        [[_init(), *_death_401()]] + [_death_401(n) for n in range(1, 11)],
+        guardrails := SessionGuardrails(config),
+    )
+    assert guardrails.abort_reason is None, guardrails.abort_reason
+    assert payload["subtype"] == "api_error", payload
+    assert len(seq.clients) == 11
+
+
+@pytest.mark.asyncio
+async def test_cpp321_resumed_client_that_never_comes_up_reports_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC3: when the resumed client cannot be opened, the deferred cpp#319
+    death is reported, with the attempts spent."""
+    exit_code, payload, _err, _seq = await _run_sequence(
+        monkeypatch, capsys, [[_init(), *_death_401()]], fail_from=1
+    )
+    assert exit_code == 1, payload
+    assert payload["status"] == "error", payload
+    assert payload["subtype"] == "api_error", payload
+    assert payload["api_error_status"] == 401, payload
+    assert "1/10" in payload["termination_reason"], payload
+
+
+def test_cpp321_resume_prompt_is_distinct_and_claims_nothing() -> None:
+    nudge = agent_module.AUTH_RESUME_NUDGE
+    assert nudge != agent_module.DENY_RESUME_NUDGE
+    assert "401" in nudge
+    assert "renewed" not in nudge.lower()
 
 
 # ── cpp#144: absent-operator question reclassifies a hollow "success" ────────

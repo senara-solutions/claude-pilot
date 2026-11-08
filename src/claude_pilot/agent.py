@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from claude_agent_sdk import (
@@ -47,6 +48,7 @@ from .tier1 import DENIED_BASH_PATTERNS_HINT
 from .transcript_writer import record_sdk_message
 from .types import PilotConfig, ResultJson
 from .ui import (
+    log_auth_resume,
     log_cache_usage,
     log_deny_resume,
     log_deny_resume_failed,
@@ -402,6 +404,116 @@ class _DenyResumeController:
         log_deny_resume(self._used, self._budget, subtype)
 
 
+# ── cpp#321: resume a session the API ended on an expired OAuth token ────────
+#
+# The host OAuth token lives 8 h, and the egress proxy injects it host-side on
+# every request. Between its expiry and the renewal of the host file, every
+# request of the pilot gets a 401 and the session ends (cpp#319 classifies it
+# `api_error`). The renewals measured land 12 s and 3 min 15 s after the 401.
+# This reuses the cpp#151 resume path (`resume=<session id>`) under its OWN
+# budget: a blind, fixed wait — the credential file is never read, and the
+# sandbox does not mount it — then a resume, at most AUTH_RESUME_MAX_ATTEMPTS
+# times, for ONE 401 episode per run. Nothing else is resumed: a 502 and every
+# other `api_error` keep their cpp#319 classification, and the two cpp#151
+# exclusions (terminal refusal, interrupt `terminal_reason`) hold here too.
+
+#: The only `api_error_status` this resume covers.
+AUTH_RESUME_STATUS = 401
+
+#: Fixed wait before each resume, in seconds.
+AUTH_RESUME_WAIT_SECONDS = 60.0
+
+#: Resumes per run: 10 x 60 s = 10 minutes, past the longest measured episode.
+AUTH_RESUME_MAX_ATTEMPTS = 10
+
+#: The synthetic `AssistantMessage.error` the CLI emits for a 401. It is not a
+#: model turn: fed to the guardrails, ten of them in a row would trip
+#: `stall_detected` (five tool-less turns) long before the budget is spent.
+AUTH_FAILED_MESSAGE_ERROR = "authentication_failed"
+
+#: The follow-up prompt of a 401 resume. It claims nothing about the token: the
+#: wait is blind, and a resume that still gets a 401 simply ends again.
+AUTH_RESUME_NUDGE = (
+    "The previous turn ended because an API call was rejected with 401 "
+    "(authentication expired), not because of anything in your work. "
+    "claude-pilot waited and reopened this same session. Continue the task "
+    "from where it stopped: do not redo steps that already completed, and "
+    "check the state of the worktree before repeating a command."
+)
+
+#: The wait, injectable so the test suite never sleeps (cpp#321 AC5).
+_auth_resume_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+class _AuthResumeController:
+    """Bounded, blind, logged resume of a session the API ended on a 401.
+
+    One episode per run: once a resumed session gets a real model response,
+    the episode is over and a later 401 is not resumed. The budget is separate
+    from `_DenyResumeController`'s; neither consumes the other.
+    """
+
+    def __init__(
+        self,
+        budget: int = AUTH_RESUME_MAX_ATTEMPTS,
+        wait_seconds: float = AUTH_RESUME_WAIT_SECONDS,
+    ) -> None:
+        self._budget = max(0, budget)
+        self._used = 0
+        self._armed = False
+        self._episode_over = False
+        self.wait_seconds = wait_seconds
+
+    @property
+    def budget(self) -> int:
+        return self._budget
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def armed(self) -> bool:
+        return self._armed
+
+    def disarm(self) -> None:
+        self._armed = False
+
+    def note_assistant(self, message: Any) -> None:
+        """Close the episode on the first real model response after a resume."""
+        if (
+            self._used
+            and getattr(message, "error", None) is None
+            and getattr(message, "parent_tool_use_id", None) is None
+        ):
+            self._episode_over = True
+
+    def should_resume(
+        self,
+        message: Any,
+        subtype: str,
+        guardrails: SessionGuardrails,
+        session_id: str | None,
+    ) -> bool:
+        if subtype != "success" or getattr(message, "is_error", False) is not True:
+            return False
+        if getattr(message, "api_error_status", None) != AUTH_RESUME_STATUS:
+            return False
+        if self._episode_over or self._used >= self._budget:
+            return False
+        if session_id is None:
+            return False
+        if getattr(message, "terminal_reason", None) in ABORT_TERMINAL_REASONS:
+            return False
+        return not guardrails.terminal_policy_deny
+
+    def arm(self) -> None:
+        """Spend one attempt and ask the session loop to wait, then reconnect."""
+        self._used += 1
+        self._armed = True
+        log_auth_resume(self._used, self._budget, self.wait_seconds)
+
+
 def _session_options(options: Any, resume_from: str | None) -> Any:
     """The SDK options for one session: the originals, or a resuming copy.
 
@@ -606,6 +718,12 @@ async def _run_agent_inner(
     # survivable refusal. One controller per run, so the budget is per run and
     # not per resumed session.
     deny_resume = _DenyResumeController(_resolve_max_deny_resumes())
+    # cpp#321: the 401 resume, under its own budget. `last_resume` names the
+    # controller that armed the latest reconnect, so a resumed session that
+    # never comes up reports the death that was deferred, not an older one.
+    auth_resume = _AuthResumeController()
+    last_resume: Literal["deny", "auth"] | None = None
+    resume_prompt = DENY_RESUME_NUDGE
 
     # Hoisted out of the session loop below: the guardrails object spans the
     # whole run, so its abort watcher and its `unhandled_message_types` ledger
@@ -632,7 +750,7 @@ async def _run_agent_inner(
                 async with ClaudeSDKClient(
                     options=_session_options(options, resume_from)
                 ) as client:
-                    await client.query(prompt if resume_from is None else DENY_RESUME_NUDGE)
+                    await client.query(prompt if resume_from is None else resume_prompt)
 
                     async for message in _merge_stream(client, guardrail_watcher):
                         if message is _GUARDRAIL_TRIP:
@@ -770,7 +888,14 @@ async def _run_agent_inner(
                                     rejected=True,
                                     detail="Assistant turn refused: rate_limit (429)",
                                 )
-                            event = guardrails.on_assistant_message(
+                            auth_resume.note_assistant(message)
+                            # cpp#321: the CLI's synthetic 401 message is not a
+                            # model turn; counting it would trip stall_detected
+                            # during the bounded 401 resume.
+                            auth_failed = (
+                                getattr(message, "error", None) == AUTH_FAILED_MESSAGE_ERROR
+                            )
+                            event = None if auth_failed else guardrails.on_assistant_message(
                                 _content_blocks(message),
                                 message_id=getattr(message, "message_id", None),
                                 # cpp#185 D1: the SDK usage dict for this call —
@@ -837,6 +962,12 @@ async def _run_agent_inner(
                             # that fresh client never comes up.
                             if deny_resume.should_resume(message, subtype, guardrails, session_id):
                                 deny_resume.arm(subtype)
+                                last_resume = "deny"
+                                break
+                            # cpp#321: same placement and same `break`, for a 401.
+                            if auth_resume.should_resume(message, subtype, guardrails, session_id):
+                                auth_resume.arm()
+                                last_resume = "auth"
                                 break
 
                             # cpp#10: flush the marker for the still-open final turn
@@ -899,6 +1030,11 @@ async def _run_agent_inner(
                                     f"api_error_status={getattr(message, 'api_error_status', None)}, "
                                     f"terminal_reason={getattr(message, 'terminal_reason', None)}"
                                 )
+                                if auth_resume.used:
+                                    termination_reason += (
+                                        f", resume attempts after 401: "
+                                        f"{auth_resume.used}/{auth_resume.budget}"
+                                    )
 
                             # cpp#144: absent-operator question contract. A headless
                             # pilot has nobody to answer `AskUserQuestion`, so the
@@ -1103,9 +1239,20 @@ async def _run_agent_inner(
                 )
                 break
 
-            if not deny_resume.armed:
+            if deny_resume.armed:
+                deny_resume.disarm()
+                resume_prompt = DENY_RESUME_NUDGE
+            elif auth_resume.armed:
+                auth_resume.disarm()
+                resume_prompt = AUTH_RESUME_NUDGE
+                # cpp#321: the wait is time the idle guardrail must not charge.
+                guardrails.pause_idle_timer()
+                try:
+                    await _auth_resume_sleep(auth_resume.wait_seconds)
+                finally:
+                    guardrails.resume_idle_timer()
+            else:
                 break
-            deny_resume.disarm()
             resume_from = session_id
     finally:
         guardrail_watcher.cancel()
@@ -1138,6 +1285,30 @@ async def _run_agent_inner(
     # dispatch-lib's `jq -r '.status // empty'` extraction would yield an
     # empty string. With it, downstream parsers always see a `^{` JSON line
     # with status="error" and a non-success subtype.
+    if not emitted_terminal and last_resume == "auth":
+        # cpp#321: a 401 resume was armed and the resumed session produced no
+        # terminal message. Report the cpp#319 death that was deferred.
+        duration_ms = int((time.monotonic() - start_time) * 1000)
+        _emit_result(
+            ResultJson(
+                status="error",
+                subtype=API_ERROR_SUBTYPE,
+                task_id=task_id,
+                session_id=session_id,
+                turns=guardrails.turns,
+                cost_usd=None,
+                duration_ms=duration_ms,
+                termination_reason=(
+                    "API call failed: api_error_status=401, and the resumed "
+                    "session produced no terminal message. Resume attempts "
+                    f"after 401: {auth_resume.used}/{auth_resume.budget}."
+                ),
+                api_error_status=AUTH_RESUME_STATUS,
+            )
+        )
+        emitted_terminal = True
+        exit_code = 1
+
     if not emitted_terminal and deny_resume.deferred_subtype is not None:
         # cpp#151: a resume was armed, so the ResultMessage branch emitted
         # nothing — and then the resumed session produced no terminal message of
