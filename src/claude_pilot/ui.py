@@ -142,6 +142,19 @@ def log_deny_resume(attempt: int, budget: int, subtype: str) -> None:
     )
 
 
+def log_auth_resume(attempt: int, budget: int, wait_seconds: float) -> None:
+    """cpp#321 — a session the API ended on a 401 is waited on, then resumed.
+
+    Never silent, like `log_deny_resume`: each attempt is one line with its rank
+    and the budget, so a 10-minute wait reads as such in the log.
+    """
+    _log(
+        f"\n{ORANGE}[resume]{RESET} {BOLD}api_error 401{RESET} — waiting "
+        f"{wait_seconds:.0f}s, then resuming the session "
+        f"(attempt {attempt}/{budget})"
+    )
+
+
 def log_deny_resume_failed(detail: str) -> None:
     """cpp#151 B2 — the resume nudge could not be delivered.
 
