@@ -719,6 +719,22 @@ def _bash_allow_is_chain_safe(
     if pd.decision == "allow" and pd.rule_id == "bash-sed-range-extract-3178":
         return True
 
+    # `bash-sed-range-extract-3178-fixtures` (cpp#328) — the bounded widening
+    # of the branch above, same place, same order, same reasoning: its
+    # anchored YAML regex admits exactly `sed -n '<N>,<M>p' <aggregate> >>
+    # skills/bundled/_shared/tests/lib-dispatch-lib-<nom>-fixtures.sh`, in
+    # APPEND only (`>` is not in the pattern), space-separated only. The
+    # target passes the control plane (cpp#42) only through the paired
+    # `_CPP328_FIXTURES_*` entry of the exception, coupled to this rule_id.
+    # SOLE CONSUMER: senara-solutions/mika#3178. REMOVAL CONDITION: removed
+    # together with the cpp#325 branch above, when mika#3178 is closed
+    # (dormant claude-pilot#326).
+    if (
+        pd.decision == "allow"
+        and pd.rule_id == "bash-sed-range-extract-3178-fixtures"
+    ):
+        return True
+
     # `bash-for-loop-safe-body` (cpp#92) — sanctioned exception to chain-safe's
     # segment split, mirroring `bash-git-show-redirect`. The rule's YAML regex
     # constrains the ENTIRE command shape (anchored `^for … done$`, enumerated
@@ -1145,8 +1161,9 @@ _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\.mika(/|$)"),                  # ~/.mika runtime config
 )
 
-# THE ONE EXCEPTION to the control-plane denylist above (cpp#42), ratified by
-# the operator on 2026-11-27 in the body of cpp#325 (amendment, AC7 to AC10).
+# THE RATIFIED EXCEPTIONS to the control-plane denylist above (cpp#42). The
+# first was ratified by the operator on 2026-11-27 in the body of cpp#325
+# (amendment, AC7 to AC10); its bounded widening, cpp#328, follows it below.
 # It lives HERE, next to the list it pierces, in claude-pilot's own code: no
 # file the mika loop can edit carries it.
 #
@@ -1178,6 +1195,49 @@ _CPP325_RANGE_EXTRACT_SEGMENT_RE = re.compile(
     r"^sed +-n +'[0-9]+,[0-9]+p' +skills/bundled/_shared/test-dispatch-lib\.sh"
     r" +>>? *skills/bundled/_shared/tests/test_dispatch_lib_[a-z0-9_]+\.sh *$"
 )
+
+# The bounded widening of the exception above (cpp#328, decision of
+# 2026-11-27 in the body of cpp#328), for the same sole consumer: mika#3178
+# stores the groom-gate helpers shared across families in a fixtures library
+# (flight 2, PR mika#3186). Same four conditions, same place, its own pair:
+#
+# * PATH: the RESOLVED worktree-relative path must match
+#   `lib-dispatch-lib-<nom>-fixtures.sh` directly in `tests/`, anchored at both
+#   ends. The `-fixtures` suffix keeps the suite skeleton
+#   `lib-dispatch-lib-suite.sh` and the library `lib-mika-bin.sh` out.
+# * WRITE: a `bash-redirect` segment admitted under
+#   `_CPP328_FIXTURES_RULE_ID`, whose shape is APPEND ONLY: `>>`, never `>`
+#   (a library starts with a header written by Write; `>` could clobber one).
+# * The pair does not cross the cpp#325 one: the cpp#325 shape with this
+#   rule_id, or this shape with the cpp#325 rule_id, stays refused.
+#
+# SOLE CONSUMER: senara-solutions/mika#3178. REMOVAL CONDITION: remove this
+# entry together with the cpp#325 one and the
+# `bash-sed-range-extract-3178-fixtures` rule when mika#3178 is closed
+# (dormant claude-pilot#326).
+_CPP328_FIXTURES_RULE_ID = "bash-sed-range-extract-3178-fixtures"
+_CPP328_FIXTURES_TARGET_RE = re.compile(
+    r"^skills/bundled/_shared/tests/lib-dispatch-lib-[a-z0-9_-]+-fixtures\.sh$"
+)
+# Byte-identical to the YAML rule's pattern; a test pins the equality.
+_CPP328_FIXTURES_SEGMENT_RE = re.compile(
+    r"^sed +-n +'[0-9]+,[0-9]+p' +skills/bundled/_shared/test-dispatch-lib\.sh"
+    r" +>> *skills/bundled/_shared/tests/lib-dispatch-lib-[a-z0-9_-]+-fixtures\.sh *$"
+)
+
+# The ratified exceptions, as PAIRED entries keyed on the admitting rule_id:
+# a rule_id selects its own segment shape and its own path anchor, and no
+# other.
+_CONTROL_PLANE_EXCEPTIONS: dict[str, tuple[re.Pattern[str], re.Pattern[str]]] = {
+    _CPP325_RANGE_EXTRACT_RULE_ID: (
+        _CPP325_RANGE_EXTRACT_SEGMENT_RE,
+        _CPP325_RANGE_EXTRACT_TARGET_RE,
+    ),
+    _CPP328_FIXTURES_RULE_ID: (
+        _CPP328_FIXTURES_SEGMENT_RE,
+        _CPP328_FIXTURES_TARGET_RE,
+    ),
+}
 
 # The literal path each pattern above protects, one per pattern, for the
 # question the patterns cannot answer: whether a DIRECTORY contains control
@@ -1580,16 +1640,20 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
 def _is_cpp325_control_plane_exception(
     dest: str, cwd: str, *, seg: str, kind: str, rule_id: str | None
 ) -> bool:
-    """Whether ``dest`` falls under the single cpp#325 exception to the
-    control-plane denylist (see ``_CPP325_RANGE_EXTRACT_TARGET_RE``). Requires
-    all four: the write is a ``bash-redirect``, the policy admitted the command
-    under ``_CPP325_RANGE_EXTRACT_RULE_ID``, the segment has the rule's exact
-    shape, and the RESOLVED worktree-relative path matches the anchored
-    pattern. Any failure to resolve is ``False`` (the control-plane veto then
-    applies)."""
-    if kind != "bash-redirect" or rule_id != _CPP325_RANGE_EXTRACT_RULE_ID:
+    """Whether ``dest`` falls under one of the ratified exceptions to the
+    control-plane denylist (``_CONTROL_PLANE_EXCEPTIONS``: cpp#325 and its
+    bounded widening cpp#328). Requires all four: the write is a
+    ``bash-redirect``, the policy admitted the command under a rule_id of the
+    table, the segment has THAT entry's exact shape, and the RESOLVED
+    worktree-relative path matches THAT entry's anchored pattern. Any failure
+    to resolve is ``False`` (the control-plane veto then applies)."""
+    if kind != "bash-redirect" or rule_id is None:
         return False
-    if _CPP325_RANGE_EXTRACT_SEGMENT_RE.match(seg) is None:
+    entry = _CONTROL_PLANE_EXCEPTIONS.get(rule_id)
+    if entry is None:
+        return False
+    segment_re, target_re = entry
+    if segment_re.match(seg) is None:
         return False
     try:
         resolved_cwd = Path(cwd).resolve(strict=True)
@@ -1602,7 +1666,7 @@ def _is_cpp325_control_plane_exception(
         rel = abs_path.relative_to(resolved_cwd).as_posix()
     except ValueError:
         return False
-    return _CPP325_RANGE_EXTRACT_TARGET_RE.match(rel) is not None
+    return target_re.match(rel) is not None
 
 
 # ── Sanctioned /tmp scratch directory for `mkdir` (cpp#143) ────────────────────
@@ -2198,8 +2262,8 @@ def _destination_veto_reason(
                     "(cpp#38 symlink-traversal containment)"
                 )
             if _is_control_plane_path(dest, cwd):
-                # cpp#325: the single ratified exception, coupled to the
-                # admitting rule_id (only the admission caller passes one).
+                # cpp#325 / cpp#328: the ratified exceptions, each coupled to
+                # its admitting rule_id (only the admission caller passes one).
                 if _is_cpp325_control_plane_exception(
                     dest, cwd, seg=seg, kind=kind, rule_id=rule_id
                 ):

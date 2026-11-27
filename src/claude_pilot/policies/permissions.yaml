@@ -354,6 +354,32 @@ rules:
     decision: allow
     reason: "sed -n '<N>,<M>p' de l'agrégat skills/bundled/_shared/test-dispatch-lib.sh vers skills/bundled/_shared/tests/test_dispatch_lib_<nom>.sh (> ou >>) -- seul consommateur : senara-solutions/mika#3178 (scission mot pour mot, D1(a)) ; à retirer quand mika#3178 est fermée (ticket dormant de claude-pilot) ; cible revalidée par _destination_veto_reason ; permissions.py _bash_allow_is_chain_safe honore ce rule_id (cpp#325)"
 
+  # Règle sœur de la précédente (cpp#328, élargissement borné de cpp#325,
+  # décision du 2026-11-27). SEUL CONSOMMATEUR : mika#3178, dont la porte de
+  # groom range ses helpers partagés entre familles dans une bibliothèque de
+  # fixtures (vol 2, PR mika#3186). CONDITION DE RETRAIT : se retire avec
+  # `bash-sed-range-extract-3178`, quand senara-solutions/mika#3178 est
+  # fermée, dans le ticket dormant claude-pilot#326.
+  #
+  # Forme admise, et rien d'autre, seule sur sa ligne, en AJOUT SEULEMENT :
+  #   sed -n '<N>,<M>p' <agrégat> >> <tests>/lib-dispatch-lib-<nom>-fixtures.sh
+  # * `>>` littéral, jamais `>` : une bibliothèque commence par un en-tête
+  #   écrit par Write, et `>` écraserait une bibliothèque existante ;
+  # * le suffixe `-fixtures` exclut l'ossature `lib-dispatch-lib-suite.sh` et
+  #   la bibliothèque `lib-mika-bin.sh` ;
+  # * tout le reste est celui de `bash-sed-range-extract-3178` : espaces
+  #   littéraux seulement, script exactement `'<N>,<M>p'`, option `-n` seule,
+  #   source littérale de l'agrégat, cible relative sans guillemet, `..`, `~`
+  #   ni `$` (`.` n'est pas dans la classe du nom).
+  # La cible est sur le plan de contrôle (cpp#42) : elle n'y passe que par
+  # l'entrée appariée `_CPP328_FIXTURES_*` de l'exception tenue dans
+  # permissions.py, couplée à ce rule_id. Ce fichier ne la porte pas.
+  - id: bash-sed-range-extract-3178-fixtures
+    tool: Bash
+    pattern: '^sed +-n +''[0-9]+,[0-9]+p'' +skills/bundled/_shared/test-dispatch-lib\.sh +>> *skills/bundled/_shared/tests/lib-dispatch-lib-[a-z0-9_-]+-fixtures\.sh *$'
+    decision: allow
+    reason: "sed -n '<N>,<M>p' de l'agrégat skills/bundled/_shared/test-dispatch-lib.sh vers skills/bundled/_shared/tests/lib-dispatch-lib-<nom>-fixtures.sh, en >> seulement (> refusé) -- seul consommateur : senara-solutions/mika#3178 ; se retire avec bash-sed-range-extract-3178 quand mika#3178 est fermée (claude-pilot#326) ; exception au plan de contrôle cpp#42 tenue dans permissions.py ; élargissement borné de cpp#325 (cpp#328)"
+
   # The subcommand must be a whole word. The forms each one is admitted in
   # (reads only: no write, no program run, no local ref, config or worktree
   # change) are a closed list in `tier1.git_read_overreaches`, which
