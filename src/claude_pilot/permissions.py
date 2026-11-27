@@ -1196,8 +1196,9 @@ _CPP325_RANGE_EXTRACT_SEGMENT_RE = re.compile(
     r" +>>? *skills/bundled/_shared/tests/test_dispatch_lib_[a-z0-9_]+\.sh *$"
 )
 
-# The bounded widening of the exception above (cpp#328, decision of
-# 2026-11-27 in the body of cpp#328), for the same sole consumer: mika#3178
+# The bounded widening of the cpp#325 exception to the cpp#42 control-plane
+# denylist (cpp#328, decision of 2026-11-27 in the body of cpp#328), for the
+# same sole consumer: mika#3178
 # stores the groom-gate helpers shared across families in a fixtures library
 # (flight 2, PR mika#3186). Same four conditions, same place, its own pair:
 #

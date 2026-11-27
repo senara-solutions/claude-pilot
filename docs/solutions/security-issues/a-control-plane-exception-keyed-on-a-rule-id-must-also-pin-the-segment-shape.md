@@ -46,9 +46,26 @@ pin the equality with a test, so the two cannot drift apart. Resolve the path
 before matching it, so a symlinked directory or target cannot pass under the
 anchored name.
 
+## Widening one: add a paired entry, not a wider pattern (cpp#328)
+
+cpp#328 admitted a second target shape, `tests/lib-dispatch-lib-<nom>-fixtures.sh`,
+in append (`>>`) only. Widening the existing target pattern to an alternation
+would have let the cpp#325 rule_id reach the new name and, worse, carried its
+`>>?` (truncation allowed) onto a name where only `>>` is ratified. The widening
+is instead a sister rule with its own rule_id, and the exception became a table
+`_CONTROL_PLANE_EXCEPTIONS: rule_id -> (segment shape, path anchor)`. A rule_id
+selects its own pair and no other, so neither pair can cross the other: the
+cpp#325 shape under the new rule_id, and the new shape under the cpp#325
+rule_id, both stay refused, and a test asserts each. The `>`/`>>` distinction
+lives in the sister pattern itself (`+>> *`, never `>>?`), at both the policy
+and the control-plane level.
+
 ## Where
 
 `src/claude_pilot/permissions.py`: `_CPP325_RANGE_EXTRACT_RULE_ID`,
 `_CPP325_RANGE_EXTRACT_TARGET_RE`, `_CPP325_RANGE_EXTRACT_SEGMENT_RE`,
+`_CPP328_FIXTURES_RULE_ID`, `_CPP328_FIXTURES_TARGET_RE`,
+`_CPP328_FIXTURES_SEGMENT_RE`, `_CONTROL_PLANE_EXCEPTIONS`,
 `_is_cpp325_control_plane_exception`. Tests:
-`tests/test_cpp325_sed_range_extract.py`.
+`tests/test_cpp325_sed_range_extract.py`,
+`tests/test_cpp328_sed_range_extract_fixtures.py`.
