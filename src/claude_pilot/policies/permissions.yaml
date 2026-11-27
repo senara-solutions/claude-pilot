@@ -318,6 +318,42 @@ rules:
     decision: allow
     reason: "git show <ref>:<path> > <relative-path> -- source is ANY git-ref-shaped token (SHA, HEAD, FETCH_HEAD, ORIG_HEAD, branch/tag, origin/main, ...; cpp#166 widened from hex-only); NOT immutable -- mutability was never the safety boundary (cpp#43); safety rests entirely on the literal redirect target (no absolute / ~ / .. / shell-expansion) plus the control-plane denylist (cpp#42), never on source-immutability; permissions.py _bash_allow_is_chain_safe honors this rule_id as a sanctioned redirect (cpp#35)"
 
+  # Extraction de plage pour la scission de mika#3178 (cpp#325, décision D1(a)
+  # du corps de mika#3178, 2026-11-27). SEUL CONSOMMATEUR : mika#3178, qui
+  # déplace mot pour mot les blocs de l'agrégat
+  # `skills/bundled/_shared/test-dispatch-lib.sh` vers des suites autonomes
+  # sous `skills/bundled/_shared/tests/`. CONDITION DE RETRAIT : la règle se
+  # retire quand senara-solutions/mika#3178 est fermée ; le retrait est suivi
+  # par un ticket dormant de claude-pilot ouvert avec la PR de cpp#325.
+  #
+  # Forme admise, et rien d'autre, seule sur sa ligne :
+  #   sed -n '<N>,<M>p' <agrégat> > <tests>/test_dispatch_lib_<nom>.sh
+  #   sed -n '<N>,<M>p' <agrégat> >> <tests>/test_dispatch_lib_<nom>.sh
+  # * séparateurs en espaces littéraux (` +`), jamais `\s` : `\s` admettrait un
+  #   saut de ligne, donc une seconde commande ;
+  # * script sed exactement `'<N>,<M>p'`, deux entiers décimaux : ni `w`, ni
+  #   `e`, ni `r`, ni `s///w`, ni `$`, ni adresse regex ; option `-n` seule ;
+  # * source : le chemin littéral de l'agrégat, relatif au worktree ;
+  # * cible : chemin littéral relatif, nom `test_dispatch_lib_[a-z0-9_]+\.sh`
+  #   dans `tests/` même (pas de sous-répertoire), sans guillemet, `..`, `~`
+  #   ni `$`.
+  # L'ancre `^…$` porte la charge, comme pour `bash-git-show-redirect`.
+  # `_bash_allow_is_chain_safe` honore ce rule_id APRÈS les vetos de
+  # substitution, heredoc, here-string et `&` (couplage par rule_id, échec
+  # fermé). La cible est en plus revalidée au point d'admission par
+  # `_destination_veto_reason` (write-kind `bash-redirect` : confinement au
+  # worktree sensible aux liens symboliques, plan de contrôle). La cible est
+  # sur le plan de contrôle (`skills/bundled/`, cpp#42) : elle n'y passe que
+  # par l'exception unique tenue dans permissions.py
+  # (`_CPP325_RANGE_EXTRACT_TARGET_RE`), couplée à ce rule_id. Ce fichier ne la
+  # porte pas : renommer ou retirer cette règle fait tomber l'exception.
+  # `sed -i` reste refusé, y compris sur l'agrégat.
+  - id: bash-sed-range-extract-3178
+    tool: Bash
+    pattern: '^sed +-n +''[0-9]+,[0-9]+p'' +skills/bundled/_shared/test-dispatch-lib\.sh +>>? *skills/bundled/_shared/tests/test_dispatch_lib_[a-z0-9_]+\.sh *$'
+    decision: allow
+    reason: "sed -n '<N>,<M>p' de l'agrégat skills/bundled/_shared/test-dispatch-lib.sh vers skills/bundled/_shared/tests/test_dispatch_lib_<nom>.sh (> ou >>) -- seul consommateur : senara-solutions/mika#3178 (scission mot pour mot, D1(a)) ; à retirer quand mika#3178 est fermée (ticket dormant de claude-pilot) ; cible revalidée par _destination_veto_reason ; permissions.py _bash_allow_is_chain_safe honore ce rule_id (cpp#325)"
+
   # The subcommand must be a whole word. The forms each one is admitted in
   # (reads only: no write, no program run, no local ref, config or worktree
   # change) are a closed list in `tier1.git_read_overreaches`, which

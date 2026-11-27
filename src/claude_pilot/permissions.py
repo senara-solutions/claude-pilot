@@ -697,6 +697,28 @@ def _bash_allow_is_chain_safe(
     if pd.decision == "allow" and pd.rule_id == "bash-git-show-redirect":
         return True
 
+    # `bash-sed-range-extract-3178` (cpp#325) — second sanctioned exception to
+    # the wholesale `>` veto, in the same place and order as
+    # `bash-git-show-redirect`: after the substitution / heredoc / here-string
+    # / bare-`&` vetoes above. Its anchored YAML regex admits exactly
+    # `sed -n '<N>,<M>p' skills/bundled/_shared/test-dispatch-lib.sh >[>]
+    # skills/bundled/_shared/tests/test_dispatch_lib_<nom>.sh`, space-separated
+    # only (no `\s`, so no newline), so no second command can ride it. The
+    # target is ALSO re-validated at the admission point: `_segment_write_kind`
+    # classifies the segment `bash-redirect`, so `_destination_veto_reason`
+    # resolves it (symlink-aware worktree containment + control plane) in
+    # `create_permission_handler`. The target sits on the control plane
+    # (`skills/bundled/`), so it passes there only through the single
+    # ratified exception `_CPP325_RANGE_EXTRACT_TARGET_RE`, coupled to this
+    # same rule_id. Fails CLOSED on rename or removal.
+    #
+    # SOLE CONSUMER: senara-solutions/mika#3178 (the verbatim split of the
+    # dispatch-lib test aggregate, decision D1(a)). REMOVAL CONDITION: remove
+    # this branch together with the YAML rule when mika#3178 is closed; a
+    # dormant claude-pilot ticket opened with cpp#325's PR tracks it.
+    if pd.decision == "allow" and pd.rule_id == "bash-sed-range-extract-3178":
+        return True
+
     # `bash-for-loop-safe-body` (cpp#92) — sanctioned exception to chain-safe's
     # segment split, mirroring `bash-git-show-redirect`. The rule's YAML regex
     # constrains the ENTIRE command shape (anchored `^for … done$`, enumerated
@@ -1123,6 +1145,40 @@ _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\.mika(/|$)"),                  # ~/.mika runtime config
 )
 
+# THE ONE EXCEPTION to the control-plane denylist above (cpp#42), ratified by
+# the operator on 2026-11-27 in the body of cpp#325 (amendment, AC7 to AC10).
+# It lives HERE, next to the list it pierces, in claude-pilot's own code: no
+# file the mika loop can edit carries it.
+#
+# * PATH: the canonical worktree-relative resolved path must match this single
+#   anchored pattern. Resolution happens first, so a symlinked `tests/` or a
+#   symlinked target file that lands anywhere else (`.git/hooks/...`, the
+#   aggregate, `dispatch-lib.sh`) does not match and stays refused.
+# * WRITE: only a `bash-redirect` segment, and only when the policy admitted
+#   the WHOLE command under `_CPP325_RANGE_EXTRACT_RULE_ID`. The rule_id is
+#   passed in by the admission caller; every other caller passes none. A rename
+#   or removal of the YAML rule makes the comparison fail, and the exception
+#   falls with it (fail closed).
+# * STILL REFUSED: any other Bash write under `skills/bundled/`, including to
+#   this same directory by another form or under another rule_id, and to the
+#   aggregate.
+#
+# SOLE CONSUMER: senara-solutions/mika#3178 (verbatim split of the dispatch-lib
+# test aggregate). REMOVAL CONDITION: remove this exception together with the
+# `bash-sed-range-extract-3178` rule when mika#3178 is closed; a dormant
+# claude-pilot ticket opened with cpp#325's PR tracks it.
+_CPP325_RANGE_EXTRACT_RULE_ID = "bash-sed-range-extract-3178"
+_CPP325_RANGE_EXTRACT_TARGET_RE = re.compile(
+    r"^skills/bundled/_shared/tests/test_dispatch_lib_[a-z0-9_]+\.sh$"
+)
+# The segment itself must ALSO have the rule's exact shape, so the rule_id
+# alone never carries another redirect form through. Byte-identical to the
+# YAML rule's pattern; a test pins the equality.
+_CPP325_RANGE_EXTRACT_SEGMENT_RE = re.compile(
+    r"^sed +-n +'[0-9]+,[0-9]+p' +skills/bundled/_shared/test-dispatch-lib\.sh"
+    r" +>>? *skills/bundled/_shared/tests/test_dispatch_lib_[a-z0-9_]+\.sh *$"
+)
+
 # The literal path each pattern above protects, one per pattern, for the
 # question the patterns cannot answer: whether a DIRECTORY contains control
 # plane. A cargo build directory is such a directory — `cargo clean` removes it
@@ -1521,6 +1577,34 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
     return any(pat.match(rel) for pat in _CONTROL_PLANE_PATTERNS)
 
 
+def _is_cpp325_control_plane_exception(
+    dest: str, cwd: str, *, seg: str, kind: str, rule_id: str | None
+) -> bool:
+    """Whether ``dest`` falls under the single cpp#325 exception to the
+    control-plane denylist (see ``_CPP325_RANGE_EXTRACT_TARGET_RE``). Requires
+    all four: the write is a ``bash-redirect``, the policy admitted the command
+    under ``_CPP325_RANGE_EXTRACT_RULE_ID``, the segment has the rule's exact
+    shape, and the RESOLVED worktree-relative path matches the anchored
+    pattern. Any failure to resolve is ``False`` (the control-plane veto then
+    applies)."""
+    if kind != "bash-redirect" or rule_id != _CPP325_RANGE_EXTRACT_RULE_ID:
+        return False
+    if _CPP325_RANGE_EXTRACT_SEGMENT_RE.match(seg) is None:
+        return False
+    try:
+        resolved_cwd = Path(cwd).resolve(strict=True)
+    except OSError:
+        return False
+    if Path(dest).is_absolute():
+        return False
+    abs_path = (resolved_cwd / dest).resolve(strict=False)
+    try:
+        rel = abs_path.relative_to(resolved_cwd).as_posix()
+    except ValueError:
+        return False
+    return _CPP325_RANGE_EXTRACT_TARGET_RE.match(rel) is not None
+
+
 # ── Sanctioned /tmp scratch directory for `mkdir` (cpp#143) ────────────────────
 #
 # `_destination_veto_reason` (below) is otherwise blind to any distinction
@@ -1669,7 +1753,11 @@ def _sed_write_veto_reason(command: str, cwd: str) -> str | None:
 
 
 def _destination_veto_reason(
-    command: str, cwd: str, *, for_lethality: bool = False
+    command: str,
+    cwd: str,
+    *,
+    for_lethality: bool = False,
+    rule_id: str | None = None,
 ) -> str | None:
     """Veto reason if any write-capable segment's destination escapes the
     worktree (cpp#38) or lands on the agent control plane (cpp#42); else ``None``.
@@ -2110,6 +2198,12 @@ def _destination_veto_reason(
                     "(cpp#38 symlink-traversal containment)"
                 )
             if _is_control_plane_path(dest, cwd):
+                # cpp#325: the single ratified exception, coupled to the
+                # admitting rule_id (only the admission caller passes one).
+                if _is_cpp325_control_plane_exception(
+                    dest, cwd, seg=seg, kind=kind, rule_id=rule_id
+                ):
+                    continue
                 return (
                     f"destination {dest!r} is on the agent control plane "
                     "(cpp#42 denylist)"
@@ -2767,7 +2861,7 @@ def create_permission_handler(
                 # sandbox in intent. It halts.
                 if tool_name == "Bash":
                     dest_veto = _destination_veto_reason(
-                        tool_input.get("command", ""), cwd
+                        tool_input.get("command", ""), cwd, rule_id=pd.rule_id
                     )
                     if dest_veto is not None:
                         # cpp#151 B0: `terminal=True` is a LITERAL here, not a

@@ -213,3 +213,83 @@ def test_cpp325_symlinked_target_outside_worktree_refused_at_admission(
         assert result.message == veto, (cmd, result.message)
         assert result.interrupt is True, cmd
     assert list(outside.iterdir()) == []
+
+
+# ── AC7 + AC8 : l'exception au plan de contrôle (amendement du 2026-11-27) ──
+
+_CP = "is on the agent control plane (cpp#42 denylist)"
+
+
+def test_cpp325_control_plane_exception_admits_only_the_rule(tmp_path: Path) -> None:
+    wt = _worktree(tmp_path)
+    (wt / "skills" / "bundled" / "_shared" / "dispatch-lib.sh").write_text("x\n")
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(wt), policy_path=_BUNDLED
+    )
+
+    # AC7 : le positif passe le plan de contrôle sous son propre rule_id, et
+    # le handler de production l'admet sans destination-veto.
+    for cmd in ADMITTED:
+        assert _destination_veto_reason(cmd, str(wt), rule_id=RULE_ID) is None, cmd
+        result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+        assert isinstance(result, PermissionResultAllow), (cmd, result)
+
+    # AC8 (1) : une autre forme de redirection Bash vers une cible conforme.
+    other_form = f"cat x > {TESTS_DIR}/test_dispatch_lib_a.sh"
+    for rid in (evaluate(_POLICY, "Bash", _bash(other_form)).rule_id, RULE_ID):
+        veto = _destination_veto_reason(other_form, str(wt), rule_id=rid)
+        assert veto is not None and _CP in veto, (rid, veto)
+    result = asyncio.run(handler("Bash", _bash(other_form), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), other_form
+
+    # AC8 (2) : une redirection vers skills/bundled/_shared/dispatch-lib.sh,
+    # même sous le rule_id de la règle.
+    to_lib = f"sed -n '1,5p' {SRC} > skills/bundled/_shared/dispatch-lib.sh"
+    veto = _destination_veto_reason(to_lib, str(wt), rule_id=RULE_ID)
+    assert veto is not None and _CP in veto, veto
+    result = asyncio.run(handler("Bash", _bash(to_lib), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), to_lib
+
+    # AC8 (3) : la forme admise vers une cible conforme, sous un autre rule_id
+    # (ou aucun) : le couplage échoue fermé.
+    for rid in (None, "bash-git-show-redirect", RULE_ID + "-renamed", RULE_ID.upper()):
+        for cmd in ADMITTED:
+            veto = _destination_veto_reason(cmd, str(wt), rule_id=rid)
+            assert veto is not None and _CP in veto, (rid, cmd, veto)
+    # Les appelants du chemin de létalité ne passent aucun rule_id.
+    for cmd in ADMITTED:
+        assert _destination_veto_reason(cmd, str(wt), for_lethality=True) is not None
+
+
+def test_cpp325_exception_segment_shape_equals_the_yaml_rule() -> None:
+    """La forme exigée par l'exception ne peut pas dériver de la règle."""
+    from claude_pilot.permissions import _CPP325_RANGE_EXTRACT_SEGMENT_RE
+
+    rules = [r for r in _POLICY.rules if r.id == RULE_ID]
+    assert len(rules) == 1
+    assert rules[0].pattern == _CPP325_RANGE_EXTRACT_SEGMENT_RE.pattern
+
+
+def test_cpp325_exception_resolves_symlinks_before_matching(tmp_path: Path) -> None:
+    """L'ancre porte sur le chemin résolu : une cible conforme qui est un lien
+    vers l'agrégat, ou un `tests/` lié vers `.git/hooks`, reste refusée."""
+    wt = _worktree(tmp_path)
+    tgt = wt / TGT
+    tgt.symlink_to(wt / SRC)
+    cmd = f"sed -n '1,5p' {SRC} > {TGT}"
+    veto = _destination_veto_reason(cmd, str(wt), rule_id=RULE_ID)
+    assert veto is not None and _CP in veto, veto
+
+    wt2 = tmp_path / "wt2"
+    (wt2 / ".git" / "hooks").mkdir(parents=True)
+    (wt2 / "skills" / "bundled" / "_shared").mkdir(parents=True)
+    (wt2 / SRC).write_text("x\n")
+    (wt2 / TESTS_DIR).symlink_to(wt2 / ".git" / "hooks", target_is_directory=True)
+    veto = _destination_veto_reason(cmd, str(wt2), rule_id=RULE_ID)
+    assert veto is not None and _CP in veto, veto
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(wt2), policy_path=_BUNDLED
+    )
+    result = asyncio.run(handler("Bash", _bash(cmd), _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny) and result.interrupt is True
+    assert list((wt2 / ".git" / "hooks").iterdir()) == []
